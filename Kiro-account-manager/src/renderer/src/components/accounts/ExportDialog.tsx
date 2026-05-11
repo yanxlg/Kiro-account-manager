@@ -1,13 +1,13 @@
 import { useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Button, Badge } from '../ui'
-import { X, FileJson, FileText, Table, Clipboard, Check, Download } from 'lucide-react'
+import { X, FileJson, FileText, Table, Clipboard, Check, Download, Key } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account } from '@/types/account'
 
-type ExportFormat = 'json' | 'txt' | 'csv' | 'clipboard'
+type ExportFormat = 'json' | 'txt' | 'csv' | 'kami' | 'clipboard'
 
 interface ExportDialogProps {
   open: boolean
@@ -28,6 +28,7 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
 
   const formats: { id: ExportFormat; name: string; icon: typeof FileJson; desc: string }[] = [
     { id: 'json', name: 'JSON', icon: FileJson, desc: isEn ? 'Full data, can be imported' : '完整数据，可用于导入' },
+    { id: 'kami', name: isEn ? 'Card Key' : '卡密', icon: Key, desc: isEn ? 'email----password----token----id----secret' : '卡密格式：邮箱----密码----Token----ID----Secret' },
     { id: 'txt', name: 'TXT', icon: FileText, desc: isEn ? 'Text format' : (includeCredentials ? '可导入格式：邮箱,Token,昵称,登录方式' : '纯文本格式，每行一个账号') },
     { id: 'csv', name: 'CSV', icon: Table, desc: isEn ? 'Excel compatible' : (includeCredentials ? '可导入格式，Excel 兼容' : 'Excel 兼容格式') },
     { id: 'clipboard', name: isEn ? 'Clipboard' : '剪贴板', icon: Clipboard, desc: isEn ? 'Copy to clipboard' : (includeCredentials ? '可导入格式：邮箱,Token' : '复制到剪贴板') },
@@ -107,6 +108,18 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
           row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',')
         ).join('\n')
 
+      case 'kami':
+        // 卡密格式：邮箱----密码----RefreshToken----ClientId----ClientSecret
+        return accounts.map(acc => 
+          [
+            acc.email,
+            acc.password || 'no_password',
+            acc.credentials?.refreshToken || '',
+            acc.credentials?.clientId || '',
+            acc.credentials?.clientSecret || ''
+          ].join('----')
+        ).join('\n')
+
       case 'clipboard':
         if (includeCredentials) {
           // 包含凭证时导出可导入格式：邮箱,RefreshToken
@@ -142,7 +155,8 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
     const extensions: Record<string, string> = {
       json: 'json',
       txt: 'txt',
-      csv: 'csv'
+      csv: 'csv',
+      kami: 'txt'
     }
     const filename = `kiro-accounts-${new Date().toISOString().slice(0, 10)}.${extensions[selectedFormat]}`
     
@@ -212,6 +226,15 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
           </div>
 
           {/* 选项 */}
+          {selectedFormat === 'kami' && (
+            <div className="p-3 bg-muted rounded-lg">
+              <p className="text-xs text-muted-foreground">
+                {isEn ? 'Format: email----password----refreshToken----clientId----clientSecret' : '格式：邮箱----密码----RefreshToken----ClientId----ClientSecret'}
+                <br />
+                {isEn ? 'One account per line, empty lines are ignored. Supports auto-detection of separators (----, spaces, tabs)' : '每行一个账号，空行无效。导入时支持自动识别分隔符（----、空格、Tab）'}
+              </p>
+            </div>
+          )}
           {selectedFormat === 'json' && (
             <label className="flex items-center gap-2 p-3 bg-muted rounded-lg cursor-pointer">
               <input
@@ -233,6 +256,29 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
           <Button variant="outline" onClick={onClose}>
             {isEn ? 'Cancel' : '取消'}
           </Button>
+          {selectedFormat === 'kami' && (
+            <Button variant="outline" disabled={copied} onClick={async () => {
+              const content = generateContent('kami')
+              await navigator.clipboard.writeText(content)
+              setCopied(true)
+              setTimeout(() => {
+                setCopied(false)
+                onClose()
+              }, 1500)
+            }}>
+              {copied ? (
+                <>
+                  <Check className="h-4 w-4 mr-2" />
+                  {isEn ? 'Copied' : '已复制'}
+                </>
+              ) : (
+                <>
+                  <Clipboard className="h-4 w-4 mr-2" />
+                  {isEn ? 'Copy' : '复制到剪贴板'}
+                </>
+              )}
+            </Button>
+          )}
           <Button onClick={handleExport} disabled={copied}>
             {copied ? (
               <>

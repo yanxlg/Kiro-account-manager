@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { X, RefreshCw, Loader2, Cpu, FileText, Image, Hash, Sparkles, Zap, Shuffle } from 'lucide-react'
+import { X, RefreshCw, Loader2, Cpu, FileText, Image, Hash, Sparkles, Zap, Shuffle, Brain, Database } from 'lucide-react'
 import { Button, Card, CardContent, CardHeader, CardTitle, Badge } from '../ui'
 import { cn } from '@/lib/utils'
 
@@ -12,6 +12,10 @@ interface ModelInfo {
   maxOutputTokens?: number | null
   rateMultiplier?: number
   rateUnit?: string
+  supportsThinking?: boolean
+  thinkingEfforts?: string[]
+  supportsPromptCaching?: boolean
+  modelProvider?: string
 }
 
 interface ModelsDialogProps {
@@ -192,6 +196,16 @@ export function ModelsDialog({
                             </Badge>
                           )}
                         </div>
+                        {model.supportsThinking && (
+                          <Badge variant="secondary" className="text-[10px] px-1.5 h-5 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-0" title={model.thinkingEfforts?.join(', ')}>
+                            <Brain className="h-3 w-3" />
+                          </Badge>
+                        )}
+                        {model.supportsPromptCaching && (
+                          <Badge variant="secondary" className="text-[10px] px-1.5 h-5 bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 border-0">
+                            <Database className="h-3 w-3" />
+                          </Badge>
+                        )}
                         {model.rateMultiplier !== undefined && (
                           <Badge variant="secondary" className="text-[10px] px-1.5 h-5 bg-amber-500/10 text-amber-600 dark:text-amber-400 border-0">
                             <Zap className="h-3 w-3 mr-0.5" />

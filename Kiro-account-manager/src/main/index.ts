@@ -7,7 +7,7 @@ import { writeFile, readFile } from 'fs/promises'
 import { encode, decode } from 'cbor-x'
 import { ProxyAgent, fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
 import icon from '../../resources/icon.png?asset'
-import { ProxyServer, type ProxyAccount, type ProxyConfig } from './proxy'
+import { ProxyServer, configureProxyClients, type ProxyAccount, type ProxyConfig, type ProxyClientTarget, type ProxyClientModel } from './proxy'
 import { 
   initKProxyService, 
   getKProxyService, 
@@ -16,8 +16,9 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUseKProxyForApiInProxy } from './proxy/kiroApi'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents } from './proxy/kiroApi'
 import { proxyLogStore } from './proxy/logger'
+import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import {
   createTray,
   destroyTray,
@@ -140,20 +141,35 @@ export function getUseKProxyForApi(): boolean {
   return useKProxyForApi
 }
 
-// 获取 K-Proxy 代理 agent（如果启用）
-function getKProxyAgent(): ProxyAgent | undefined {
-  if (!useKProxyForApi) return undefined
-  const kproxyService = getKProxyService()
-  if (!kproxyService || !kproxyService.isRunning()) return undefined
-  const config = kproxyService.getConfig()
-  const proxyUrl = `http://${config.host}:${config.port}`
-  // 配置代理 agent，允许自签名证书（K-Proxy 使用自签名 CA）
-  return new ProxyAgent({
-    uri: proxyUrl,
-    requestTls: {
-      rejectUnauthorized: false // 允许自签名证书
+// 获取网络代理 agent（优先 K-Proxy，其次环境变量代理）
+function getNetworkAgent(): ProxyAgent | undefined {
+  if (useKProxyForApi) {
+    const kproxyService = getKProxyService()
+    if (kproxyService?.isRunning()) {
+      const config = kproxyService.getConfig()
+      const proxyUrl = `http://${config.host}:${config.port}`
+      return new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
     }
-  })
+  }
+  const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
+  if (envProxy) {
+    return new ProxyAgent({ uri: envProxy, requestTls: { rejectUnauthorized: false } })
+  }
+  return undefined
+}
+
+// 通用 fetch 函数，使用 getNetworkAgent 获取代理
+async function fetchWithAppProxy(url: string, options: RequestInit): Promise<Response> {
+  const agent = getNetworkAgent()
+  if (agent) {
+    return await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+  }
+  return await fetch(url, options)
+}
+
+// 兼容函数，指向 getNetworkAgent
+function getKProxyAgent(): ProxyAgent | undefined {
+  return getNetworkAgent()
 }
 
 // ============ OIDC Token 刷新 ============
@@ -257,7 +273,9 @@ function initProxyServer(): ProxyServer {
     maxConcurrent: 10,
     maxRetries: 3,
     retryDelayMs: 1000,
-    tokenRefreshBeforeExpiry: 300 // 5分钟提前刷新
+    tokenRefreshBeforeExpiry: 300, // 5分钟提前刷新
+    enableServerSideToolAutoContinue: false,
+    clientDrivenToolExecution: true
   }
   
   // 合并保存的配置和默认配置
@@ -329,6 +347,34 @@ function initProxyServer(): ProxyServer {
         debouncedStoreSet('proxyFailedRequests', failedRequests)
         // 更新托盘菜单（也防抖，避免频繁重建菜单）
         debouncedUpdateTrayMenu()
+      },
+      // 账号池为空时懒加载 - 从 store 读取账号数据同步到 pool
+      onPoolEmpty: async () => {
+        await initStore()
+        if (!store) return
+        const accountData = store.get('accountData') as { accounts?: Record<string, any> } | undefined
+        if (!accountData?.accounts) return
+        const proxyAccounts = Object.values(accountData.accounts)
+          .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
+          .map((acc: any) => ({
+            id: acc.id,
+            email: acc.email,
+            accessToken: acc.credentials.accessToken,
+            refreshToken: acc.credentials?.refreshToken,
+            profileArn: acc.profileArn,
+            expiresAt: acc.credentials?.expiresAt,
+            machineId: acc.machineId,
+            clientId: acc.credentials?.clientId,
+            clientSecret: acc.credentials?.clientSecret,
+            region: acc.credentials?.region || 'us-east-1',
+            authMethod: acc.credentials?.authMethod,
+            provider: acc.credentials?.provider || acc.idp
+          }))
+        if (proxyAccounts.length > 0 && proxyServer) {
+          const pool = proxyServer.getAccountPool()
+          proxyAccounts.forEach(acc => pool.addAccount(acc))
+          console.log(`[ProxyServer] Lazy-synced ${proxyAccounts.length} accounts from store`)
+        }
       }
     }
   )
@@ -483,7 +529,7 @@ async function refreshOidcToken(
   }
   
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithAppProxy(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
@@ -520,7 +566,7 @@ async function refreshSocialToken(refreshToken: string): Promise<OidcRefreshResu
   const machineId = getCurrentMachineId()
   
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithAppProxy(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -619,7 +665,7 @@ async function ssoDeviceAuth(bearerToken: string, region: string = 'us-east-1'):
   // Step 1: 注册 OIDC 客户端
   console.log('[SSO] Step 1: Registering OIDC client...')
   try {
-    const regRes = await fetch(`${oidcBase}/client/register`, {
+    const regRes = await fetchWithAppProxy(`${oidcBase}/client/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -642,7 +688,7 @@ async function ssoDeviceAuth(bearerToken: string, region: string = 'us-east-1'):
   // Step 2: 发起设备授权
   console.log('[SSO] Step 2: Starting device authorization...')
   try {
-    const devRes = await fetch(`${oidcBase}/device_authorization`, {
+    const devRes = await fetchWithAppProxy(`${oidcBase}/device_authorization`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clientId, clientSecret, startUrl })
@@ -660,7 +706,7 @@ async function ssoDeviceAuth(bearerToken: string, region: string = 'us-east-1'):
   // Step 3: 验证 Bearer Token (whoAmI)
   console.log('[SSO] Step 3: Verifying bearer token...')
   try {
-    const whoRes = await fetch(`${portalBase}/token/whoAmI`, {
+    const whoRes = await fetchWithAppProxy(`${portalBase}/token/whoAmI`, {
       method: 'GET',
       headers: { 'Authorization': `Bearer ${bearerToken}`, 'Accept': 'application/json' }
     })
@@ -673,7 +719,7 @@ async function ssoDeviceAuth(bearerToken: string, region: string = 'us-east-1'):
   // Step 4: 获取设备会话令牌
   console.log('[SSO] Step 4: Getting device session token...')
   try {
-    const sessRes = await fetch(`${portalBase}/session/device`, {
+    const sessRes = await fetchWithAppProxy(`${portalBase}/session/device`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${bearerToken}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({})
@@ -690,7 +736,7 @@ async function ssoDeviceAuth(bearerToken: string, region: string = 'us-east-1'):
   console.log('[SSO] Step 5: Accepting user code...')
   let deviceContext: { deviceContextId?: string; clientId?: string; clientType?: string } | null = null
   try {
-    const acceptRes = await fetch(`${oidcBase}/device_authorization/accept_user_code`, {
+    const acceptRes = await fetchWithAppProxy(`${oidcBase}/device_authorization/accept_user_code`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Referer': 'https://view.awsapps.com/' },
       body: JSON.stringify({ userCode, userSessionId: deviceSessionToken })
@@ -707,7 +753,7 @@ async function ssoDeviceAuth(bearerToken: string, region: string = 'us-east-1'):
   if (deviceContext?.deviceContextId) {
     console.log('[SSO] Step 6: Approving authorization...')
     try {
-      const approveRes = await fetch(`${oidcBase}/device_authorization/associate_token`, {
+      const approveRes = await fetchWithAppProxy(`${oidcBase}/device_authorization/associate_token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Referer': 'https://view.awsapps.com/' },
         body: JSON.stringify({
@@ -735,7 +781,7 @@ async function ssoDeviceAuth(bearerToken: string, region: string = 'us-east-1'):
     await new Promise(r => setTimeout(r, interval * 1000))
     
     try {
-      const tokenRes = await fetch(`${oidcBase}/token`, {
+      const tokenRes = await fetchWithAppProxy(`${oidcBase}/token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -819,7 +865,7 @@ async function kiroApiRequest<T>(
       dispatcher: agent
     } as UndiciRequestInit) as unknown as Response
   } else {
-    response = await fetch(`${KIRO_API_BASE}/${operation}`, {
+    response = await fetchWithAppProxy(`${KIRO_API_BASE}/${operation}`, {
       method: 'POST',
       headers,
       body: Buffer.from(encode(body))
@@ -920,6 +966,7 @@ interface UsageLimitsResponse {
   }
   overageConfiguration?: {
     overageEnabled?: boolean
+    overageStatus?: string
   }
   userInfo?: {
     email?: string
@@ -959,7 +1006,7 @@ async function fetchRestApi(
       dispatcher: agent
     } as UndiciRequestInit) as unknown as Response
   }
-  return await fetch(url, { method: 'GET', headers })
+  return await fetchWithAppProxy(url, { method: 'GET', headers })
 }
 
 async function getUsageLimitsRest(
@@ -1058,6 +1105,7 @@ interface UnifiedUsageResponse {
   }
   overageConfiguration?: {
     overageEnabled?: boolean
+    overageStatus?: string
   }
   userInfo?: {
     email?: string
@@ -1458,9 +1506,10 @@ function createWindow(): void {
         const server = initProxyServer()
         server.updateConfig(savedProxyConfig)
         
-        // 自启动时同步账号到代理池
-        const accountData = store.get('accountData') as { accounts?: Record<string, any> } | undefined
-        if (accountData?.accounts) {
+        // 自启动时同步账号到代理池（含重试机制应对冷启动数据延迟）
+        const syncAccountsToPool = (): number => {
+          const accountData = store!.get('accountData') as { accounts?: Record<string, any> } | undefined
+          if (!accountData?.accounts) return 0
           const proxyAccounts = Object.values(accountData.accounts)
             .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
             .map((acc: any) => ({
@@ -1470,16 +1519,40 @@ function createWindow(): void {
               refreshToken: acc.credentials?.refreshToken,
               profileArn: acc.profileArn,
               expiresAt: acc.credentials?.expiresAt,
+              machineId: acc.machineId,
               clientId: acc.credentials?.clientId,
               clientSecret: acc.credentials?.clientSecret,
               region: acc.credentials?.region || 'us-east-1',
-              authMethod: acc.credentials?.authMethod
+              authMethod: acc.credentials?.authMethod,
+              provider: acc.credentials?.provider || acc.idp
             }))
           if (proxyAccounts.length > 0) {
             const pool = server.getAccountPool()
+            pool.clear()
             proxyAccounts.forEach(acc => pool.addAccount(acc))
-            console.log('[ProxyServer] Auto-synced', proxyAccounts.length, 'accounts')
           }
+          return proxyAccounts.length
+        }
+
+        let syncedCount = syncAccountsToPool()
+        if (syncedCount > 0) {
+          console.log('[ProxyServer] Auto-synced', syncedCount, 'accounts')
+        } else {
+          // 冷启动时 store 可能还没有数据（渲染进程尚未初始化完成），延迟重试
+          console.log('[ProxyServer] No accounts found on initial sync, will retry...')
+          const retrySync = (attempt: number) => {
+            setTimeout(() => {
+              const count = syncAccountsToPool()
+              if (count > 0) {
+                console.log(`[ProxyServer] Retry #${attempt}: synced ${count} accounts`)
+              } else if (attempt < 5) {
+                retrySync(attempt + 1)
+              } else {
+                console.log('[ProxyServer] All retry attempts exhausted, no accounts available. Accounts will sync when UI loads.')
+              }
+            }, attempt * 2000) // 2s, 4s, 6s, 8s, 10s
+          }
+          retrySync(1)
         }
         
         await server.start()
@@ -1674,6 +1747,9 @@ app.whenReady().then(async () => {
     }
   })
 
+  // ============ 注册功能 IPC ============
+  registerRegistrationHandlers(() => mainWindow)
+
   // ============ 托盘相关 IPC ============
 
   // IPC: 获取托盘设置
@@ -1826,7 +1902,7 @@ app.whenReady().then(async () => {
       console.log('[Update] Manual check via GitHub API...')
       const currentVersion = app.getVersion()
       
-      const response = await fetch(GITHUB_API_URL, {
+      const response = await fetchWithAppProxy(GITHUB_API_URL, {
         headers: {
           'Accept': 'application/vnd.github.v3+json',
           'User-Agent': 'Kiro-Account-Manager'
@@ -2003,7 +2079,7 @@ app.whenReady().then(async () => {
         subscriptionInfo?: { type?: string; subscriptionTitle?: string; upgradeCapability?: string; overageCapability?: string; subscriptionManagementTarget?: string }
         usageBreakdownList?: UsageBreakdownItem[]
         nextDateReset?: string
-        overageConfiguration?: { overageEnabled?: boolean }
+        overageConfiguration?: { overageEnabled?: boolean; overageStatus?: string }
       }
 
       let userInfo: UserInfoResponse | undefined
@@ -2104,7 +2180,7 @@ app.whenReady().then(async () => {
               unit: creditUsage.unit,
               overageRate: creditUsage.overageRate,
               overageCap: creditUsage.overageCap,
-              overageEnabled: usageData?.overageConfiguration?.overageEnabled
+              overageEnabled: usageData?.overageConfiguration?.overageStatus === 'ENABLED' || usageData?.overageConfiguration?.overageEnabled === true
             } : undefined
           },
           daysRemaining: usageData?.nextDateReset ? Math.max(0, Math.ceil((new Date(usageData.nextDateReset).getTime() - Date.now()) / 86400000)) : undefined
@@ -2176,6 +2252,7 @@ app.whenReady().then(async () => {
 
     interface OverageConfiguration {
       overageEnabled?: boolean
+      overageStatus?: string
     }
 
     interface UsageResponse {
@@ -2265,7 +2342,7 @@ app.whenReady().then(async () => {
         unit: creditUsage.unit,
         overageRate: creditUsage.overageRate,
         overageCap: creditUsage.overageCap,
-        overageEnabled: result.overageConfiguration?.overageEnabled ?? false
+        overageEnabled: result.overageConfiguration?.overageStatus === 'ENABLED' || result.overageConfiguration?.overageEnabled === true
       } : undefined
 
       return {
@@ -2339,7 +2416,13 @@ app.whenReady().then(async () => {
       try {
         // 并行调用 GetUserInfo 和 getUsageAndLimits
         const [userInfoResult, usageResult] = await Promise.all([
-          getUserInfo(accessToken, idp, accountMachineId).catch(() => undefined), // GetUserInfo 失败不影响整体流程
+          getUserInfo(accessToken, idp, accountMachineId).catch((err: Error) => {
+            // 封禁错误不能吞掉，必须向上抛出
+            if (err.message.includes('423') || err.message.includes('AccountSuspended') || err.message.includes('403')) {
+              throw err
+            }
+            return undefined
+          }),
           getUsageAndLimits(accessToken, idp, undefined, accountMachineId, region)
         ])
         return parseUsageResponse(usageResult, undefined, userInfoResult)
@@ -2375,7 +2458,12 @@ app.whenReady().then(async () => {
             
             // 用新 token 并行调用 GetUserInfo 和 getUsageAndLimits
             const [userInfoResult, usageResult] = await Promise.all([
-              getUserInfo(refreshResult.accessToken, idp, accountMachineId).catch(() => undefined),
+              getUserInfo(refreshResult.accessToken, idp, accountMachineId).catch((err: Error) => {
+                if (err.message.includes('423') || err.message.includes('AccountSuspended') || err.message.includes('403')) {
+                  throw err
+                }
+                return undefined
+              }),
               getUsageAndLimits(refreshResult.accessToken, idp, undefined, accountMachineId, region)
             ])
             
@@ -2502,9 +2590,19 @@ app.whenReady().then(async () => {
               freeTrialExpiry?: string
               bonuses: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
               nextResetDate?: string
+              resourceDetail?: {
+                displayName?: string
+                displayNamePlural?: string
+                resourceType?: string
+                currency?: string
+                unit?: string
+                overageRate?: number
+                overageCap?: number
+                overageEnabled?: boolean
+              }
             } | undefined
             let userInfoData: UserInfoResponse | undefined
-            let subscriptionData: { type: string; title: string; daysRemaining?: number; expiresAt?: number } | undefined
+            let subscriptionData: { type: string; title: string; daysRemaining?: number; expiresAt?: number; overageCapability?: string; upgradeCapability?: string; subscriptionManagementTarget?: string } | undefined
             let status = 'active'
             let errorMessage: string | undefined
 
@@ -2513,6 +2611,7 @@ app.whenReady().then(async () => {
               try {
                 interface UsageBreakdownItem {
                   resourceType?: string
+                  displayName?: string
                   currentUsage?: number
                   currentUsageWithPrecision?: number
                   usageLimit?: number
@@ -2542,6 +2641,14 @@ app.whenReady().then(async () => {
                   subscriptionInfo?: {
                     subscriptionTitle?: string
                     type?: string
+                    overageCapability?: string
+                    upgradeCapability?: string
+                    subscriptionManagementTarget?: string
+                  }
+                  overageConfiguration?: {
+                    overageStatus?: string
+                    overageEnabled?: boolean
+                    overageLimit?: number | null
                   }
                 }
                 console.log(`[BackgroundRefresh] Account ${account.id} machineId: ${account.machineId || 'undefined'}`)
@@ -2585,7 +2692,17 @@ app.whenReady().then(async () => {
                   freeTrialLimit,
                   freeTrialExpiry,
                   bonuses,
-                  nextResetDate: rawUsage.nextDateReset
+                  nextResetDate: rawUsage.nextDateReset,
+                  resourceDetail: creditUsage ? {
+                    displayName: creditUsage.displayName,
+                    displayNamePlural: (creditUsage as { displayNamePlural?: string }).displayNamePlural,
+                    resourceType: creditUsage.resourceType,
+                    currency: (creditUsage as { currency?: string }).currency,
+                    unit: (creditUsage as { unit?: string }).unit,
+                    overageRate: (creditUsage as { overageRate?: number }).overageRate,
+                    overageCap: (creditUsage as { overageCap?: number }).overageCap,
+                    overageEnabled: rawUsage.overageConfiguration?.overageStatus === 'ENABLED' || rawUsage.overageConfiguration?.overageEnabled === true
+                  } : undefined
                 }
                 
                 // 解析订阅信息（注意检查顺序：先检查更具体的类型）
@@ -2612,7 +2729,15 @@ app.whenReady().then(async () => {
                   daysRemaining = Math.max(0, Math.ceil((expiresAt - Date.now()) / (1000 * 60 * 60 * 24)))
                 }
                 
-                subscriptionData = { type: subscriptionType, title: subscriptionTitle, daysRemaining, expiresAt }
+                subscriptionData = {
+                  type: subscriptionType,
+                  title: subscriptionTitle,
+                  daysRemaining,
+                  expiresAt,
+                  overageCapability: rawUsage.subscriptionInfo?.overageCapability,
+                  upgradeCapability: rawUsage.subscriptionInfo?.upgradeCapability,
+                  subscriptionManagementTarget: rawUsage.subscriptionInfo?.subscriptionManagementTarget
+                }
               } catch (apiError) {
                 const errMsg = apiError instanceof Error ? apiError.message : String(apiError)
                 console.log(`[BackgroundRefresh] Usage API error for ${account.id}:`, errMsg)
@@ -2762,6 +2887,14 @@ app.whenReady().then(async () => {
                 subscriptionInfo?: {
                   subscriptionTitle?: string
                   type?: string
+                  overageCapability?: string
+                  upgradeCapability?: string
+                  subscriptionManagementTarget?: string
+                }
+                overageConfiguration?: {
+                  overageStatus?: string
+                  overageEnabled?: boolean
+                  overageLimit?: number | null
                 }
                 userInfo?: {
                   email?: string
@@ -2773,7 +2906,13 @@ app.whenReady().then(async () => {
                 userId?: string
                 status?: string
                 idp?: string
-              }>('GetUserInfo', { origin: 'KIRO_IDE' }, accessToken, idp).catch(() => null)
+              }>('GetUserInfo', { origin: 'KIRO_IDE' }, accessToken, idp).catch((err: Error) => {
+                // 封禁错误不能吞掉，需要在后续逻辑中检测
+                if (err.message.includes('423') || err.message.includes('AccountSuspended') || err.message.includes('403')) {
+                  throw err
+                }
+                return null
+              })
             ])
 
             // 解析响应（kiroApiRequest 直接返回数据或抛出异常）
@@ -2793,7 +2932,20 @@ app.whenReady().then(async () => {
               title: string
               daysRemaining?: number
               expiresAt?: number
+              overageCapability?: string
+              upgradeCapability?: string
+              subscriptionManagementTarget?: string
             } | null = null
+            let resourceDetail: {
+              displayName?: string
+              displayNamePlural?: string
+              resourceType?: string
+              currency?: string
+              unit?: string
+              overageRate?: number
+              overageCap?: number
+              overageEnabled?: boolean
+            } | undefined
             let userInfoData: {
               email?: string
               userId?: string
@@ -2852,6 +3004,20 @@ app.whenReady().then(async () => {
                 nextResetDate: rawUsage.nextDateReset
               }
 
+              // 解析资源详情（含超额信息）
+              if (creditUsage) {
+                resourceDetail = {
+                  displayName: creditUsage.displayName,
+                  displayNamePlural: (creditUsage as { displayNamePlural?: string }).displayNamePlural,
+                  resourceType: creditUsage.resourceType,
+                  currency: (creditUsage as { currency?: string }).currency,
+                  unit: (creditUsage as { unit?: string }).unit,
+                  overageRate: (creditUsage as { overageRate?: number }).overageRate,
+                  overageCap: (creditUsage as { overageCap?: number }).overageCap,
+                  overageEnabled: rawUsage.overageConfiguration?.overageStatus === 'ENABLED' || rawUsage.overageConfiguration?.overageEnabled === true
+                }
+              }
+
               // 解析订阅信息（注意检查顺序：先检查更具体的类型）
               const subscriptionTitle = rawUsage.subscriptionInfo?.subscriptionTitle ?? 'Free'
               let subscriptionType = 'Free'
@@ -2876,7 +3042,15 @@ app.whenReady().then(async () => {
                 daysRemaining = Math.max(0, Math.ceil((expiresAt - Date.now()) / (1000 * 60 * 60 * 24)))
               }
               
-              subscriptionData = { type: subscriptionType, title: subscriptionTitle, daysRemaining, expiresAt }
+              subscriptionData = {
+                type: subscriptionType,
+                title: subscriptionTitle,
+                daysRemaining,
+                expiresAt,
+                overageCapability: rawUsage.subscriptionInfo?.overageCapability,
+                upgradeCapability: rawUsage.subscriptionInfo?.upgradeCapability,
+                subscriptionManagementTarget: rawUsage.subscriptionInfo?.subscriptionManagementTarget
+              }
             } else if (usageRes.status === 'rejected') {
               // API 调用失败（可能是封禁或 Token 过期）
               const errorMsg = usageRes.reason?.message || String(usageRes.reason)
@@ -2906,6 +3080,13 @@ app.whenReady().then(async () => {
                 status = 'error'
                 errorMessage = `用户状态异常: ${rawUserInfo.status}`
               }
+            } else if (userInfoRes.status === 'rejected') {
+              // GetUserInfo 失败（封禁错误会到这里）
+              const errMsg = userInfoRes.reason?.message || String(userInfoRes.reason)
+              if (errMsg.includes('423') || errMsg.includes('AccountSuspended') || errMsg.includes('403')) {
+                status = 'error'
+                errorMessage = errMsg
+              }
             }
 
             success++
@@ -2916,7 +3097,7 @@ app.whenReady().then(async () => {
               id: account.id,
               success: true,
               data: {
-                usage: usageData,
+                usage: usageData ? { ...usageData, resourceDetail } : null,
                 subscription: subscriptionData,
                 userInfo: userInfoData,
                 status,
@@ -3083,7 +3264,7 @@ app.whenReady().then(async () => {
           upgradeCapability?: string
           overageCapability?: string
         }
-        overageConfiguration?: { overageEnabled?: boolean }
+        overageConfiguration?: { overageEnabled?: boolean; overageStatus?: string }
         userInfo?: { email?: string; userId?: string }
       }
       
@@ -3191,7 +3372,7 @@ app.whenReady().then(async () => {
               unit: creditUsage.unit,
               overageRate: creditUsage.overageRate,
               overageCap: creditUsage.overageCap,
-              overageEnabled: usageResult.overageConfiguration?.overageEnabled
+              overageEnabled: usageResult.overageConfiguration?.overageStatus === 'ENABLED' || usageResult.overageConfiguration?.overageEnabled === true
             } : undefined
           },
           daysRemaining,
@@ -3422,6 +3603,119 @@ app.whenReady().then(async () => {
     }
   })
 
+  // IPC: 切换账号到 Kiro CLI - 写入凭证到 SQLite 数据库
+  // kiro-cli 使用 ~/.local/share/kiro-cli/data.sqlite3 中的 auth_kv 表
+  ipcMain.handle('switch-account-cli', async (_event, credentials: {
+    accessToken: string
+    refreshToken: string
+    clientId?: string
+    clientSecret?: string
+    region?: string
+    profileArn?: string
+    provider?: string
+    scopes?: string[]
+  }) => {
+    const os = await import('os')
+    const path = await import('path')
+    const { mkdir } = await import('fs/promises')
+
+    try {
+      const {
+        accessToken,
+        refreshToken,
+        clientId,
+        clientSecret,
+        region = 'us-east-1',
+        profileArn,
+        provider,
+        scopes
+      } = credentials
+
+      // kiro-cli SQLite 数据库路径
+      // Windows: %LOCALAPPDATA%\kiro-cli\data.sqlite3
+      // macOS/Linux: ~/.local/share/kiro-cli/data.sqlite3
+      const dataDir = process.platform === 'win32'
+        ? path.join(os.homedir(), 'AppData', 'Local', 'kiro-cli')
+        : path.join(os.homedir(), '.local', 'share', 'kiro-cli')
+      await mkdir(dataDir, { recursive: true })
+      const dbPath = path.join(dataDir, 'data.sqlite3')
+
+      // 判断 token key：social 登录用 social:token，IdC 登录用 odic:token
+      const isSocial = !clientId || !clientSecret || provider === 'BuilderId' || provider === 'Google' || provider === 'Github'
+      const preferredTokenKey = isSocial ? 'kirocli:social:token' : 'kirocli:odic:token'
+      const preferredRegKey = 'kirocli:odic:device-registration'
+
+      // 构建 token JSON（snake_case 字段名，与 kiro-cli Rust 结构一致）
+      const expiresAt = new Date(Date.now() + 3600 * 1000).toISOString()
+      const tokenData: Record<string, unknown> = {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        expires_at: expiresAt,
+        region
+      }
+      if (profileArn) tokenData.profile_arn = profileArn
+      if (scopes) tokenData.scopes = scopes
+
+      // 使用 sqlite3 命令行操作（跨平台兼容，无需原生模块编译）
+      const { execFileSync } = await import('child_process')
+      const sqlite3Bin = process.platform === 'win32' ? 'sqlite3.exe' : 'sqlite3'
+
+      // 构建 SQL 语句
+      const sqlStatements: string[] = [
+        'CREATE TABLE IF NOT EXISTS auth_kv (key TEXT PRIMARY KEY, value TEXT);',
+        `INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('${preferredTokenKey}', '${JSON.stringify(tokenData).replace(/'/g, "''")}');`
+      ]
+
+      // 写入 device-registration（仅 IdC 登录）
+      if (clientId && clientSecret && !isSocial) {
+        const regData = { client_id: clientId, client_secret: clientSecret, region }
+        sqlStatements.push(
+          `INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('${preferredRegKey}', '${JSON.stringify(regData).replace(/'/g, "''")}');`
+        )
+      }
+
+      // 清除其他优先级的旧 key
+      const cliTokenKeys = ['kirocli:social:token', 'kirocli:odic:token', 'codewhisperer:odic:token']
+      for (const key of cliTokenKeys) {
+        if (key !== preferredTokenKey) {
+          sqlStatements.push(`DELETE FROM auth_kv WHERE key = '${key}';`)
+        }
+      }
+
+      try {
+        execFileSync(sqlite3Bin, [dbPath], {
+          input: sqlStatements.join('\n'),
+          timeout: 10000,
+          encoding: 'utf-8'
+        })
+      } catch (sqlite3Error) {
+        // sqlite3 命令不存在，尝试用 Node.js 22+ 的内置 SQLite
+        console.log('[Switch CLI] sqlite3 command not available, trying Node.js built-in SQLite...')
+        try {
+          const { DatabaseSync } = await import('node:sqlite') as { DatabaseSync: new (path: string) => { exec: (sql: string) => void; close: () => void } }
+          const db = new DatabaseSync(dbPath)
+          try {
+            for (const sql of sqlStatements) {
+              db.exec(sql)
+            }
+          } finally {
+            db.close()
+          }
+        } catch {
+          throw new Error(`SQLite 操作失败: sqlite3 命令不可用 (${(sqlite3Error as Error).message})，且 Node.js 内置 SQLite 不支持。请确保系统安装了 sqlite3 命令行工具。`)
+        }
+      }
+
+      console.log(`[Switch CLI] Token saved to SQLite key: ${preferredTokenKey}`)
+      console.log(`[Switch CLI] Account switched successfully in ${dbPath}`)
+      return { success: true, dbPath }
+    } catch (error) {
+      console.error('[Switch CLI] Error:', error)
+      return { success: false, error: error instanceof Error ? error.message : 'CLI 切换失败' }
+    }
+  })
+
+
   // IPC: 退出登录 - 清除本地 SSO 缓存
   ipcMain.handle('logout-account', async () => {
     const os = await import('os')
@@ -3491,7 +3785,7 @@ app.whenReady().then(async () => {
     try {
       // Step 1: 注册 OIDC 客户端
       console.log('[Login] Step 1: Registering OIDC client...')
-      const regRes = await fetch(`${oidcBase}/client/register`, {
+      const regRes = await fetchWithAppProxy(`${oidcBase}/client/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -3515,7 +3809,7 @@ app.whenReady().then(async () => {
 
       // Step 2: 发起设备授权
       console.log('[Login] Step 2: Starting device authorization...')
-      const authRes = await fetch(`${oidcBase}/device_authorization`, {
+      const authRes = await fetchWithAppProxy(`${oidcBase}/device_authorization`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ clientId, clientSecret, startUrl })
@@ -3572,7 +3866,7 @@ app.whenReady().then(async () => {
     const { clientId, clientSecret, deviceCode } = currentLoginState
 
     try {
-      const tokenRes = await fetch(`${oidcBase}/token`, {
+      const tokenRes = await fetchWithAppProxy(`${oidcBase}/token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -3676,7 +3970,7 @@ app.whenReady().then(async () => {
     try {
       // Step 1: 注册 OIDC 客户端 (使用 authorization_code grant type)
       console.log('[Login] Step 1: Registering OIDC client...')
-      const regRes = await fetch(`${oidcBase}/client/register`, {
+      const regRes = await fetchWithAppProxy(`${oidcBase}/client/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -3771,7 +4065,7 @@ app.whenReady().then(async () => {
             
             // 自动完成 token 交换
             try {
-              const tokenRes = await fetch(`${oidcBase}/token`, {
+              const tokenRes = await fetchWithAppProxy(`${oidcBase}/token`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -3973,7 +4267,7 @@ app.whenReady().then(async () => {
     const redirectUri = 'kiro://kiro.kiroAgent/authenticate-success'
 
     try {
-      const tokenRes = await fetch(`${KIRO_AUTH_ENDPOINT}/oauth/token`, {
+      const tokenRes = await fetchWithAppProxy(`${KIRO_AUTH_ENDPOINT}/oauth/token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -4578,6 +4872,10 @@ app.whenReady().then(async () => {
       const server = initProxyServer()
       server.updateConfig(config)
       const newConfig = server.getConfig()
+      // 同步流式日志开关
+      if (config.logStreamEvents !== undefined) {
+        setLogStreamEvents(config.logStreamEvents)
+      }
       // 保存配置到 store（用于自启动）
       if (store) {
         store.set('proxyConfig', newConfig)
@@ -4819,6 +5117,41 @@ app.whenReady().then(async () => {
     }
   })
 
+  ipcMain.handle('proxy-configure-clients', async (_event, input: { clients: ProxyClientTarget[]; modelId: string; modelName?: string; models?: ProxyClientModel[] }) => {
+    try {
+      const server = initProxyServer()
+      const config = server.getConfig()
+      const apiKey = (config.apiKey || config.apiKeys?.find(key => key.enabled)?.key || '').trim()
+      if (!apiKey) {
+        return {
+          success: false,
+          proxyOrigin: '',
+          openaiBaseUrl: '',
+          results: [],
+          error: '请先在反代配置中设置或启用 API Key'
+        }
+      }
+      return await configureProxyClients({
+        clients: input.clients,
+        host: config.host,
+        port: config.port,
+        tlsEnabled: config.tls?.enabled,
+        apiKey,
+        modelId: input.modelId,
+        modelName: input.modelName,
+        models: input.models
+      })
+    } catch (error) {
+      return {
+        success: false,
+        proxyOrigin: '',
+        openaiBaseUrl: '',
+        results: [],
+        error: error instanceof Error ? error.message : 'Failed to configure clients'
+      }
+    }
+  })
+
   // IPC: 获取账户可用模型列表
   ipcMain.handle('account-get-models', async (_event, accessToken: string, region?: string, profileArn?: string) => {
     try {
@@ -4842,9 +5175,9 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 获取可用订阅列表
-  ipcMain.handle('account-get-subscriptions', async (_event, accessToken: string, region?: string) => {
+  ipcMain.handle('account-get-subscriptions', async (_event, accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => {
     try {
-      const result = await fetchAvailableSubscriptions({ accessToken, region: region || 'us-east-1' } as ProxyAccount)
+      const result = await fetchAvailableSubscriptions({ id: accountId || 'subscription-request', accessToken, region: region || 'us-east-1', profileArn, machineId, provider, authMethod } as ProxyAccount)
       if (result.subscriptionPlans) {
         return { 
           success: true, 
@@ -4859,9 +5192,9 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 获取订阅管理/支付链接
-  ipcMain.handle('account-get-subscription-url', async (_event, accessToken: string, subscriptionType?: string, region?: string) => {
+  ipcMain.handle('account-get-subscription-url', async (_event, accessToken: string, subscriptionType?: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => {
     try {
-      const result = await fetchSubscriptionToken({ accessToken, region: region || 'us-east-1' } as ProxyAccount, subscriptionType)
+      const result = await fetchSubscriptionToken({ id: accountId || 'subscription-request', accessToken, region: region || 'us-east-1', profileArn, machineId, provider, authMethod } as ProxyAccount, subscriptionType)
       if (result.encodedVerificationUrl) {
         return { success: true, url: result.encodedVerificationUrl, status: result.status }
       }
@@ -4871,24 +5204,26 @@ app.whenReady().then(async () => {
     }
   })
 
-  // IPC: 在新窗口打开订阅链接
+  // IPC: 设置用户偏好（超额开启/关闭）
+  ipcMain.handle('account-set-overage', async (_event, accessToken: string, overageStatus: 'ENABLED' | 'DISABLED', region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => {
+    try {
+      const result = await setUserPreference(
+        { id: accountId || 'subscription-request', accessToken, region: region || 'us-east-1', profileArn, machineId, provider, authMethod } as ProxyAccount,
+        overageStatus
+      )
+      return result
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to set overage' }
+    }
+  })
+
+  // IPC: 在系统默认浏览器无痕模式中打开订阅链接
   ipcMain.handle('open-subscription-window', async (_event, url: string) => {
     try {
-      const subscriptionWindow = new BrowserWindow({
-        width: 1200,
-        height: 800,
-        title: 'Kiro Subscription',
-        icon: icon,
-        autoHideMenuBar: true,
-        webPreferences: {
-          nodeIntegration: false,
-          contextIsolation: true
-        }
-      })
-      subscriptionWindow.loadURL(url)
+      openBrowserInPrivateMode(url)
       return { success: true }
     } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to open window' }
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to open URL' }
     }
   })
 

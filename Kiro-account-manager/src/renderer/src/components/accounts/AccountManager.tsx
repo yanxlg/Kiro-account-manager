@@ -124,27 +124,62 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
         const result = importAccounts(items)
         alert(`导入完成：成功 ${result.success} 个，失败 ${result.failed} 个`)
       } else if (format === 'txt') {
-        // TXT 格式：每行一个账号，格式为 邮箱,RefreshToken 或 邮箱|RefreshToken
+        // TXT 格式：自动识别卡密格式或普通格式
         const lines = content.split('\n').filter(line => line.trim() && !line.startsWith('#'))
-        
-        const items = lines.map(line => {
-          // 支持逗号或竖线分隔
-          const parts = line.includes('|') ? line.split('|') : line.split(',')
-          return {
-            email: parts[0]?.trim() || '',
-            refreshToken: parts[1]?.trim() || '',
-            nickname: parts[2]?.trim() || undefined,
-            idp: parts[3]?.trim() || 'Google'
+
+        // 检测是否为卡密格式（包含 ---- 分隔符）
+        const isKamiFormat = lines.some(line => line.includes('----'))
+
+        if (isKamiFormat) {
+          // 卡密格式：邮箱----密码----RefreshToken----ClientId----ClientSecret
+          // 自动识别分隔符：----、\t、连续空格
+          const items = lines.map(line => {
+            let parts: string[]
+            if (line.includes('----')) {
+              parts = line.split('----')
+            } else if (line.includes('\t')) {
+              parts = line.split('\t')
+            } else {
+              parts = line.split(/\s{2,}/)
+            }
+            const rawPwd = parts[1]?.trim()
+            return {
+              email: parts[0]?.trim() || '',
+              password: (rawPwd && rawPwd !== 'no_password') ? rawPwd : undefined,
+              refreshToken: parts[2]?.trim() || '',
+              clientId: parts[3]?.trim() || undefined,
+              clientSecret: parts[4]?.trim() || undefined,
+              idp: 'BuilderId' as const
+            }
+          }).filter(item => item.email && item.refreshToken)
+
+          if (items.length === 0) {
+            alert('未找到有效的卡密数据（格式：邮箱----密码----RefreshToken----ClientId----ClientSecret）')
+            return
           }
-        }).filter(item => item.email && item.refreshToken)
 
-        if (items.length === 0) {
-          alert('未找到有效的账号数据（格式：邮箱,RefreshToken）')
-          return
+          const result = importAccounts(items)
+          alert(`卡密导入完成：成功 ${result.success} 个，失败 ${result.failed} 个`)
+        } else {
+          // 普通 TXT 格式：邮箱,RefreshToken 或 邮箱|RefreshToken
+          const items = lines.map(line => {
+            const parts = line.includes('|') ? line.split('|') : line.split(',')
+            return {
+              email: parts[0]?.trim() || '',
+              refreshToken: parts[1]?.trim() || '',
+              nickname: parts[2]?.trim() || undefined,
+              idp: parts[3]?.trim() || 'Google'
+            }
+          }).filter(item => item.email && item.refreshToken)
+
+          if (items.length === 0) {
+            alert('未找到有效的账号数据（格式：邮箱,RefreshToken 或 卡密格式：邮箱----密码----Token----ID----Secret）')
+            return
+          }
+
+          const result = importAccounts(items)
+          alert(`导入完成：成功 ${result.success} 个，失败 ${result.failed} 个`)
         }
-
-        const result = importAccounts(items)
-        alert(`导入完成：成功 ${result.success} 个，失败 ${result.failed} 个`)
       } else {
         alert(`不支持的文件格式：${format}`)
       }

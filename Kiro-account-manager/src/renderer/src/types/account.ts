@@ -98,6 +98,7 @@ export interface Account {
   // 基本信息
   id: string
   email: string
+  password?: string // 注册密码（卡密导出/导入用）
   nickname?: string // 自定义别名
   idp: IdpType
   userId?: string
@@ -194,6 +195,7 @@ export interface AccountExportData {
  */
 export interface AccountImportItem {
   email: string
+  password?: string
   refreshToken: string
   accessToken?: string
   csrfToken?: string

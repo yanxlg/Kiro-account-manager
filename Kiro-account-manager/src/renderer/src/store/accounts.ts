@@ -92,6 +92,9 @@ interface AccountsState {
   // 登录浏览器隐私模式
   loginPrivateMode: boolean // 登录时使用浏览器隐私/无痕模式
 
+  // 切号目标设置
+  switchTarget: 'ide' | 'cli' | 'both' // ide=仅 Kiro IDE, cli=仅 Kiro CLI, both=两者都切
+
   // 主题设置
   theme: string // 主题名称: default, purple, emerald, orange, rose, cyan, amber
   darkMode: boolean // 深色模式
@@ -210,6 +213,9 @@ interface AccountsActions {
   // 登录浏览器隐私模式
   setLoginPrivateMode: (enabled: boolean) => void
 
+  // 切号目标设置
+  setSwitchTarget: (target: 'ide' | 'cli' | 'both') => void
+
   startAutoSwitch: () => void
   stopAutoSwitch: () => void
   checkAndAutoSwitch: () => Promise<void>
@@ -276,6 +282,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   autoSwitchInterval: 5,
   batchImportConcurrency: 100,
   loginPrivateMode: false,
+  switchTarget: 'ide' as const,
   theme: 'default',
   darkMode: false,
   language: 'auto',
@@ -811,6 +818,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
         const account: Omit<Account, 'id' | 'createdAt' | 'isActive'> = {
           email: item.email,
+          password: item.password,
           nickname: item.nickname,
           idp: normalizeIdp(item.idp as string),
           credentials: {
@@ -1406,6 +1414,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           autoSwitchEnabled: data.autoSwitchEnabled ?? false,
           autoSwitchThreshold: data.autoSwitchThreshold ?? 0,
           autoSwitchInterval: data.autoSwitchInterval ?? 5,
+          switchTarget: data.switchTarget ?? 'ide',
           theme: data.theme ?? 'default',
           darkMode: data.darkMode ?? false,
           language: data.language ?? 'auto',
@@ -1464,6 +1473,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       autoSwitchEnabled,
       autoSwitchThreshold,
       autoSwitchInterval,
+      switchTarget,
       theme,
       darkMode,
       language,
@@ -1491,6 +1501,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         autoSwitchEnabled,
         autoSwitchThreshold,
         autoSwitchInterval,
+        switchTarget,
         theme,
         darkMode,
         language,
@@ -1662,6 +1673,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     get().saveToStorage()
   },
 
+  setSwitchTarget: (target) => {
+    set({ switchTarget: target })
+    get().saveToStorage()
+  },
+
   startAutoSwitch: () => {
     const { autoSwitchEnabled, autoSwitchInterval, checkAndAutoSwitch } = get()
     
@@ -1732,17 +1748,32 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       if (availableAccount) {
         console.log(`[AutoSwitch] Switching to: ${availableAccount.email}`)
         setActiveAccount(availableAccount.id)
-        // 通知主进程切换账号
-        await window.api.switchAccount({
-          accessToken: availableAccount.credentials.accessToken || '',
-          refreshToken: availableAccount.credentials.refreshToken || '',
-          clientId: availableAccount.credentials.clientId || '',
-          clientSecret: availableAccount.credentials.clientSecret || '',
-          region: availableAccount.credentials.region || 'us-east-1',
-          startUrl: availableAccount.credentials.startUrl,
-          authMethod: availableAccount.credentials.authMethod,
-          provider: availableAccount.credentials.provider
-        })
+        // 根据 switchTarget 设置决定切换目标
+        const { switchTarget: target } = get()
+        const creds = availableAccount.credentials
+        if (target === 'ide' || target === 'both') {
+          await window.api.switchAccount({
+            accessToken: creds.accessToken || '',
+            refreshToken: creds.refreshToken || '',
+            clientId: creds.clientId || '',
+            clientSecret: creds.clientSecret || '',
+            region: creds.region || 'us-east-1',
+            startUrl: creds.startUrl,
+            authMethod: creds.authMethod,
+            provider: creds.provider
+          })
+        }
+        if (target === 'cli' || target === 'both') {
+          window.api.switchAccountCli?.({
+            accessToken: creds.accessToken || '',
+            refreshToken: creds.refreshToken || '',
+            clientId: creds.clientId,
+            clientSecret: creds.clientSecret,
+            region: creds.region || 'us-east-1',
+            profileArn: (availableAccount as { profileArn?: string }).profileArn,
+            provider: creds.provider
+          }).catch(err => console.warn('[AutoSwitch CLI] Failed:', err))
+        }
       } else {
         console.log('[AutoSwitch] No available account to switch to')
       }
@@ -2017,8 +2048,18 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           freeTrialExpiry?: string
           bonuses?: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
           nextResetDate?: string
+          resourceDetail?: {
+            displayName?: string
+            displayNamePlural?: string
+            resourceType?: string
+            currency?: string
+            unit?: string
+            overageRate?: number
+            overageCap?: number
+            overageEnabled?: boolean
+          }
         }
-        subscription?: { type?: string; title?: string; daysRemaining?: number; expiresAt?: number }
+        subscription?: { type?: string; title?: string; daysRemaining?: number; expiresAt?: number; overageCapability?: string; upgradeCapability?: string; subscriptionManagementTarget?: string }
         userInfo?: { email?: string; userId?: string }
         status?: string
         errorMessage?: string
@@ -2051,6 +2092,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             freeTrialExpiry: refreshData.usage.freeTrialExpiry ?? account.usage.freeTrialExpiry,
             bonuses: refreshData.usage.bonuses ?? account.usage.bonuses,
             nextResetDate: refreshData.usage.nextResetDate ?? account.usage.nextResetDate,
+            resourceDetail: refreshData.usage.resourceDetail ?? account.usage.resourceDetail,
             lastUpdated: now
           }
         })() : account.usage,
@@ -2059,7 +2101,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           type: (refreshData.subscription.type as SubscriptionType) || account.subscription.type,
           title: refreshData.subscription.title || account.subscription.title,
           daysRemaining: refreshData.subscription.daysRemaining ?? account.subscription.daysRemaining,
-          expiresAt: refreshData.subscription.expiresAt ?? account.subscription.expiresAt
+          expiresAt: refreshData.subscription.expiresAt ?? account.subscription.expiresAt,
+          overageCapability: refreshData.subscription.overageCapability ?? account.subscription.overageCapability,
+          upgradeCapability: refreshData.subscription.upgradeCapability ?? account.subscription.upgradeCapability,
+          managementTarget: refreshData.subscription.subscriptionManagementTarget ?? account.subscription.managementTarget
         } : account.subscription,
         email: refreshData?.userInfo?.email || account.email,
         userId: refreshData?.userInfo?.userId || account.userId,
@@ -2113,8 +2158,18 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           freeTrialExpiry?: string
           bonuses?: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
           nextResetDate?: string
+          resourceDetail?: {
+            displayName?: string
+            displayNamePlural?: string
+            resourceType?: string
+            currency?: string
+            unit?: string
+            overageRate?: number
+            overageCap?: number
+            overageEnabled?: boolean
+          }
         }
-        subscription?: { type?: string; title?: string; daysRemaining?: number; expiresAt?: number }
+        subscription?: { type?: string; title?: string; daysRemaining?: number; expiresAt?: number; overageCapability?: string; upgradeCapability?: string; subscriptionManagementTarget?: string }
         userInfo?: { email?: string; userId?: string }
         status?: string
         errorMessage?: string
@@ -2147,6 +2202,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             freeTrialExpiry: checkData.usage.freeTrialExpiry ?? account.usage.freeTrialExpiry,
             bonuses: checkData.usage.bonuses ?? account.usage.bonuses,
             nextResetDate: checkData.usage.nextResetDate ?? account.usage.nextResetDate,
+            resourceDetail: checkData.usage.resourceDetail ?? account.usage.resourceDetail,
             lastUpdated: now
           }
         })() : account.usage,
@@ -2155,7 +2211,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           type: (checkData.subscription.type as 'Free' | 'Pro' | 'Enterprise' | 'Teams') ?? account.subscription.type,
           title: checkData.subscription.title ?? account.subscription.title,
           daysRemaining: checkData.subscription.daysRemaining ?? account.subscription.daysRemaining,
-          expiresAt: checkData.subscription.expiresAt ?? account.subscription.expiresAt
+          expiresAt: checkData.subscription.expiresAt ?? account.subscription.expiresAt,
+          overageCapability: checkData.subscription.overageCapability ?? account.subscription.overageCapability,
+          upgradeCapability: checkData.subscription.upgradeCapability ?? account.subscription.upgradeCapability,
+          managementTarget: checkData.subscription.subscriptionManagementTarget ?? account.subscription.managementTarget
         } : account.subscription,
         email: checkData?.userInfo?.email || account.email,
         userId: checkData?.userInfo?.userId || account.userId,

@@ -644,9 +644,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       return
     }
 
-    // 解析 JSON 数据
+    // 解析凭证数据：自动识别 JSON 或卡密格式
     let credentials: Array<{
       refreshToken: string
+      password?: string
       clientId?: string
       clientSecret?: string
       region?: string
@@ -654,16 +655,50 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       provider?: string
     }>
 
+    const trimmed = oidcBatchData.trim()
+    let isKamiFormat = false
+
     try {
-      const parsed = JSON.parse(oidcBatchData.trim())
+      const parsed = JSON.parse(trimmed)
       credentials = Array.isArray(parsed) ? parsed : [parsed]
     } catch {
-      setError('JSON 格式错误，请检查输入')
-      return
+      // JSON 解析失败，尝试卡密格式：邮箱----密码----RefreshToken----ClientId----ClientSecret
+      // 支持分隔符：----、Tab、连续空格
+      const lines = trimmed.split('\n').filter(line => line.trim() && !line.startsWith('#'))
+      if (lines.length === 0) {
+        setError(isEn ? 'Invalid format' : '格式错误，请输入 JSON 数组或卡密格式（邮箱----密码----Token----ID----Secret）')
+        return
+      }
+
+      credentials = lines.map(line => {
+        let parts: string[]
+        if (line.includes('----')) {
+          parts = line.split('----')
+        } else if (line.includes('\t')) {
+          parts = line.split('\t')
+        } else {
+          parts = line.split(/\s{2,}/)
+        }
+        const rawPwd = parts[1]?.trim()
+        return {
+          _email: parts[0]?.trim() || '',
+          password: (rawPwd && rawPwd !== 'no_password') ? rawPwd : undefined,
+          refreshToken: parts[2]?.trim() || '',
+          clientId: parts[3]?.trim() || undefined,
+          clientSecret: parts[4]?.trim() || undefined,
+          provider: 'BuilderId'
+        }
+      }).filter(item => item.refreshToken) as typeof credentials
+
+      if (credentials.length === 0) {
+        setError(isEn ? 'Invalid format' : '格式错误，请输入 JSON 数组或卡密格式（邮箱----密码----Token----ID----Secret）')
+        return
+      }
+      isKamiFormat = true
     }
 
     if (credentials.length === 0) {
-      setError('请输入至少一个凭证')
+      setError(isEn ? 'Enter at least one credential' : '请输入至少一个凭证')
       return
     }
 
@@ -720,6 +755,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           const now = Date.now()
           addAccount({
             email,
+            password: cred.password,
             userId,
             nickname: email ? email.split('@')[0] : undefined,
             idp,
@@ -803,7 +839,15 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         // 保留失败的凭证在输入框中
         const failedCredentials = importResult.failedIndices.map(i => credentials[i])
         if (failedCredentials.length > 0) {
-          setOidcBatchData(JSON.stringify(failedCredentials, null, 2))
+          if (isKamiFormat) {
+            // 卡密格式：还原为卡密文本
+            const kamiLines = failedCredentials.map(c => 
+              [(c as Record<string, string>)._email || '', c.password || '', c.refreshToken, c.clientId || '', c.clientSecret || ''].join('----')
+            )
+            setOidcBatchData(kamiLines.join('\n'))
+          } else {
+            setOidcBatchData(JSON.stringify(failedCredentials, null, 2))
+          }
         }
         if (importResult.success > 0) {
           setError(`成功导入 ${importResult.success} 个，失败 ${importResult.failed} 个`)
@@ -1646,20 +1690,20 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                 <>
                   <div className="p-3 bg-blue-50/50 dark:bg-blue-900/10 rounded-xl border border-blue-100 dark:border-blue-900/20">
                     <p className="text-xs text-blue-600 dark:text-blue-400">
-                      {isEn ? 'JSON array format. Required:' : '支持 JSON 数组格式。必填:'} <code className="px-1 bg-blue-100 dark:bg-blue-900/40 rounded">refreshToken</code>.
-                      {isEn ? 'Optional:' : '可选:'} <code className="px-1 bg-blue-100 dark:bg-blue-900/40 rounded">provider</code> (BuilderId/Enterprise/Github/Google),
-                      <code className="px-1 bg-blue-100 dark:bg-blue-900/40 rounded">clientId</code>,
-                      <code className="px-1 bg-blue-100 dark:bg-blue-900/40 rounded">clientSecret</code>
+                      {isEn ? 'Supports JSON array or Card Key format. JSON required:' : '支持 JSON 数组或卡密格式。JSON 必填:'} <code className="px-1 bg-blue-100 dark:bg-blue-900/40 rounded">refreshToken</code>.
+                      {isEn ? 'Card Key format:' : '卡密格式：'} <code className="px-1 bg-blue-100 dark:bg-blue-900/40 rounded">{isEn ? 'email----pwd----token----id----secret' : '邮箱----密码----Token----ID----Secret'}</code>
                     </p>
                   </div>
 
                   <div className="space-y-2">
                     <label className="text-sm font-medium flex items-center gap-2">
-                      {isEn ? 'JSON Credentials' : 'JSON 凭证数据'} <span className="text-destructive">*</span>
+                      {isEn ? 'Credentials Data' : '凭证数据'} <span className="text-destructive">*</span>
                     </label>
                     <textarea
                       className="w-full min-h-[180px] px-3 py-2.5 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 resize-none font-mono text-xs"
-                      placeholder={`[
+                      placeholder={isEn 
+                        ? `JSON format:
+[
   {
     "refreshToken": "xxx",
     "clientId": "xxx",
@@ -1680,17 +1724,52 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     "refreshToken": "aaa",
     "provider": "Google"
   }
-]`}
+]
+
+Or Card Key format (one per line):
+email----password----refreshToken----clientId----clientSecret`
+                        : `JSON 格式：
+[
+  {
+    "refreshToken": "xxx",
+    "clientId": "xxx",
+    "clientSecret": "xxx",
+    "provider": "BuilderId"
+  },
+  {
+    "refreshToken": "yyy",
+    "clientId": "yyy",
+    "clientSecret": "yyy",
+    "provider": "Enterprise"
+  },
+  {
+    "refreshToken": "zzz",
+    "provider": "Github"
+  },
+  {
+    "refreshToken": "aaa",
+    "provider": "Google"
+  }
+]
+
+或卡密格式（每行一个）：
+邮箱----密码----RefreshToken----ClientId----ClientSecret`}
                       value={oidcBatchData}
                       onChange={(e) => { setOidcBatchData(e.target.value); setOidcBatchImportResult(null) }}
                     />
                     {oidcBatchData.trim() && (() => {
+                      const val = oidcBatchData.trim()
                       try {
-                        const parsed = JSON.parse(oidcBatchData.trim())
+                        const parsed = JSON.parse(val)
                         const count = Array.isArray(parsed) ? parsed.length : 1
-                        return <p className="text-xs text-muted-foreground">{isEn ? `Entered ${count} credentials` : `已输入 ${count} 个凭证`}</p>
+                        return <p className="text-xs text-muted-foreground">{isEn ? `Entered ${count} credentials (JSON)` : `已输入 ${count} 个凭证 (JSON)`}</p>
                       } catch {
-                        return <p className="text-xs text-destructive">{isEn ? 'Invalid JSON format' : 'JSON 格式错误'}</p>
+                        // 尝试卡密格式计数
+                        const kamiLines = val.split('\n').filter(l => l.trim() && !l.startsWith('#'))
+                        if (kamiLines.length > 0 && kamiLines.some(l => l.includes('----') || l.includes('\t') || /\s{2,}/.test(l))) {
+                          return <p className="text-xs text-muted-foreground">{isEn ? `Entered ${kamiLines.length} credentials (Card Key)` : `已输入 ${kamiLines.length} 个凭证 (卡密格式)`}</p>
+                        }
+                        return <p className="text-xs text-destructive">{isEn ? 'Invalid format (JSON or Card Key)' : '格式错误（支持 JSON 或卡密格式）'}</p>
                       }
                     })()}
                   </div>

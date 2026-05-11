@@ -174,6 +174,7 @@ export const AccountCard = memo(function AccountCard({
 
   const handleSwitch = async (): Promise<void> => {
     const { credentials } = account
+    const { switchTarget } = useAccountsStore.getState()
     
     // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret
     if (!credentials.refreshToken) {
@@ -184,9 +185,17 @@ export const AccountCard = memo(function AccountCard({
       alert(isEn ? 'Incomplete credentials, cannot switch' : '账号凭证不完整，无法切换')
       return
     }
-    
-    // 写入凭证到本地 SSO 缓存
-    const result = await window.api.switchAccount({
+
+    const cliPayload = {
+      accessToken: credentials.accessToken,
+      refreshToken: credentials.refreshToken,
+      clientId: credentials.clientId,
+      clientSecret: credentials.clientSecret,
+      region: credentials.region || 'us-east-1',
+      profileArn: account.profileArn,
+      provider: credentials.provider
+    }
+    const idePayload = {
       accessToken: credentials.accessToken,
       refreshToken: credentials.refreshToken,
       clientId: credentials.clientId || '',
@@ -195,12 +204,25 @@ export const AccountCard = memo(function AccountCard({
       startUrl: credentials.startUrl,
       authMethod: credentials.authMethod,
       provider: credentials.provider
-    })
-    
-    if (result.success) {
+    }
+
+    let success = true
+    let errorMsg = ''
+
+    // 根据 switchTarget 设置决定切换目标
+    if (switchTarget === 'ide' || switchTarget === 'both') {
+      const result = await window.api.switchAccount(idePayload)
+      if (!result.success) { success = false; errorMsg = result.error || '' }
+    }
+    if (switchTarget === 'cli' || switchTarget === 'both') {
+      const result = await window.api.switchAccountCli(cliPayload)
+      if (!result.success && switchTarget === 'cli') { success = false; errorMsg = result.error || '' }
+    }
+
+    if (success) {
       setActiveAccount(account.id)
     } else {
-      alert(isEn ? `Switch failed: ${result.error}` : `切换失败: ${result.error}`)
+      alert(isEn ? `Switch failed: ${errorMsg}` : `切换失败: ${errorMsg}`)
     }
   }
 
@@ -310,7 +332,7 @@ export const AccountCard = memo(function AccountCard({
     setSubscriptionLoading(true)
     try {
       // 统一先获取可用订阅列表
-      const result = await window.api.accountGetSubscriptions(account.credentials.accessToken, account.credentials?.region)
+      const result = await window.api.accountGetSubscriptions(account.credentials.accessToken, account.credentials?.region, account.profileArn, account.machineId, account.credentials?.provider || account.idp, account.credentials?.authMethod, account.id)
       if (result.success && result.plans.length > 0) {
         setSubscriptionPlans(result.plans)
         // 检查是否是首次用户（当前订阅类型为 FREE 或无订阅）
@@ -336,7 +358,7 @@ export const AccountCard = memo(function AccountCard({
     setPaymentLoading(true)
     setSubscriptionError(null)
     try {
-      const result = await window.api.accountGetSubscriptionUrl(account.credentials.accessToken, planName, account.credentials?.region)
+      const result = await window.api.accountGetSubscriptionUrl(account.credentials.accessToken, planName, account.credentials?.region, account.profileArn, account.machineId, account.credentials?.provider || account.idp, account.credentials?.authMethod, account.id)
       if (result.success && result.url) {
         // 自动复制链接到剪贴板
         await navigator.clipboard.writeText(result.url)
@@ -371,7 +393,7 @@ export const AccountCard = memo(function AccountCard({
     setPaymentLoading(true)
     setSubscriptionError(null)
     try {
-      const result = await window.api.accountGetSubscriptionUrl(account.credentials.accessToken, undefined, account.credentials?.region)
+      const result = await window.api.accountGetSubscriptionUrl(account.credentials.accessToken, undefined, account.credentials?.region, account.profileArn, account.machineId, account.credentials?.provider || account.idp, account.credentials?.authMethod, account.id)
       if (result.success && result.url) {
         setShowSubscriptionDialog(false)
         await window.api.openSubscriptionWindow(result.url)

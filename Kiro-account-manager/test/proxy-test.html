@@ -205,11 +205,11 @@
         <div class="form-group">
           <label>模型</label>
           <select id="openaiModel">
-            <option value="claude-opus-4-5">claude-opus-4.5 (最强)</option>
-            <option value="claude-sonnet-4-5">claude-sonnet-4.5</option>
-            <option value="claude-sonnet-4">claude-sonnet-4</option>
-            <option value="claude-haiku-4-5">claude-haiku-4.5</option>
-            <option value="claude-3-5-sonnet">claude-3.5-sonnet</option>
+            <option value="deepseek-3.2">deepseek-3.2</option>
+            <option value="minimax-m2.5">minimax-m2.5</option>
+            <option value="minimax-m2.1">minimax-m2.1</option>
+            <option value="glm-5">glm-5</option>
+            <option value="qwen3-coder-next">qwen3-coder-next</option>
             <option value="gpt-4">gpt-4 (映射)</option>
           </select>
         </div>
@@ -233,11 +233,11 @@
         <div class="form-group">
           <label>模型</label>
           <select id="claudeModel">
-            <option value="claude-opus-4-5">claude-opus-4.5 (最强)</option>
-            <option value="claude-sonnet-4-5">claude-sonnet-4.5</option>
-            <option value="claude-sonnet-4">claude-sonnet-4</option>
-            <option value="claude-haiku-4-5">claude-haiku-4.5</option>
-            <option value="claude-3-5-sonnet">claude-3.5-sonnet</option>
+            <option value="deepseek-3.2">deepseek-3.2</option>
+            <option value="minimax-m2.5">minimax-m2.5</option>
+            <option value="minimax-m2.1">minimax-m2.1</option>
+            <option value="glm-5">glm-5</option>
+            <option value="qwen3-coder-next">qwen3-coder-next</option>
           </select>
         </div>
         <div class="checkbox-group">
@@ -303,6 +303,34 @@
       box.className = `result-box ${type}`;
     }
 
+    function populateModelSelect(selectId, models) {
+      const select = document.getElementById(selectId);
+      const selected = select.value;
+      const validModels = models.filter(model => model && typeof model.id === 'string' && model.id !== 'auto');
+      if (validModels.length === 0) return;
+      select.innerHTML = '';
+      for (const model of validModels) {
+        const option = document.createElement('option');
+        option.value = model.id;
+        option.textContent = model.name && model.name !== model.id ? `${model.id} (${model.name})` : model.id;
+        select.appendChild(option);
+      }
+      if (validModels.some(model => model.id === selected)) {
+        select.value = selected;
+      }
+    }
+
+    async function loadModelSelects() {
+      try {
+        const res = await fetch(`${getBaseUrl()}/v1/models`, { headers: getHeaders() });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!Array.isArray(data.data)) return;
+        populateModelSelect('openaiModel', data.data);
+        populateModelSelect('claudeModel', data.data);
+      } catch (e) {}
+    }
+
     async function checkHealth() {
       const indicator = document.getElementById('healthStatus');
       indicator.className = 'status-indicator loading';
@@ -328,6 +356,10 @@
       try {
         const res = await fetch(`${getBaseUrl()}/v1/models`, { headers: getHeaders() });
         const data = await res.json();
+        if (Array.isArray(data.data)) {
+          populateModelSelect('openaiModel', data.data);
+          populateModelSelect('claudeModel', data.data);
+        }
         setResult('modelsResult', formatResult(data), res.ok ? 'success' : 'error');
       } catch (e) {
         setResult('modelsResult', `错误: ${e.message}`, 'error');
@@ -380,6 +412,11 @@
               if (data === '[DONE]') continue;
               try {
                 const json = JSON.parse(data);
+                if (json.error?.message) {
+                  content += `\n错误: ${json.error.message}`;
+                  resultBox.className = 'result-box error';
+                  continue;
+                }
                 const delta = json.choices?.[0]?.delta?.content || '';
                 content += delta;
                 resultBox.textContent = content;
@@ -481,7 +518,7 @@
           method: 'POST',
           headers: getHeaders(),
           body: JSON.stringify({
-            model: 'claude-sonnet-4-5',
+            model: 'deepseek-3.2',
             messages: [{ role: 'user', content: prompt }],
             tools: [{
               type: 'function',
@@ -548,6 +585,7 @@
     }
 
     // 页面加载时检查健康状态
+    loadModelSelects();
     checkHealth();
   </script>
 </body>

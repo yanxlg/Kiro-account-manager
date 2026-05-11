@@ -115,7 +115,8 @@ export interface MitmRule {
  */
 export const DEFAULT_MITM_DOMAINS = [
   'amazonaws.com',
-  'amazon.com'
+  'amazon.com',
+  'kiro.dev'
 ]
 
 /**

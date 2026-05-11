@@ -8,7 +8,11 @@ import type {
   KiroToolWrapper,
   KiroToolResult,
   KiroImage,
+  KiroDocument,
   KiroToolUse,
+  KiroCachePoint,
+  KiroRequestContext,
+  KiroUsage,
   ProxyAccount
 } from './types'
 import { proxyLogger } from './logger'
@@ -16,35 +20,39 @@ import { getKProxyService } from '../kproxy'
 
 // 是否使用 K-Proxy 代理发送 API 请求（从主进程导入）
 let useKProxyForApi = false
+let logStreamEvents = false
 
 export function setUseKProxyForApiInProxy(enabled: boolean): void {
   useKProxyForApi = enabled
 }
 
-// 获取 K-Proxy 代理 agent
-function getKProxyAgent(): ProxyAgent | undefined {
-  if (!useKProxyForApi) return undefined
-  const kproxyService = getKProxyService()
-  if (!kproxyService || !kproxyService.isRunning()) return undefined
-  const config = kproxyService.getConfig()
-  const proxyUrl = `http://${config.host}:${config.port}`
-  return new ProxyAgent({
-    uri: proxyUrl,
-    requestTls: {
-      rejectUnauthorized: false
+export function setLogStreamEvents(enabled: boolean): void {
+  logStreamEvents = enabled
+}
+
+// 获取网络代理 agent（优先 K-Proxy，其次应用级代理设置）
+function getNetworkAgent(): ProxyAgent | undefined {
+  if (useKProxyForApi) {
+    const kproxyService = getKProxyService()
+    if (kproxyService?.isRunning()) {
+      const config = kproxyService.getConfig()
+      const proxyUrl = `http://${config.host}:${config.port}`
+      return new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
     }
-  })
+  }
+  const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
+  if (envProxy) {
+    return new ProxyAgent({ uri: envProxy, requestTls: { rejectUnauthorized: false } })
+  }
+  return undefined
 }
 
 // 使用代理的 fetch 函数
 async function fetchWithProxy(url: string, options: RequestInit): Promise<Response> {
-  const agent = getKProxyAgent()
+  const agent = getNetworkAgent()
   if (agent) {
-    console.log('[KiroAPI] Using K-Proxy agent')
-    return await undiciFetch(url, {
-      ...options,
-      dispatcher: agent
-    } as UndiciRequestInit) as unknown as Response
+    proxyLogger.debug('KiroAPI', `Using proxy agent: ${agent.constructor.name}`)
+    return await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
   }
   return await fetch(url, options)
 }
@@ -55,37 +63,59 @@ const KIRO_ENDPOINTS = [
     url: 'https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse',
     origin: 'AI_EDITOR',
     amzTarget: 'AmazonCodeWhispererStreamingService.GenerateAssistantResponse',
-    name: 'CodeWhisperer'
+    name: 'CodeWhisperer',
+    protocol: 'generateAssistantResponse' as const
   },
   {
     url: 'https://q.us-east-1.amazonaws.com/generateAssistantResponse',
-    origin: 'CLI',
+    origin: 'AI_EDITOR',
+    amzTarget: 'AmazonCodeWhispererStreamingService.GenerateAssistantResponse',
+    name: 'AmazonQ',
+    protocol: 'generateAssistantResponse' as const
+  },
+  {
+    url: 'https://q.us-east-1.amazonaws.com/SendMessageStreaming',
+    origin: 'AI_EDITOR',
     amzTarget: 'AmazonQDeveloperStreamingService.SendMessage',
-    name: 'AmazonQ'
+    name: 'AmazonQCLI'
   }
 ]
 
-// Kiro 版本
-const KIRO_VERSION = '0.6.18'
+// Kiro 版本号（跟随官方 IDE 更新）
+const KIRO_VERSION = '0.12.155'
+const AWS_SDK_VERSION = '1.0.34'
+const AWS_STREAMING_API_VERSION = '1.0.34'
 
-// User-Agent 生成函数 - Social 认证方式
+const OS_PLATFORM = process.platform === 'win32' ? 'win32' : process.platform === 'darwin' ? 'macos' : 'linux'
+const OS_RELEASE = (() => { try { return require('os').release() } catch { return '10.0.0' } })()
+const NODE_VERSION = process.versions.node || '22.22.0'
+
 function getKiroUserAgent(machineId?: string): string {
   const suffix = machineId ? `KiroIDE-${KIRO_VERSION}-${machineId}` : `KiroIDE-${KIRO_VERSION}`
-  return `aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E ${suffix}`
+  return `aws-sdk-js/${AWS_SDK_VERSION} ua/2.1 os/${OS_PLATFORM}#${OS_RELEASE} lang/js md/nodejs#${NODE_VERSION} api/codewhispererstreaming#${AWS_STREAMING_API_VERSION} m/E ${suffix}`
 }
 
 function getKiroAmzUserAgent(machineId?: string): string {
   const suffix = machineId ? `KiroIDE ${KIRO_VERSION} ${machineId}` : `KiroIDE-${KIRO_VERSION}`
-  return `aws-sdk-js/1.0.18 ${suffix}`
+  return `aws-sdk-js/${AWS_SDK_VERSION} ${suffix}`
 }
 
-// User-Agent 配置 - IDC 认证方式 (Amazon Q CLI 样式)
-const KIRO_CLI_USER_AGENT = 'aws-sdk-rust/1.3.9 os/macos lang/rust/1.87.0'
-const KIRO_CLI_AMZ_USER_AGENT = 'aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/macos lang/rust/1.87.0 m/E app/AmazonQ-For-CLI'
+const KIRO_CLI_OS = OS_PLATFORM === 'win32' ? 'windows' : OS_PLATFORM === 'macos' ? 'macos' : 'linux'
+const KIRO_CLI_USER_AGENT = `aws-sdk-rust/1.3.9 os/${KIRO_CLI_OS} lang/rust/1.87.0`
+const KIRO_CLI_AMZ_USER_AGENT = `aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/${KIRO_CLI_OS} lang/rust/1.87.0 m/E app/AmazonQ-For-CLI`
 
 // Agent 模式
 const AGENT_MODE_SPEC = 'spec' // IDE 模式
 const AGENT_MODE_VIBE = 'vibe' // CLI 模式
+
+const KIRO_BUILDER_ID_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX'
+const KIRO_SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK'
+
+function resolveProfileArn(account: ProxyAccount): string {
+  if (account.profileArn) return account.profileArn
+  if (account.provider === 'Github' || account.provider === 'Google') return KIRO_SOCIAL_PROFILE_ARN
+  return KIRO_BUILDER_ID_PROFILE_ARN
+}
 
 // Agentic 模式系统提示 - 防止大文件写入超时
 const AGENTIC_SYSTEM_PROMPT = `# CRITICAL: CHUNKED WRITE PROTOCOL (MANDATORY)
@@ -115,6 +145,11 @@ REMEMBER: When in doubt, write LESS per operation. Multiple small operations > o
 const THINKING_MODE_PROMPT = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
 
+const CODEWHISPERER_DEFAULT_MODEL_ID = 'CLAUDE_SONNET_4_20250514_V1_0'
+const CODEWHISPERER_MODEL_CACHE_TTL = 5 * 60 * 1000
+
+const codeWhispererModelCache = new Map<string, { models: KiroModel[]; timestamp: number }>()
+
 // 模型 ID 映射
 const MODEL_ID_MAP: Record<string, string> = {
   // Claude 4.5 系列
@@ -141,13 +176,82 @@ const MODEL_ID_MAP: Record<string, string> = {
 }
 
 export function mapModelId(model: string): string {
-  const lower = model.toLowerCase()
-  for (const [key, value] of Object.entries(MODEL_ID_MAP)) {
-    if (lower.includes(key)) {
-      return value
-    }
+  const modelId = model.trim()
+  if (!modelId) return MODEL_ID_MAP.default
+  if (isCodeWhispererModelId(modelId)) return modelId
+  const lower = modelId.toLowerCase()
+  return MODEL_ID_MAP[lower] || modelId
+}
+
+function clonePayload(payload: KiroPayload): KiroPayload {
+  return JSON.parse(JSON.stringify(payload)) as KiroPayload
+}
+
+function normalizeModelKey(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, '')
+}
+
+function modelTokens(value: string): string[] {
+  return value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+}
+
+function modelText(model: KiroModel): string {
+  return [model.modelId, model.modelName, model.description].filter(Boolean).join(' ')
+}
+
+function matchesRequestedModel(model: KiroModel, requestedModelId: string): boolean {
+  const requestedKey = normalizeModelKey(requestedModelId)
+  const candidateKey = normalizeModelKey(modelText(model))
+  if (candidateKey === requestedKey || candidateKey.includes(requestedKey)) return true
+  const tokens = modelTokens(requestedModelId).filter(token => token !== 'latest' && token !== 'model')
+  if (tokens.length === 0) return false
+  const candidateTokens = new Set(modelTokens(modelText(model)))
+  return tokens.every(token => candidateTokens.has(token))
+}
+
+function isCodeWhispererModelId(modelId: string): boolean {
+  return /^[A-Z0-9_]+$/.test(modelId) && modelId.includes('_')
+}
+
+function getModelCacheKey(account: ProxyAccount): string {
+  return `${account.id}:${account.region || 'us-east-1'}:${resolveProfileArn(account)}`
+}
+
+async function getCachedCodeWhispererModels(account: ProxyAccount): Promise<KiroModel[]> {
+  const key = getModelCacheKey(account)
+  const cached = codeWhispererModelCache.get(key)
+  if (cached && Date.now() - cached.timestamp < CODEWHISPERER_MODEL_CACHE_TTL) return cached.models
+  const models = await fetchKiroModels(account)
+  codeWhispererModelCache.set(key, { models, timestamp: Date.now() })
+  return models
+}
+
+async function resolveCodeWhispererModelId(account: ProxyAccount, requestedModelId?: string): Promise<string> {
+  const modelId = requestedModelId?.trim()
+  if (!modelId) return CODEWHISPERER_DEFAULT_MODEL_ID
+  if (isCodeWhispererModelId(modelId)) return modelId
+  const models = await getCachedCodeWhispererModels(account)
+  return models.find(model => matchesRequestedModel(model, modelId))?.modelId || CODEWHISPERER_DEFAULT_MODEL_ID
+}
+
+function getPayloadModelId(payload: KiroPayload): string | undefined {
+  const currentModelId = payload.conversationState.currentMessage.userInputMessage.modelId
+  if (currentModelId) return currentModelId
+  return payload.conversationState.history?.find(message => message.userInputMessage?.modelId)?.userInputMessage?.modelId
+}
+
+function applyPayloadModelId(payload: KiroPayload, modelId: string): void {
+  payload.conversationState.currentMessage.userInputMessage.modelId = modelId
+  for (const message of payload.conversationState.history ?? []) {
+    if (message.userInputMessage) message.userInputMessage.modelId = modelId
   }
-  return MODEL_ID_MAP.default
+}
+
+function applyPayloadOrigin(payload: KiroPayload, origin: string): void {
+  payload.conversationState.currentMessage.userInputMessage.origin = origin
+  for (const message of payload.conversationState.history ?? []) {
+    if (message.userInputMessage) message.userInputMessage.origin = origin
+  }
 }
 
 // 检测是否为 Agentic 模式请求
@@ -360,7 +464,9 @@ export function buildKiroPayload(
   toolResults: KiroToolResult[] = [],
   images: KiroImage[] = [],
   profileArn?: string,
-  inferenceConfig?: { maxTokens?: number; temperature?: number; topP?: number }
+  inferenceConfig?: { maxTokens?: number; temperature?: number; topP?: number },
+  messageOptions?: { cachePoint?: KiroCachePoint | undefined; clientCacheConfig?: unknown; documents?: KiroDocument[]; conversationId?: string; context?: KiroRequestContext },
+  additionalModelRequestFields?: Record<string, unknown>
 ): KiroPayload {
   // 构建当前消息
   const finalContent = content.trim() || (toolResults.length > 0 ? '' : 'Continue')
@@ -375,6 +481,18 @@ export function buildKiroPayload(
     currentUserInputMessage.images = images
   }
 
+  if (messageOptions?.documents?.length) {
+    currentUserInputMessage.documents = messageOptions.documents
+  }
+
+  if (messageOptions?.cachePoint) {
+    currentUserInputMessage.cachePoint = messageOptions.cachePoint
+  }
+
+  if (messageOptions?.clientCacheConfig !== undefined) {
+    currentUserInputMessage.clientCacheConfig = messageOptions.clientCacheConfig
+  }
+
   // 构建 userInputMessageContext（包含 tools 和 toolResults）
   // 注意：tools 只放在最后一条消息（currentMessage）的 userInputMessageContext 中
   if (tools.length > 0 || toolResults.length > 0) {
@@ -384,6 +502,17 @@ export function buildKiroPayload(
     }
     if (toolResults.length > 0) {
       currentUserInputMessage.userInputMessageContext.toolResults = toolResults
+    }
+  }
+
+  if (messageOptions?.context) {
+    currentUserInputMessage.userInputMessageContext = {
+      ...currentUserInputMessage.userInputMessageContext,
+      ...(messageOptions.context.editorState !== undefined ? { editorState: messageOptions.context.editorState } : {}),
+      ...(messageOptions.context.shellState !== undefined ? { shellState: messageOptions.context.shellState } : {}),
+      ...(messageOptions.context.gitState !== undefined ? { gitState: messageOptions.context.gitState } : {}),
+      ...(messageOptions.context.envState !== undefined ? { envState: messageOptions.context.envState } : {}),
+      ...(messageOptions.context.additionalContext !== undefined ? { additionalContext: messageOptions.context.additionalContext } : {})
     }
   }
 
@@ -422,10 +551,13 @@ export function buildKiroPayload(
     }
   }
 
+  const conversationId = messageOptions?.conversationId || uuidv4()
   const payload: KiroPayload = {
     conversationState: {
+      agentContinuationId: uuidv4(),
+      agentTaskType: 'vibe',
       chatTriggerType: 'MANUAL',
-      conversationId: uuidv4(),
+      conversationId,
       currentMessage: {
         userInputMessage: finalCurrentMessage.userInputMessage!
       },
@@ -433,7 +565,7 @@ export function buildKiroPayload(
     }
   }
 
-  if (profileArn) {
+  if (profileArn !== undefined) {
     payload.profileArn = profileArn
   }
 
@@ -450,6 +582,11 @@ export function buildKiroPayload(
     }
   }
 
+  // additionalModelRequestFields（thinking 等模型级参数）
+  if (additionalModelRequestFields && Object.keys(additionalModelRequestFields).length > 0) {
+    payload.additionalModelRequestFields = additionalModelRequestFields
+  }
+
   // 调试日志
   console.log(`[KiroPayload] Built payload (native history mode):`, {
     contentLength: finalContent.length,
@@ -457,48 +594,66 @@ export function buildKiroPayload(
     sanitizedHistoryLength: sanitizedHistory.length,
     toolsCount: tools.length,
     toolResultsCount: toolResults.length,
-    hasProfileArn: !!profileArn
+    hasProfileArn: payload.profileArn !== undefined,
+    hasThinking: !!additionalModelRequestFields?.thinking
   })
 
   return payload
 }
 
-// 获取账号绑定的 Machine ID（从账户对象或 K-Proxy 映射）
-function getAccountMachineId(accountId: string, accountMachineId?: string): string | undefined {
-  // 优先使用账户对象中的 machineId
+// machineId 稳定生成缓存（用于无绑定 machineId 且 K-Proxy 不可用时的兆底）
+const fallbackMachineIds = new Map<string, string>()
+
+function generateStableMachineId(accountId: string): string {
+  const cached = fallbackMachineIds.get(accountId)
+  if (cached) return cached
+  const crypto = require('crypto')
+  const hash = crypto.createHash('sha256').update(`kiro-device-${accountId}`).digest('hex')
+  fallbackMachineIds.set(accountId, hash)
+  return hash
+}
+
+// 获取账号绑定的 Machine ID（保证永远不为空）
+function getAccountMachineId(accountId: string, accountMachineId?: string): string {
   if (accountMachineId) return accountMachineId
-  // 否则从 K-Proxy 映射获取
   const kproxyService = getKProxyService()
-  if (!kproxyService) return undefined
-  return kproxyService.getDeviceIdForAccount(accountId)
+  if (kproxyService) {
+    const deviceId = kproxyService.getDeviceIdForAccount(accountId)
+    if (deviceId) return deviceId
+  }
+  return generateStableMachineId(accountId)
 }
 
 // 获取认证方式对应的请求头
-function getAuthHeaders(account: ProxyAccount, endpoint: typeof KIRO_ENDPOINTS[0]): Record<string, string> {
-  const isIDC = account.authMethod === 'idc'
+function getAuthHeaders(account: ProxyAccount, _endpoint: typeof KIRO_ENDPOINTS[0]): Record<string, string> {
+  const isIDC = account.authMethod?.toLowerCase() === 'idc'
   const machineId = getAccountMachineId(account.id, account.machineId)
+  const agentMode = isIDC ? AGENT_MODE_VIBE : AGENT_MODE_SPEC
   
-  return {
-    'Content-Type': 'application/json',
-    'Accept': '*/*',
-    'X-Amz-Target': endpoint.amzTarget,
-    'User-Agent': isIDC ? KIRO_CLI_USER_AGENT : getKiroUserAgent(machineId),
-    'X-Amz-User-Agent': isIDC ? KIRO_CLI_AMZ_USER_AGENT : getKiroAmzUserAgent(machineId),
-    'x-amzn-kiro-agent-mode': isIDC ? AGENT_MODE_VIBE : AGENT_MODE_SPEC,
-    'x-amzn-codewhisperer-optout': 'true',
-    'Amz-Sdk-Request': 'attempt=1; max=3',
-    'Amz-Sdk-Invocation-Id': uuidv4(),
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'x-amzn-kiro-agent-mode': agentMode,
+    'x-amz-user-agent': isIDC ? KIRO_CLI_AMZ_USER_AGENT : getKiroAmzUserAgent(machineId),
+    'user-agent': isIDC ? KIRO_CLI_USER_AGENT : getKiroUserAgent(machineId),
+    'amz-sdk-invocation-id': uuidv4(),
+    'amz-sdk-request': 'attempt=1; max=3',
     'Authorization': `Bearer ${account.accessToken}`
   }
+  return headers
 }
 
 // 获取排序后的端点列表（根据首选端点配置）
-function getSortedEndpoints(preferredEndpoint?: 'codewhisperer' | 'amazonq'): typeof KIRO_ENDPOINTS {
-  if (!preferredEndpoint) return [...KIRO_ENDPOINTS]
+function getSortedEndpoints(preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'): typeof KIRO_ENDPOINTS {
+  if (!preferredEndpoint) return KIRO_ENDPOINTS.filter(ep => ep.name !== 'AmazonQCLI')
   
-  const sorted = [...KIRO_ENDPOINTS]
+  // AmazonQ CLI 模式：只用这一个端点，失败不回退
+  if (preferredEndpoint === 'amazonq-cli') {
+    return KIRO_ENDPOINTS.filter(ep => ep.name === 'AmazonQCLI')
+  }
+  
   const preferredName = preferredEndpoint === 'codewhisperer' ? 'CodeWhisperer' : 'AmazonQ'
   
+  const sorted = KIRO_ENDPOINTS.filter(ep => ep.name !== 'AmazonQCLI')
   sorted.sort((a, b) => {
     if (a.name === preferredName) return -1
     if (b.name === preferredName) return 1
@@ -512,37 +667,47 @@ function getSortedEndpoints(preferredEndpoint?: 'codewhisperer' | 'amazonq'): ty
 export async function callKiroApiStream(
   account: ProxyAccount,
   payload: KiroPayload,
-  onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean) => void,
-  onComplete: (usage: { inputTokens: number; outputTokens: number; credits: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number }) => void,
+  onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string) => void,
+  onComplete: (usage: KiroUsage) => void,
   onError: (error: Error) => void,
   signal?: AbortSignal,
-  preferredEndpoint?: 'codewhisperer' | 'amazonq'
+  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
 ): Promise<void> {
   const endpoints = getSortedEndpoints(preferredEndpoint)
   let lastError: Error | null = null
 
   for (const endpoint of endpoints) {
     try {
-      // 更新 payload 中的 origin
-      if (payload.conversationState.currentMessage.userInputMessage) {
-        payload.conversationState.currentMessage.userInputMessage.origin = endpoint.origin
+      const requestPayload = clonePayload(payload)
+      requestPayload.profileArn = resolveProfileArn(account)
+      const requestedModelId = getPayloadModelId(requestPayload)
+      if (endpoint.name === 'CodeWhisperer') {
+        applyPayloadModelId(requestPayload, await resolveCodeWhispererModelId(account, requestedModelId))
       }
 
-      // 调试：打印请求体摘要
-      const payloadStr = JSON.stringify(payload)
+      applyPayloadOrigin(requestPayload, endpoint.origin)
+
+      // AmazonQCLI 端点不支持 agentContinuationId/agentTaskType
+      if (endpoint.name === 'AmazonQCLI') {
+        delete (requestPayload.conversationState as unknown as Record<string, unknown>).agentContinuationId
+        delete (requestPayload.conversationState as unknown as Record<string, unknown>).agentTaskType
+      }
+
+      const payloadStr = JSON.stringify(requestPayload)
+      const headers = getAuthHeaders(account, endpoint)
       console.log(`[KiroAPI] Request to ${endpoint.name}:`)
-      console.log(`[KiroAPI]   - Content length: ${payload.conversationState.currentMessage.userInputMessage?.content?.length || 0}`)
-      console.log(`[KiroAPI]   - Tools count: ${payload.conversationState.currentMessage.userInputMessage?.userInputMessageContext?.tools?.length || 0}`)
+      console.log(`[KiroAPI]   - Content length: ${requestPayload.conversationState.currentMessage.userInputMessage?.content?.length || 0}`)
+      console.log(`[KiroAPI]   - Tools count: ${requestPayload.conversationState.currentMessage.userInputMessage?.userInputMessageContext?.tools?.length || 0}`)
+      console.log(`[KiroAPI]   - Model ID: ${requestPayload.conversationState.currentMessage.userInputMessage?.modelId || 'default'}`)
+      console.log(`[KiroAPI]   - Has profileArn: ${requestPayload.profileArn !== undefined}`)
+      console.log(`[KiroAPI]   - Agent mode: ${headers['x-amzn-kiro-agent-mode']}`)
       console.log(`[KiroAPI]   - Payload size: ${payloadStr.length} bytes`)
       
-      const headers = getAuthHeaders(account, endpoint)
-      // 流式请求直接发送，不走 K-Proxy（因为已内置 Machine ID 替换）
-      const response = await fetch(endpoint.url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(payload),
-        signal
-      })
+      const agent = getNetworkAgent()
+      if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
+      const response = agent
+        ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+        : await fetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal })
 
       if (response.status === 429) {
         console.log(`[KiroAPI] Endpoint ${endpoint.name} quota exhausted, trying next...`)
@@ -633,8 +798,8 @@ interface ToolUseState {
 // 解析 AWS Event Stream 二进制格式
 async function parseEventStream(
   body: ReadableStream<Uint8Array>,
-  onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean) => void,
-  onComplete: (usage: { inputTokens: number; outputTokens: number; credits: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number }) => void,
+  onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string) => void,
+  onComplete: (usage: KiroUsage) => void,
   onError: (error: Error) => void,
   inputChars: number = 0  // 输入字符长度，用于估算 input tokens
 ): Promise<void> {
@@ -752,6 +917,7 @@ async function parseEventStream(
                       name: currentToolUse.name,
                       input: finalInput
                     })
+                    totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
                     processedIds.add(currentToolUse.toolUseId)
                   }
                   currentToolUse = null
@@ -786,9 +952,9 @@ async function parseEventStream(
                 let parseError = false
                 try {
                   if (currentToolUse.inputBuffer) {
-                    proxyLogger.debug('Kiro', 'Tool input buffer: ' + currentToolUse.inputBuffer.substring(0, 200))
+                    if (logStreamEvents) proxyLogger.debug('Kiro', 'Tool input buffer: ' + currentToolUse.inputBuffer.substring(0, 200))
                     finalInput = JSON.parse(currentToolUse.inputBuffer)
-                    proxyLogger.debug('Kiro', 'Parsed tool input: ' + JSON.stringify(finalInput).substring(0, 200))
+                    if (logStreamEvents) proxyLogger.debug('Kiro', 'Parsed tool input: ' + JSON.stringify(finalInput).substring(0, 200))
                   }
                 } catch (e) {
                   parseError = true
@@ -807,6 +973,7 @@ async function parseEventStream(
                   name: currentToolUse.name,
                   input: finalInput
                 })
+                totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
                 
                 // 如果解析失败，额外发送一条文本消息告知用户
                 if (parseError) {
@@ -868,8 +1035,9 @@ async function parseEventStream(
               if (metadata.outputTokens) usage.outputTokens = metadata.outputTokens
             }
             
-            // 调试：打印所有事件类型（包括常见类型）
-            proxyLogger.debug('Kiro', 'Event: ' + (eventType || 'unknown'), JSON.stringify(event).slice(0, 500))
+            if (logStreamEvents) {
+              proxyLogger.debug('Kiro', 'Event: ' + (eventType || 'unknown'), JSON.stringify(event).slice(0, 500))
+            }
             
             // 处理 usageEvent
             if (eventType === 'usageEvent' || eventType === 'usage' || event.usageEvent || event.usage) {
@@ -926,10 +1094,12 @@ async function parseEventStream(
               if (reasoning.text) {
                 // 传递 isThinking=true 标记这是思考内容
                 proxyLogger.info('Kiro', `Received reasoning content (isThinking=true): ${reasoning.text.slice(0, 50)}...`)
-                onChunk(reasoning.text, undefined, true)
+                onChunk(reasoning.text, undefined, true, reasoning.signature)
                 totalOutputChars += reasoning.text.length
                 // 累计 reasoning tokens（约 3 字符 = 1 token）
                 usage.reasoningTokens += Math.max(1, Math.round(reasoning.text.length / 3))
+              } else if (reasoning.signature) {
+                onChunk('', undefined, true, reasoning.signature)
               }
               proxyLogger.debug('Kiro', 'reasoningContentEvent', JSON.stringify(reasoning).slice(0, 200))
             }
@@ -1046,6 +1216,7 @@ async function parseEventStream(
         name: currentToolUse.name,
         input: finalInput
       })
+      totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
     }
     
     // 如果 API 没有返回 token 信息，基于输出字符长度估算
@@ -1073,24 +1244,41 @@ export async function callKiroApi(
 ): Promise<{
   content: string
   toolUses: KiroToolUse[]
-  usage: { inputTokens: number; outputTokens: number; credits: number }
+  usage: KiroUsage
+  reasoningContent?: { text: string; signature?: string }
 }> {
   return new Promise((resolve, reject) => {
     let content = ''
+    let reasoningText = ''
+    let reasoningSignature: string | undefined
     const toolUses: KiroToolUse[] = []
-    let usage = { inputTokens: 0, outputTokens: 0, credits: 0 }
+    let usage: KiroUsage = { inputTokens: 0, outputTokens: 0, credits: 0 }
 
     callKiroApiStream(
       account,
       payload,
-      (text, toolUse) => {
-        content += text
+      (text, toolUse, isThinking, signature) => {
+        if (isThinking) {
+          reasoningText += text
+          reasoningSignature = signature || reasoningSignature
+        } else {
+          content += text
+        }
         if (toolUse) {
           toolUses.push(toolUse)
         }
       },
       (u) => {
         usage = u
+        if (reasoningText) {
+          resolve({
+            content,
+            toolUses,
+            usage,
+            reasoningContent: reasoningSignature ? { text: reasoningText, signature: reasoningSignature } : { text: reasoningText }
+          })
+          return
+        }
         resolve({ content, toolUses, usage })
       },
       reject,
@@ -1104,13 +1292,22 @@ export interface KiroModel {
   modelId: string
   modelName: string
   description: string
+  modelProvider?: string | null
   rateMultiplier?: number
   rateUnit?: string
+  status?: string | null
   supportedInputTypes?: string[]
   tokenLimits?: {
     maxInputTokens?: number | null
     maxOutputTokens?: number | null
   }
+  promptCaching?: {
+    supportsPromptCaching: boolean
+    maximumCacheCheckpointsPerRequest?: number | null
+    minimumTokensPerCacheCheckpoint?: number | null
+  } | null
+  additionalModelRequestFieldsSchema?: Record<string, unknown> | null
+  availableOrigins?: string[] | null
 }
 
 // 根据账号区域获取 Q Service 端点（官方插件使用 q.{region}.amazonaws.com）
@@ -1139,7 +1336,7 @@ export async function fetchKiroModels(account: ProxyAccount): Promise<KiroModel[
   try {
     do {
       const params = new URLSearchParams({ origin: 'AI_EDITOR', maxResults: '50' })
-      if (account.profileArn) params.set('profileArn', account.profileArn)
+      params.set('profileArn', resolveProfileArn(account))
       if (nextToken) params.set('nextToken', nextToken)
 
       const url = `${baseUrl}/ListAvailableModels?${params.toString()}`
@@ -1184,6 +1381,19 @@ export interface SubscriptionListResponse {
   subscriptionPlans?: SubscriptionPlan[]
 }
 
+// 订阅请求专用 User-Agent（匹配 Kiro IDE 实际报文格式）
+const KIRO_SUBSCRIPTION_VERSION = '0.12.155'
+
+function getSubscriptionUserAgent(machineId?: string): string {
+  const suffix = machineId ? `KiroIDE-${KIRO_SUBSCRIPTION_VERSION}-${machineId}` : `KiroIDE-${KIRO_SUBSCRIPTION_VERSION}`
+  return `aws-sdk-js/1.0.0 ua/2.1 os/win32#10.0.19043 lang/js md/nodejs#22.22.0 api/codewhispererruntime#1.0.0 m/N,E ${suffix}`
+}
+
+function getSubscriptionAmzUserAgent(machineId?: string): string {
+  const suffix = machineId ? `KiroIDE-${KIRO_SUBSCRIPTION_VERSION}-${machineId}` : `KiroIDE-${KIRO_SUBSCRIPTION_VERSION}`
+  return `aws-sdk-js/1.0.0 ${suffix}`
+}
+
 // 获取可用订阅列表
 export async function fetchAvailableSubscriptions(account: ProxyAccount): Promise<SubscriptionListResponse> {
   const baseUrl = getQServiceEndpoint(account.region)
@@ -1192,23 +1402,35 @@ export async function fetchAvailableSubscriptions(account: ProxyAccount): Promis
   
   const headers: Record<string, string> = {
     'Authorization': `Bearer ${account.accessToken}`,
-    'Content-Type': 'application/json',
-    'Accept': 'application/json',
-    'User-Agent': getKiroUserAgent(machineId),
-    'x-amz-user-agent': getKiroAmzUserAgent(machineId),
-    'x-amzn-codewhisperer-optout-preference': 'OPTIN'
+    'content-type': 'application/json',
+    'user-agent': getSubscriptionUserAgent(machineId),
+    'x-amz-user-agent': getSubscriptionAmzUserAgent(machineId),
+    'amz-sdk-invocation-id': uuidv4(),
+    'amz-sdk-request': 'attempt=1; max=1'
   }
 
+  const profileArn = resolveProfileArn(account)
+  const body = JSON.stringify({ profileArn })
+
+  console.log('[KiroAPI] ListAvailableSubscriptions request:', {
+    url,
+    headers: { ...headers, Authorization: `Bearer ${account.accessToken?.substring(0, 20)}...` },
+    body
+  })
+
   try {
-    const response = await fetchWithProxy(url, { method: 'POST', headers, body: '{}' })
+    const response = await fetchWithProxy(url, { method: 'POST', headers, body })
+    const responseText = await response.text()
+    console.log('[KiroAPI] ListAvailableSubscriptions response:', {
+      status: response.status,
+      body: responseText.substring(0, 500)
+    })
     
     if (!response.ok) {
-      console.error('[KiroAPI] ListAvailableSubscriptions failed:', response.status)
       return {}
     }
 
-    const data = await response.json()
-    return data
+    return JSON.parse(responseText)
   } catch (error) {
     console.error('[KiroAPI] ListAvailableSubscriptions error:', error)
     return {}
@@ -1234,17 +1456,20 @@ export async function fetchSubscriptionToken(
   
   const headers: Record<string, string> = {
     'Authorization': `Bearer ${account.accessToken}`,
-    'Content-Type': 'application/json',
-    'Accept': 'application/json',
-    'User-Agent': getKiroUserAgent(machineId),
-    'x-amz-user-agent': getKiroAmzUserAgent(machineId),
-    'x-amzn-codewhisperer-optout-preference': 'OPTIN'
+    'content-type': 'application/json',
+    'user-agent': getSubscriptionUserAgent(machineId),
+    'x-amz-user-agent': getSubscriptionAmzUserAgent(machineId),
+    'amz-sdk-invocation-id': uuidv4(),
+    'amz-sdk-request': 'attempt=1; max=1'
   }
 
+  const profileArn = resolveProfileArn(account)
+
   // clientToken 是必需参数，需要生成 UUID
-  const payload: { provider: string; clientToken: string; subscriptionType?: string } = {
-    provider: 'STRIPE',
-    clientToken: uuidv4()
+  const payload: Record<string, string> = {
+    clientToken: uuidv4(),
+    profileArn,
+    provider: 'STRIPE'
   }
   if (subscriptionType) {
     payload.subscriptionType = subscriptionType
@@ -1264,5 +1489,41 @@ export async function fetchSubscriptionToken(
   } catch (error) {
     console.error('[KiroAPI] CreateSubscriptionToken error:', error)
     return { message: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+// 设置用户偏好（超额开启/关闭）
+export async function setUserPreference(
+  account: ProxyAccount,
+  overageStatus: 'ENABLED' | 'DISABLED'
+): Promise<{ success: boolean; error?: string }> {
+  const baseUrl = getQServiceEndpoint(account.region)
+  const url = `${baseUrl}/setUserPreference`
+  const machineId = getAccountMachineId(account.id, account.machineId)
+
+  const headers: Record<string, string> = {
+    'Authorization': `Bearer ${account.accessToken}`,
+    'content-type': 'application/json',
+    'user-agent': getSubscriptionUserAgent(machineId),
+    'x-amz-user-agent': getSubscriptionAmzUserAgent(machineId),
+    'amz-sdk-invocation-id': uuidv4(),
+    'amz-sdk-request': 'attempt=1; max=1'
+  }
+
+  const profileArn = resolveProfileArn(account)
+  const body = JSON.stringify({
+    overageConfiguration: { overageStatus },
+    profileArn
+  })
+
+  try {
+    const response = await fetchWithProxy(url, { method: 'POST', headers, body })
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => '')
+      return { success: false, error: `HTTP ${response.status}: ${errorText.substring(0, 200)}` }
+    }
+    return { success: true }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
   }
 }

@@ -140,6 +140,20 @@ const api = {
     return ipcRenderer.invoke('switch-account', credentials)
   },
 
+  // 切换账号到 Kiro CLI - 写入凭证到 SQLite 数据库
+  switchAccountCli: (credentials: {
+    accessToken: string
+    refreshToken: string
+    clientId?: string
+    clientSecret?: string
+    region?: string
+    profileArn?: string
+    provider?: string
+    scopes?: string[]
+  }): Promise<{ success: boolean; error?: string; dbPath?: string }> => {
+    return ipcRenderer.invoke('switch-account-cli', credentials)
+  },
+
   // 退出登录 - 清除本地 SSO 缓存
   logoutAccount: (): Promise<{ success: boolean; deletedCount?: number; error?: string }> => {
     return ipcRenderer.invoke('logout-account')
@@ -574,7 +588,7 @@ const api = {
   // ============ Kiro API 反代服务器 ============
 
   // 启动反代服务器
-  proxyStart: (config?: { port?: number; host?: string; enableMultiAccount?: boolean; logRequests?: boolean }): Promise<{ success: boolean; port?: number; error?: string }> => {
+  proxyStart: (config?: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; logRequests?: boolean; autoContinueRounds?: number; enableServerSideToolAutoContinue?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think' }): Promise<{ success: boolean; port?: number; error?: string }> => {
     return ipcRenderer.invoke('proxy-start', config)
   },
 
@@ -619,12 +633,12 @@ const api = {
   },
 
   // 更新反代服务器配置
-  proxyUpdateConfig: (config: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; selectedAccountIds?: string[]; logRequests?: boolean; autoStart?: boolean; maxRetries?: number; preferredEndpoint?: 'codewhisperer' | 'amazonq'; autoContinueRounds?: number; disableTools?: boolean; autoSwitchOnQuotaExhausted?: boolean; modelMappings?: Array<{ id: string; name: string; enabled: boolean; type: 'replace' | 'alias' | 'loadbalance'; sourceModel: string; targetModels: string[]; weights?: number[]; priority: number; apiKeyIds?: string[] }> }): Promise<{ success: boolean; config?: unknown; error?: string }> => {
+  proxyUpdateConfig: (config: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; selectedAccountIds?: string[]; logRequests?: boolean; autoStart?: boolean; maxRetries?: number; preferredEndpoint?: 'codewhisperer' | 'amazonq'; autoContinueRounds?: number; enableServerSideToolAutoContinue?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; autoSwitchOnQuotaExhausted?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think'; modelMappings?: Array<{ id: string; name: string; enabled: boolean; type: 'replace' | 'alias' | 'loadbalance'; sourceModel: string; targetModels: string[]; weights?: number[]; priority: number; apiKeyIds?: string[] }> }): Promise<{ success: boolean; config?: unknown; error?: string }> => {
     return ipcRenderer.invoke('proxy-update-config', config)
   },
 
   // 添加账号到反代池
-  proxyAddAccount: (account: { id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number }): Promise<{ success: boolean; accountCount?: number; error?: string }> => {
+  proxyAddAccount: (account: { id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }): Promise<{ success: boolean; accountCount?: number; error?: string }> => {
     return ipcRenderer.invoke('proxy-add-account', account)
   },
 
@@ -634,7 +648,7 @@ const api = {
   },
 
   // 同步账号到反代池（批量更新）
-  proxySyncAccounts: (accounts: Array<{ id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number }>): Promise<{ success: boolean; accountCount?: number; error?: string }> => {
+  proxySyncAccounts: (accounts: Array<{ id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }>): Promise<{ success: boolean; accountCount?: number; error?: string }> => {
     return ipcRenderer.invoke('proxy-sync-accounts', accounts)
   },
 
@@ -658,19 +672,28 @@ const api = {
     return ipcRenderer.invoke('proxy-get-models')
   },
 
+  proxyConfigureClients: (input: { clients: Array<'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'>; modelId: string; modelName?: string; models?: Array<{ id: string; name?: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null }> }): Promise<{ success: boolean; error?: string; proxyOrigin: string; openaiBaseUrl: string; results: Array<{ client: 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'; success: boolean; paths: string[]; backupPaths: string[]; error?: string }> }> => {
+    return ipcRenderer.invoke('proxy-configure-clients', input)
+  },
+
   // 获取账户可用模型列表
   accountGetModels: (accessToken: string, region?: string, profileArn?: string): Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }> }> => {
     return ipcRenderer.invoke('account-get-models', accessToken, region, profileArn)
   },
 
   // 获取可用订阅列表
-  accountGetSubscriptions: (accessToken: string, region?: string): Promise<{ success: boolean; error?: string; plans: Array<{ name: string; qSubscriptionType: string; description: { title: string; billingInterval: string; featureHeader: string; features: string[] }; pricing: { amount: number; currency: string } }>; disclaimer?: string[] }> => {
-    return ipcRenderer.invoke('account-get-subscriptions', accessToken, region)
+  accountGetSubscriptions: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string): Promise<{ success: boolean; error?: string; plans: Array<{ name: string; qSubscriptionType: string; description: { title: string; billingInterval: string; featureHeader: string; features: string[] }; pricing: { amount: number; currency: string } }>; disclaimer?: string[] }> => {
+    return ipcRenderer.invoke('account-get-subscriptions', accessToken, region, profileArn, machineId, provider, authMethod, accountId)
   },
 
   // 获取订阅管理/支付链接
-  accountGetSubscriptionUrl: (accessToken: string, subscriptionType?: string, region?: string): Promise<{ success: boolean; error?: string; url?: string; status?: string }> => {
-    return ipcRenderer.invoke('account-get-subscription-url', accessToken, subscriptionType, region)
+  accountGetSubscriptionUrl: (accessToken: string, subscriptionType?: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string): Promise<{ success: boolean; error?: string; url?: string; status?: string }> => {
+    return ipcRenderer.invoke('account-get-subscription-url', accessToken, subscriptionType, region, profileArn, machineId, provider, authMethod, accountId)
+  },
+
+  // 设置用户超额偏好
+  accountSetOverage: (accessToken: string, overageStatus: 'ENABLED' | 'DISABLED', region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('account-set-overage', accessToken, overageStatus, region, profileArn, machineId, provider, authMethod, accountId)
   },
 
   // 在新窗口打开订阅链接
@@ -1021,6 +1044,101 @@ const api = {
   // 发送关闭确认对话框响应
   sendCloseConfirmResponse: (action: 'minimize' | 'quit' | 'cancel', rememberChoice: boolean): void => {
     ipcRenderer.send('close-confirm-response', action, rememberChoice)
+  },
+
+  // ============ 注册功能 API ============
+
+  // 启动自动注册
+  registrationStartAuto: (config: {
+    proxy?: string
+    moEmailBaseURL?: string
+    moEmailAPIKey?: string
+    useOutlook?: boolean
+    outlookData?: string
+    useTempMailPlus?: boolean
+    tempMailPlusEmail?: string
+    tempMailPlusEpin?: string
+    tempMailPlusDomain?: string
+    password?: string
+    fullName?: string
+    taskId?: string
+  }): Promise<{ success: boolean; result?: unknown; error?: string }> => {
+    return ipcRenderer.invoke('registration-start-auto', config)
+  },
+
+  // 手动模式 Phase1: 初始化 OIDC + 设备授权
+  registrationManualPhase1: (config: {
+    proxy?: string
+    password?: string
+    fullName?: string
+  }): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('registration-manual-phase1', config)
+  },
+
+  // 手动模式 Phase2: 设置邮箱 -> 发送 OTP
+  registrationManualPhase2: (email: string, fullName?: string): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('registration-manual-phase2', email, fullName)
+  },
+
+  // 手动模式 Phase3: 验证码 -> 完成
+  registrationManualPhase3: (otp: string): Promise<{ success: boolean; result?: unknown; error?: string }> => {
+    return ipcRenderer.invoke('registration-manual-phase3', otp)
+  },
+
+  // 取消注册
+  registrationCancel: (): Promise<{ success: boolean }> => {
+    return ipcRenderer.invoke('registration-cancel')
+  },
+
+  // 获取注册状态
+  registrationStatus: (): Promise<{ inProgress: boolean }> => {
+    return ipcRenderer.invoke('registration-status')
+  },
+
+  // 监听注册日志
+  onRegistrationLog: (callback: (msg: string) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, msg: string): void => {
+      callback(msg)
+    }
+    ipcRenderer.on('registration-log', handler)
+    return () => {
+      ipcRenderer.removeListener('registration-log', handler)
+    }
+  },
+
+  // 监听注册完成
+  onRegistrationComplete: (callback: (result: {
+    status: 'success' | 'failed'
+    email: string
+    password?: string
+    error?: string
+    clientId?: string
+    clientSecret?: string
+    refreshToken?: string
+    accessToken?: string
+    region?: string
+    provider?: string
+    verify?: Record<string, unknown>
+  }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, result: {
+      status: 'success' | 'failed'
+      email: string
+      password?: string
+      error?: string
+      clientId?: string
+      clientSecret?: string
+      refreshToken?: string
+      accessToken?: string
+      region?: string
+      provider?: string
+      verify?: Record<string, unknown>
+    }): void => {
+      callback(result)
+    }
+    ipcRenderer.on('registration-complete', handler)
+    return () => {
+      ipcRenderer.removeListener('registration-complete', handler)
+    }
   }
 }
 

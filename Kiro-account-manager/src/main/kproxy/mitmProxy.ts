@@ -288,10 +288,19 @@ export class MitmProxy {
           if (clMatch) {
             contentLength = parseInt(clMatch[1], 10)
           }
-          bodyReceived = Buffer.byteLength(body)
+
+          // 替换 body 中的 machineId
+          const modifiedBody = this.modifyBody(body)
+          if (modifiedBody !== body) {
+            // body 长度变了，更新 Content-Length
+            const newLength = contentLength - Buffer.byteLength(body) + Buffer.byteLength(modifiedBody)
+            modifiedHeaders = modifiedHeaders.replace(/content-length:\s*\d+/i, `content-length: ${newLength}`)
+            contentLength = newLength
+          }
+          bodyReceived = Buffer.byteLength(modifiedBody)
 
           // 转发请求到目标服务器
-          this.forwardRequest(modifiedHeaders, body, hostname, port, clientSocket, contentLength, bodyReceived)
+          this.forwardRequest(modifiedHeaders, modifiedBody, hostname, port, clientSocket, contentLength, bodyReceived)
         }
       }
     })
@@ -299,6 +308,27 @@ export class MitmProxy {
     clientSocket.on('error', (error) => {
       console.error(`[MitmProxy] Decrypted connection error:`, error.message)
     })
+  }
+
+  /**
+   * 替换请求体中的 Machine ID
+   */
+  private modifyBody(body: string): string {
+    const targetDeviceId = this.config.deviceId
+    if (!targetDeviceId || !body) return body
+    // 只在 body 中包含 64 位十六进制时才替换（避免误伤无关内容）
+    if (!MACHINE_ID_REGEX.test(body)) return body
+    MACHINE_ID_REGEX.lastIndex = 0
+    const result = body.replace(MACHINE_ID_REGEX, (match) => {
+      // 不替换已经是目标 ID 的
+      if (match.toLowerCase() === targetDeviceId.toLowerCase()) return match
+      if (this.config.logRequests) {
+        console.log(`[MitmProxy] Replaced Machine ID in body: ${match.substring(0, 16)}... -> ${targetDeviceId.substring(0, 16)}...`)
+      }
+      return targetDeviceId
+    })
+    MACHINE_ID_REGEX.lastIndex = 0
+    return result
   }
 
   /**

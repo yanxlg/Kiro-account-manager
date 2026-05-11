@@ -271,6 +271,74 @@ The project is configured with GitHub Actions workflow for auto building all pla
 
 ## 📋 Changelog
 
+### v1.6.0 (2026-5-12)
+
+#### API Proxy Enhancement
+- **New**: Gemini v1beta API compatibility (`/v1beta/models`, `/v1beta/models/{model}:generateContent`, `/v1beta/models/{model}:streamGenerateContent`)
+- **New**: One-click client configuration supports 6 clients: Claude Code, OpenCode, Codex CLI, Gemini CLI, Hermes, OpenClaw
+- **New**: AmazonQ CLI endpoint isolation — `amazonq-cli` preferred endpoint uses SendMessageStreaming only, no fallback on failure
+- **New**: Smart account rotation — circuit breaker + sticky behavior + exponential backoff + probabilistic retry (inspired by Kiro Gateway architecture)
+- **New**: Error classification system — `FATAL` (request problem, return directly) vs `RECOVERABLE` (account problem, switch to next)
+- **New**: Proactive quota filtering — exhausted accounts excluded before selection, no more waiting for 429
+- **New**: `onPoolEmpty` lazy-load callback — proxy auto-loads accounts from store on first request (fixes Mac cold-start 503)
+- **New**: Cold-start account pool synchronous retry mechanism (5 retries, 2s/4s/6s/8s/10s intervals)
+- **New**: Model capability tags — model list displays Thinking/Caching/Effort capabilities (parsed from ListAvailableModels)
+- **New**: Hidden model support — Claude 3.7 Sonnet and other models not in official list but supported by backend
+- **Improved**: Request headers/UA/version fully match official Kiro IDE 0.12.155 capture (SDK 1.0.34, dynamic OS/Node fingerprint)
+- **Improved**: Request body adds agentContinuationId/agentTaskType fields, matching official protocol
+- **Improved**: All outbound requests routed through app-level HTTP proxy (including token refresh, SSO login, image download, etc.)
+- **Improved**: machineId empty value fallback (SHA-256 hash), token refresh random jitter (0-3s), IDC UA dynamic OS
+- **Improved**: K-Proxy MITM adds body machineId replacement + telemetry domain kiro.dev interception
+- **Improved**: Tool call token estimation covers all exits (tool name + parameter JSON)
+- **Improved**: 503 error message includes quota details (`All accounts quota exhausted (X/Y exhausted, Z in cooldown)`)
+- **Improved**: Extended quota error detection patterns (402, 429, ThrottlingException, ServiceQuotaExceededException, rate limit, limit exceeded)
+- **New**: Streaming log toggle — off by default, shows detailed JSON for each streaming event when enabled (assistantResponseEvent/toolUseEvent, etc.)
+- **Improved**: Thinking mode simplified — removed legacy `<thinking>` tag detection, directly pass through native reasoningContentEvent as OpenAI `reasoning_content` / Claude thinking block
+- **New**: `additionalModelRequestFields` support — passes through `thinking` parameter from client to Kiro API
+
+#### Account Switching
+- **New**: Kiro CLI switch support — writes credentials to `~/.local/share/kiro-cli/data.sqlite3` SQLite database
+- **New**: Settings allows selecting switch target: "Kiro IDE" / "Kiro CLI" / "Both (IDE + CLI)" (default: IDE)
+- **New**: Manual and auto switching both follow `switchTarget` setting
+- **New**: CLI switch uses Read-Merge-Write strategy, preserves unknown fields, cleans expired priority keys
+
+#### Subscription & Overage
+- **New**: Batch overage settings page — "One-click Enable" (only disabled) and "Set All" (all subscribed) buttons
+- **New**: Account overage status overview table (subscription type, overage capability, overage status)
+- **Fixed**: `overageStatus` field detection — correctly maps REST API `"ENABLED"`/`"DISABLED"` strings to boolean values
+- **Fixed**: Batch check and batch refresh now return `resourceDetail` and `overageCapability` to frontend
+
+#### UI & Interaction
+- **New**: Registration page full redesign — using Card/Button/Input/Label/Progress/Badge/Switch component library
+- **New**: Subscription page header redesign — gradient banner style
+- **New**: Both pages support theme color switching and dark mode
+- **Fixed**: Batch registration progress/history no longer lost after page navigation (module-level React setter refs)
+- **Fixed**: Windows dev terminal Chinese encoding issue (prepend `chcp 65001` to dev script)
+
+#### Account Registration
+- **New**: Account registration feature (Manual / MoEmail / Outlook / Custom Domain modes)
+- **New**: Custom domain mode — user provides domain (configure catch-all forwarding to TempMail.Plus), system auto-generates random English name email prefix for registration
+- **New**: Concurrent batch registration — configurable concurrency (1-10 tasks simultaneously)
+- **New**: Batch registration with auto-import, failure retry, per-item status tracking
+- **New**: Manual mode step progress indicator
+- **New**: All modes auto-verify and import account after successful registration
+- **New**: Session-level registration state persistence (logs, stages, history preserved after page navigation)
+- **New**: Manual mode supports mid-process cancellation
+- **New**: Registration page full i18n support (Chinese/English)
+
+#### Bug Fixes
+- **Fixed**: Model alias mapping changed to exact match, `claude-opus-4.7` and other dynamic models no longer downgraded
+- **Fixed**: Proxy test page loads real `/v1/models` results, avoids selecting unavailable static aliases
+- **Fixed**: Unknown model IDs passed through as-is, no longer remapped to static Claude defaults
+- **Fixed**: Proxy default endpoint order changed to AmazonQ first, CodeWhisperer fallback
+- **Fixed**: Proxy streaming requests routed through app-level HTTP proxy
+- **Fixed**: CodeWhisperer requests resolve short aliases to `ListAvailableModels` official IDs
+- **Fixed**: CodeWhisperer requests include `x-amzn-kiro-agent-mode` header
+- **Fixed**: Registration page blank screen issue (TDZ error)
+- **Fixed**: Manual mode registration accounts no longer imported twice
+- **Fixed**: TLS fingerprint upgraded to `chrome_144`
+- **Fixed**: Corrected `tlsclientwrapper` API call — body as 2nd parameter, options as 3rd parameter
+
 ### v1.5.0 (2025-02-06)
 - 🌐 **API Regional Routing Fix**: Fixed 403 errors for EU accounts when calling ListAvailableModels/fetchSubscriptionToken/fetchAvailableSubscriptions, all API calls now route to correct regional endpoints (eu-* → eu-central-1, others → us-east-1)
 - 🔄 **Regional Fallback Mechanism**: Auto-retry with alternate regional endpoint on 403 errors, ensuring all regions (ap-*, ca-*, sa-*, me-*, af-*) work correctly

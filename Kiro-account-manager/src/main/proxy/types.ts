@@ -11,20 +11,29 @@ export interface OpenAIChatRequest {
   tools?: OpenAITool[]
   tool_choice?: string | { type: string; function: { name: string } }
   response_format?: { type: string; json_schema?: unknown }
+  conversation_id?: string
+  metadata?: Record<string, unknown>
+  kiro_context?: KiroRequestContext
 }
 
 export interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
   content: string | OpenAIContentPart[]
+  reasoning_content?: string
   name?: string
   tool_calls?: OpenAIToolCall[]
   tool_call_id?: string
+  cache_control?: ClaudeCacheControl
 }
 
 export interface OpenAIContentPart {
-  type: 'text' | 'image_url'
+  type: 'text' | 'image_url' | 'file' | 'document'
   text?: string
   image_url?: { url: string; detail?: string }
+  file?: { filename?: string; file_data?: string }
+  source?: ClaudeDocumentSource
+  name?: string
+  cache_control?: ClaudeCacheControl
 }
 
 export interface OpenAITool {
@@ -34,6 +43,7 @@ export interface OpenAITool {
     description: string
     parameters: unknown
   }
+  cache_control?: ClaudeCacheControl
 }
 
 export interface OpenAIToolCall {
@@ -55,6 +65,12 @@ export interface OpenAIChatResponse {
     prompt_tokens: number
     completion_tokens: number
     total_tokens: number
+    prompt_tokens_details?: {
+      cached_tokens?: number
+    }
+    completion_tokens_details?: {
+      reasoning_tokens?: number
+    }
   }
 }
 
@@ -63,6 +79,7 @@ export interface OpenAIChoice {
   message: {
     role: 'assistant'
     content: string | null
+    reasoning_content?: string
     tool_calls?: OpenAIToolCall[]
   }
   finish_reason: 'stop' | 'length' | 'tool_calls' | null
@@ -78,11 +95,66 @@ export interface OpenAIStreamChunk {
     delta: {
       role?: 'assistant'
       content?: string
+      reasoning_content?: string
       tool_calls?: Partial<OpenAIToolCall>[]
     }
     finish_reason: 'stop' | 'length' | 'tool_calls' | null
   }[]
 }
+
+export interface OpenAIResponsesRequest {
+  model: string
+  input: string | OpenAIResponseInputItem[]
+  instructions?: string
+  temperature?: number
+  top_p?: number
+  max_output_tokens?: number
+  stream?: boolean
+  tools?: OpenAITool[]
+  tool_choice?: string | { type: string; name?: string; function?: { name: string } }
+  previous_response_id?: string
+  reasoning?: unknown
+  metadata?: Record<string, unknown>
+  kiro_context?: KiroRequestContext
+}
+
+export interface OpenAIResponseInputItem {
+  type?: 'message' | 'function_call' | 'function_call_output'
+  role?: 'system' | 'user' | 'assistant' | 'tool'
+  content?: string | OpenAIResponseContentPart[]
+  call_id?: string
+  name?: string
+  arguments?: string
+  output?: string
+}
+
+export interface OpenAIResponseContentPart {
+  type: 'input_text' | 'output_text' | 'input_image' | 'input_file'
+  text?: string
+  image_url?: string
+  file_data?: string
+  filename?: string
+}
+
+export interface OpenAIResponsesResponse {
+  id: string
+  object: 'response'
+  created_at: number
+  model: string
+  output: OpenAIResponseOutputItem[]
+  previous_response_id?: string
+  usage: {
+    input_tokens: number
+    output_tokens: number
+    total_tokens: number
+    input_tokens_details?: { cached_tokens?: number }
+    output_tokens_details?: { reasoning_tokens?: number }
+  }
+}
+
+export type OpenAIResponseOutputItem =
+  | { type: 'message'; id: string; role: 'assistant'; content: { type: 'output_text'; text: string }[] }
+  | { type: 'function_call'; id: string; call_id: string; name: string; arguments: string }
 
 // ============ Claude 兼容格式 ============
 export interface ClaudeRequest {
@@ -95,34 +167,51 @@ export interface ClaudeRequest {
   system?: string | ClaudeSystemBlock[]
   tools?: ClaudeTool[]
   tool_choice?: { type: string; name?: string }
+  thinking?: { type: 'enabled'; budget_tokens: number } | { type: 'adaptive'; display?: string } | { type: 'disabled' }
+  conversation_id?: string
+  metadata?: Record<string, unknown>
+  kiro_context?: KiroRequestContext
 }
 
 export interface ClaudeMessage {
   role: 'user' | 'assistant'
   content: string | ClaudeContentBlock[]
+  cache_control?: ClaudeCacheControl
 }
 
 export interface ClaudeSystemBlock {
   type: 'text'
   text: string
+  cache_control?: ClaudeCacheControl
 }
 
 export interface ClaudeContentBlock {
-  type: 'text' | 'image' | 'tool_use' | 'tool_result' | 'thinking'
+  type: 'text' | 'image' | 'document' | 'tool_use' | 'tool_result' | 'thinking' | 'redacted_thinking'
   text?: string
   thinking?: string
-  source?: { type: 'base64'; media_type: string; data: string }
+  signature?: string
+  source?: { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string } | ClaudeDocumentSource
   id?: string
   name?: string
   input?: unknown
   tool_use_id?: string
   content?: string | ClaudeContentBlock[]
+  cache_control?: ClaudeCacheControl
 }
+
+export type ClaudeDocumentSource =
+  | { type: 'base64'; media_type: string; data: string }
+  | { type: 'text'; media_type?: string; data: string }
 
 export interface ClaudeTool {
   name: string
   description: string
   input_schema: unknown
+  cache_control?: ClaudeCacheControl
+}
+
+export interface ClaudeCacheControl {
+  type: string
 }
 
 export interface ClaudeResponse {
@@ -136,6 +225,8 @@ export interface ClaudeResponse {
   usage: {
     input_tokens: number
     output_tokens: number
+    cache_creation_input_tokens?: number
+    cache_read_input_tokens?: number
   }
 }
 
@@ -144,8 +235,8 @@ export interface ClaudeStreamEvent {
   message?: Partial<ClaudeResponse>
   index?: number
   content_block?: ClaudeContentBlock
-  delta?: { type: string; text?: string; thinking?: string; reasoning_content?: string; stop_reason?: string; stop_sequence?: string }
-  usage?: { input_tokens?: number; output_tokens: number }
+  delta?: { type: string; text?: string; thinking?: string; signature?: string; reasoning_content?: string; stop_reason?: string; stop_sequence?: string }
+  usage?: { input_tokens?: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }
   error?: { type: string; message: string }
 }
 
@@ -154,9 +245,12 @@ export interface KiroPayload {
   conversationState: KiroConversationState
   profileArn?: string
   inferenceConfig?: KiroInferenceConfig
+  additionalModelRequestFields?: Record<string, unknown>
 }
 
 export interface KiroConversationState {
+  agentContinuationId?: string
+  agentTaskType?: string
   chatTriggerType: 'MANUAL'
   conversationId: string
   currentMessage: KiroCurrentMessage
@@ -172,6 +266,9 @@ export interface KiroUserInputMessage {
   modelId?: string  // 可选，占位消息不需要
   origin: string
   images?: KiroImage[]
+  documents?: KiroDocument[]
+  cachePoint?: KiroCachePoint
+  clientCacheConfig?: unknown
   userInputMessageContext?: KiroUserInputMessageContext
 }
 
@@ -180,9 +277,20 @@ export interface KiroImage {
   source: { bytes: string }
 }
 
+export interface KiroDocument {
+  format: string
+  name: string
+  source: { bytes: string }
+}
+
 export interface KiroUserInputMessageContext {
   toolResults?: KiroToolResult[]
   tools?: KiroToolWrapper[]
+  editorState?: unknown
+  shellState?: unknown
+  gitState?: unknown
+  envState?: unknown
+  additionalContext?: unknown
 }
 
 export interface KiroToolResult {
@@ -191,12 +299,14 @@ export interface KiroToolResult {
   toolUseId: string
 }
 
-export interface KiroToolWrapper {
+export type KiroToolWrapper = {
   toolSpecification: {
     name: string
     description: string
     inputSchema: { json: unknown }
   }
+} | {
+  cachePoint: KiroCachePoint
 }
 
 export interface KiroHistoryMessage {
@@ -206,6 +316,8 @@ export interface KiroHistoryMessage {
 
 export interface KiroAssistantResponseMessage {
   content: string
+  cachePoint?: KiroCachePoint
+  reasoningContent?: KiroReasoningContent
   toolUses?: KiroToolUse[]
 }
 
@@ -221,6 +333,34 @@ export interface KiroInferenceConfig {
   topP?: number
 }
 
+export interface KiroCachePoint {
+  type: 'default'
+}
+
+export interface KiroReasoningContent {
+  reasoningText: {
+    text: string
+    signature?: string
+  }
+}
+
+export interface KiroRequestContext {
+  editorState?: unknown
+  shellState?: unknown
+  gitState?: unknown
+  envState?: unknown
+  additionalContext?: unknown
+}
+
+export interface KiroUsage {
+  inputTokens: number
+  outputTokens: number
+  credits: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  reasoningTokens?: number
+}
+
 // ============ 账号和代理配置 ============
 export interface ProxyAccount {
   id: string
@@ -230,7 +370,7 @@ export interface ProxyAccount {
   clientId?: string
   clientSecret?: string
   region?: string
-  authMethod?: 'social' | 'idc'
+  authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'
   provider?: string
   profileArn?: string
   expiresAt?: number
@@ -241,6 +381,11 @@ export interface ProxyAccount {
   errorCount?: number
   isAvailable?: boolean
   cooldownUntil?: number
+  // 配额追踪
+  quotaUsed?: number
+  quotaLimit?: number
+  quotaExhaustedAt?: number // 配额耗尽时间戳
+  quotaResetAt?: number // 下次配额重置时间
 }
 
 // API Key 格式类型
@@ -320,12 +465,13 @@ export interface ProxyConfig {
   enableMultiAccount: boolean
   selectedAccountIds: string[]
   logRequests: boolean
+  logStreamEvents?: boolean
   maxConcurrent: number
   // 重试配置
   maxRetries?: number
   retryDelayMs?: number
   // 首选端点配置
-  preferredEndpoint?: 'codewhisperer' | 'amazonq'
+  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
   // Token 刷新提前量（秒）
   tokenRefreshBeforeExpiry?: number
   // TLS/HTTPS 配置
@@ -334,14 +480,12 @@ export interface ProxyConfig {
   autoStart?: boolean
   // 工具调用后自动继续（最大轮数）
   autoContinueRounds?: number
+  enableServerSideToolAutoContinue?: boolean
+  clientDrivenToolExecution?: boolean
   // 禁用工具调用（移除 tools 参数）
   disableTools?: boolean
   // 单账号模式下额度耗尽自动切换到下一个账号
   autoSwitchOnQuotaExhausted?: boolean
-  // 模型思考模式配置（模型名 -> 是否默认启用思考模式）
-  modelThinkingMode?: Record<string, boolean>
-  // 思考内容输出格式：reasoning_content / thinking / think
-  thinkingOutputFormat?: 'reasoning_content' | 'thinking' | 'think'
   // 模型映射规则
   modelMappings?: ModelMappingRule[]
 }

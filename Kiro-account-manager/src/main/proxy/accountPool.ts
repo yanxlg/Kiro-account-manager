@@ -1,16 +1,46 @@
-// 多账号轮询管理器
+// 多账号智能轮询管理器
+// 参考 Kiro Gateway 的 Circuit Breaker + Sticky + 指数退避 + 概率重试机制
 import type { ProxyAccount, AccountStats } from './types'
 
+// 错误类型分类（决定 failover 策略）
+export enum ErrorType {
+  FATAL = 'fatal',           // 请求本身有问题 → 直接返回客户端，不切号
+  RECOVERABLE = 'recoverable' // 账号问题 → 切换到下一个账号
+}
+
+// 根据 HTTP 状态码和错误原因分类错误
+export function classifyError(statusCode: number, reason?: string): ErrorType {
+  // RECOVERABLE: 配额/计费问题
+  if (statusCode === 402) return ErrorType.RECOVERABLE
+  // RECOVERABLE: Token 过期/无效
+  if (statusCode === 403) return ErrorType.RECOVERABLE
+  // RECOVERABLE: 限流
+  if (statusCode === 429) return ErrorType.RECOVERABLE
+  // 400: 根据原因细分
+  if (statusCode === 400) {
+    // 上下文超限 → 所有账号都会失败
+    if (reason === 'CONTENT_LENGTH_EXCEEDS_THRESHOLD') return ErrorType.FATAL
+    return ErrorType.FATAL
+  }
+  // 422: 请求格式错误
+  if (statusCode === 422) return ErrorType.FATAL
+  // 5xx: 服务端错误
+  if (statusCode >= 500) return ErrorType.FATAL
+  return ErrorType.FATAL
+}
+
 export interface AccountPoolConfig {
-  cooldownMs: number // 错误后冷却时间
-  maxErrorCount: number // 最大连续错误次数
-  quotaResetMs: number // 配额重置时间
+  baseCooldownMs: number      // 基础冷却时间（指数退避的基数）
+  maxBackoffMultiplier: number // 最大退避倍数
+  quotaResetMs: number        // 配额耗尽冷却时间
+  probabilisticRetryChance: number // 概率重试几率（0-1）
 }
 
 const DEFAULT_CONFIG: AccountPoolConfig = {
-  cooldownMs: 60000, // 1分钟冷却
-  maxErrorCount: 3, // 3次错误后暂停
-  quotaResetMs: 3600000 // 1小时配额重置
+  baseCooldownMs: 60000,        // 60s 基础冷却
+  maxBackoffMultiplier: 1440,   // 最大 1440 倍 = 24h
+  quotaResetMs: 3600000,        // 1h 配额重置
+  probabilisticRetryChance: 0.1 // 10% 概率重试
 }
 
 export class AccountPool {
@@ -60,31 +90,50 @@ export class AccountPool {
     }
   }
 
-  // 获取下一个可用账号（轮询）
-  getNextAccount(): ProxyAccount | null {
+  // 获取下一个可用账号（粘滞 + 断路器 + 指数退避 + 概率重试）
+  getNextAccount(excludeIds?: Set<string>): ProxyAccount | null {
     const accountList = Array.from(this.accounts.values())
     if (accountList.length === 0) {
       return null
     }
 
+    // 单账号特殊处理：绕过断路器，直接返回（让用户看到真实 API 错误）
+    if (accountList.length === 1) {
+      const account = accountList[0]
+      if (excludeIds?.has(account.id)) return null
+      return account
+    }
+
     const now = Date.now()
-    let attempts = 0
-    const maxAttempts = accountList.length
+    // 从当前粘滞索引开始遍历所有账号
+    const startIndex = this.currentIndex
 
-    while (attempts < maxAttempts) {
-      const account = accountList[this.currentIndex]
-      this.currentIndex = (this.currentIndex + 1) % accountList.length
+    for (let i = 0; i < accountList.length; i++) {
+      const idx = (startIndex + i) % accountList.length
+      const account = accountList[idx]
 
-      // 检查账号是否可用
+      // 跳过当前请求已试过的账号
+      if (excludeIds?.has(account.id)) continue
+
+      // 检查账号是否可用（含断路器状态）
       if (this.isAccountAvailable(account, now)) {
         return account
       }
-
-      attempts++
     }
 
-    // 没有可用账号，返回冷却时间最短的
-    return this.getAccountWithShortestCooldown(accountList, now)
+    // 没有可用账号：检查是否全部因配额耗尽
+    const candidates = excludeIds
+      ? accountList.filter(a => !excludeIds.has(a.id))
+      : accountList
+    const allExhausted = candidates.length > 0 && candidates.every(a => this.isQuotaExhausted(a, now))
+    if (allExhausted) {
+      console.log(`[AccountPool] All ${candidates.length} accounts quota exhausted, no fallback available`)
+      return null
+    }
+
+    // 还有非配额原因不可用的账号，返回冷却时间最短的
+    const nonExhausted = candidates.filter(a => !this.isQuotaExhausted(a, now))
+    return this.getAccountWithShortestCooldown(nonExhausted, now)
   }
 
   // 获取特定账号
@@ -118,15 +167,10 @@ export class AccountPool {
     return Array.from(this.accounts.values())
   }
 
-  // 检查账号是否可用
+  // 检查账号是否可用（断路器 + 指数退避 + 概率重试）
   private isAccountAvailable(account: ProxyAccount, now: number): boolean {
-    // 检查冷却时间
-    if (account.cooldownUntil && account.cooldownUntil > now) {
-      return false
-    }
-
-    // 检查错误计数
-    if ((account.errorCount || 0) >= this.config.maxErrorCount) {
+    // 检查配额是否耗尽
+    if (this.isQuotaExhausted(account, now)) {
       return false
     }
 
@@ -135,7 +179,46 @@ export class AccountPool {
       return false
     }
 
-    return account.isAvailable !== false
+    if (account.isAvailable === false) {
+      return false
+    }
+
+    // 断路器检查：指数退避 + 概率重试
+    const failures = account.errorCount || 0
+    if (failures > 0 && account.lastUsed) {
+      const timeSinceFailure = now - account.lastUsed
+      // 指数退避：base * 2^(failures-1)，封顶为 maxBackoffMultiplier
+      const backoffMultiplier = Math.min(Math.pow(2, failures - 1), this.config.maxBackoffMultiplier)
+      const effectiveCooldown = this.config.baseCooldownMs * backoffMultiplier
+
+      if (timeSinceFailure < effectiveCooldown) {
+        // 未超出冷却期，用概率重试
+        if (Math.random() > this.config.probabilisticRetryChance) {
+          return false
+        }
+        console.log(`[AccountPool] Probabilistic retry for ${account.email || account.id} (failures=${failures}, cooldown=${Math.round(effectiveCooldown / 1000)}s)`)
+      }
+      // else: 冷却期已过，Half-Open 状态，允许重试
+    }
+
+    return true
+  }
+
+  // 检查账号配额是否耗尽
+  isQuotaExhausted(account: ProxyAccount, now: number = Date.now()): boolean {
+    // 如果配额已重置（过了重置时间），不再视为耗尽
+    if (account.quotaResetAt && account.quotaResetAt <= now) {
+      return false
+    }
+    // 有明确的耗尽标记
+    if (account.quotaExhaustedAt && account.quotaExhaustedAt > 0) {
+      return true
+    }
+    // 有配额数据且已用尽
+    if (account.quotaLimit && account.quotaLimit > 0 && (account.quotaUsed ?? 0) >= account.quotaLimit) {
+      return true
+    }
+    return false
   }
 
   // 获取冷却时间最短的账号
@@ -156,17 +239,24 @@ export class AccountPool {
     return bestAccount
   }
 
-  // 记录请求成功
+  // 记录请求成功（重置断路器 + 粘滞到当前账号）
   recordSuccess(accountId: string, tokens: number = 0): void {
     const account = this.accounts.get(accountId)
     if (account) {
       this.accounts.set(accountId, {
         ...account,
         requestCount: (account.requestCount || 0) + 1,
-        errorCount: 0, // 重置错误计数
+        errorCount: 0, // 重置断路器失败计数
         lastUsed: Date.now(),
         isAvailable: true
       })
+
+      // 粘滞行为：成功后将全局索引固定在这个账号
+      const accountList = Array.from(this.accounts.keys())
+      const successIndex = accountList.indexOf(accountId)
+      if (successIndex >= 0 && this.currentIndex !== successIndex) {
+        this.currentIndex = successIndex
+      }
     }
 
     const stats = this.accountStats.get(accountId)
@@ -180,43 +270,88 @@ export class AccountPool {
     }
   }
 
-  // 记录请求失败
-  recordError(accountId: string, isQuotaError: boolean = false): void {
+  // 记录请求失败（区分错误类型）
+  recordError(accountId: string, errorType: ErrorType = ErrorType.RECOVERABLE, statusCode?: number): void {
     const account = this.accounts.get(accountId)
     if (!account) return
 
-    const errorCount = (account.errorCount || 0) + 1
     const now = Date.now()
-
-    let cooldownUntil = account.cooldownUntil || 0
-    let isAvailable = account.isAvailable !== false
-
-    if (isQuotaError) {
-      // 配额错误，长时间冷却
-      cooldownUntil = now + this.config.quotaResetMs
-      console.log(`[AccountPool] Account ${account.email || accountId} quota exhausted, cooldown until ${new Date(cooldownUntil).toISOString()}`)
-    } else if (errorCount >= this.config.maxErrorCount) {
-      // 连续错误过多，进入冷却
-      cooldownUntil = now + this.config.cooldownMs
-      console.log(`[AccountPool] Account ${account.email || accountId} too many errors, cooldown until ${new Date(cooldownUntil).toISOString()}`)
+    const stats = this.accountStats.get(accountId)
+    if (stats) {
+      this.accountStats.set(accountId, { ...stats, errors: stats.errors + 1, lastUsed: now })
     }
+
+    // FATAL 错误不增加失败计数（是请求的问题，不是账号的问题）
+    if (errorType === ErrorType.FATAL) return
+
+    // RECOVERABLE: 增加失败计数，断路器指数退避自动生效
+    const errorCount = (account.errorCount || 0) + 1
+    let quotaExhaustedAt = account.quotaExhaustedAt
+
+    // 配额类错误额外标记耗尽
+    const isQuotaError = statusCode === 402 || statusCode === 429
+    if (isQuotaError) {
+      quotaExhaustedAt = now
+    }
+
+    // 计算当前退避时间用于日志
+    const backoffMultiplier = Math.min(Math.pow(2, errorCount - 1), this.config.maxBackoffMultiplier)
+    const effectiveCooldown = this.config.baseCooldownMs * backoffMultiplier
+    const cooldownStr = effectiveCooldown < 60000 ? `${Math.round(effectiveCooldown / 1000)}s`
+      : effectiveCooldown < 3600000 ? `${Math.round(effectiveCooldown / 60000)}m`
+      : `${Math.round(effectiveCooldown / 3600000)}h`
+
+    console.log(`[AccountPool] Account ${account.email || accountId} failure #${errorCount}: status=${statusCode || '?'}, cooldown=${cooldownStr}`)
 
     this.accounts.set(accountId, {
       ...account,
       errorCount,
-      cooldownUntil,
-      isAvailable,
+      quotaExhaustedAt,
       lastUsed: now
     })
+  }
 
-    const stats = this.accountStats.get(accountId)
-    if (stats) {
-      this.accountStats.set(accountId, {
-        ...stats,
-        errors: stats.errors + 1,
-        lastUsed: now
-      })
+  // 更新账号配额信息
+  updateQuota(accountId: string, used: number, limit: number, resetAt?: number): void {
+    const account = this.accounts.get(accountId)
+    if (!account) return
+
+    const wasExhausted = this.isQuotaExhausted(account)
+    this.accounts.set(accountId, {
+      ...account,
+      quotaUsed: used,
+      quotaLimit: limit,
+      quotaResetAt: resetAt,
+      // 如果配额从耗尽恢复，清除耗尽标记
+      quotaExhaustedAt: (used < limit) ? undefined : account.quotaExhaustedAt
+    })
+
+    if (!wasExhausted && used >= limit) {
+      console.log(`[AccountPool] Account ${account.email || accountId} quota reached: ${used}/${limit}`)
+    } else if (wasExhausted && used < limit) {
+      console.log(`[AccountPool] Account ${account.email || accountId} quota recovered: ${used}/${limit}`)
     }
+  }
+
+  // 获取配额状态摘要
+  getQuotaStatus(): { total: number; available: number; exhausted: number; cooldown: number } {
+    const now = Date.now()
+    const all = Array.from(this.accounts.values())
+    let available = 0
+    let exhausted = 0
+    let cooldown = 0
+
+    for (const account of all) {
+      if (this.isQuotaExhausted(account, now)) {
+        exhausted++
+      } else if (account.cooldownUntil && account.cooldownUntil > now) {
+        cooldown++
+      } else if (this.isAccountAvailable(account, now)) {
+        available++
+      }
+    }
+
+    return { total: all.length, available, exhausted, cooldown }
   }
 
   // 标记账号需要刷新 Token
@@ -259,7 +394,8 @@ export class AccountPool {
         ...account,
         isAvailable: true,
         errorCount: 0,
-        cooldownUntil: undefined
+        cooldownUntil: undefined,
+        quotaExhaustedAt: undefined
       })
     }
     this.currentIndex = 0

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Play, Square, RefreshCw, Copy, Check, Server, Activity, AlertCircle, Globe, Zap, Loader2, FileText, Eye, EyeOff, Dices, Cpu, UserCheck, RotateCcw, Users, Clock } from 'lucide-react'
+import { Play, Square, RefreshCw, Copy, Check, Server, Activity, AlertCircle, Globe, Zap, Loader2, FileText, Eye, EyeOff, Dices, Cpu, UserCheck, RotateCcw, Users, Clock, Settings2 } from 'lucide-react'
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Switch, Badge, Select } from '../ui'
 import { useAccountsStore } from '../../store/accounts'
 import { useTranslation } from '../../hooks/useTranslation'
@@ -9,6 +9,7 @@ import { ModelsDialog } from './ModelsDialog'
 import { ModelMappingDialog } from './ModelMappingDialog'
 import { AccountSelectDialog } from './AccountSelectDialog'
 import { ApiKeyManager } from './ApiKeyManager'
+import { ClientConfigDialog } from './ClientConfigDialog'
 import { createPortal } from 'react-dom'
 
 interface ProxyStats {
@@ -57,10 +58,13 @@ interface ProxyConfig {
   enableMultiAccount: boolean
   selectedAccountId?: string
   logRequests: boolean
+  logStreamEvents?: boolean
   maxRetries?: number
-  preferredEndpoint?: 'codewhisperer' | 'amazonq'
+  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
   autoStart?: boolean
   autoContinueRounds?: number
+  enableServerSideToolAutoContinue?: boolean
+  clientDrivenToolExecution?: boolean
   disableTools?: boolean
   autoSwitchOnQuotaExhausted?: boolean
   modelMappings?: ModelMappingRule[]
@@ -75,7 +79,8 @@ export function ProxyPanel() {
     port: 5580,
     host: '127.0.0.1',
     enableMultiAccount: true,
-    logRequests: true
+    logRequests: true,
+    clientDrivenToolExecution: true
   })
   const [stats, setStats] = useState<ProxyStats | null>(null)
   const [sessionStats, setSessionStats] = useState<SessionStats | null>(null)
@@ -91,6 +96,7 @@ export function ProxyPanel() {
   const [showLogsDialog, setShowLogsDialog] = useState(false)
   const [showDetailedLogsDialog, setShowDetailedLogsDialog] = useState(false)
   const [showModelsDialog, setShowModelsDialog] = useState(false)
+  const [showClientConfigDialog, setShowClientConfigDialog] = useState(false)
   const [showModelMappingDialog, setShowModelMappingDialog] = useState(false)
   const [availableModels, setAvailableModels] = useState<Array<{ id: string; name: string }>>([])
   const [showAccountSelectDialog, setShowAccountSelectDialog] = useState(false)
@@ -151,7 +157,12 @@ export function ProxyPanel() {
         if (cfg.selectedAccountIds && cfg.selectedAccountIds.length > 0) {
           cfg.selectedAccountId = cfg.selectedAccountIds[0]
         }
-        setConfig(cfg)
+        const clientDrivenToolExecution = cfg.clientDrivenToolExecution !== false
+        setConfig({
+          ...cfg,
+          clientDrivenToolExecution,
+          enableServerSideToolAutoContinue: clientDrivenToolExecution ? false : cfg.enableServerSideToolAutoContinue
+        })
       }
       if (result.stats) {
         setStats(result.stats as ProxyStats)
@@ -168,6 +179,16 @@ export function ProxyPanel() {
     }
   }, [])
 
+  const loadAvailableModels = useCallback(async () => {
+    try {
+      const result = await window.api.proxyGetModels()
+      if (result.success && result.models) {
+        setAvailableModels(result.models.map((m: { id: string; name?: string }) => ({ id: m.id, name: m.name || m.id })))
+      }
+    } catch {
+    }
+  }, [])
+
   // 同步账号到反代池
   const syncAccounts = useCallback(async () => {
     setIsSyncing(true)
@@ -180,13 +201,15 @@ export function ProxyPanel() {
           email: acc.email,
           accessToken: acc.credentials.accessToken,
           refreshToken: acc.credentials?.refreshToken,
-          profileArn: (acc as any).profileArn,
+          profileArn: acc.profileArn,
           expiresAt: acc.credentials?.expiresAt,
+          machineId: acc.machineId,
           // Token 刷新所需字段
           clientId: acc.credentials?.clientId,
           clientSecret: acc.credentials?.clientSecret,
           region: acc.credentials?.region || 'us-east-1',
-          authMethod: acc.credentials?.authMethod as 'social' | 'idc' | undefined
+          authMethod: acc.credentials?.authMethod,
+          provider: acc.credentials?.provider || acc.idp
         }))
 
       const result = await window.api.proxySyncAccounts(proxyAccounts)
@@ -215,7 +238,11 @@ export function ProxyPanel() {
         host: config.host,
         apiKey: config.apiKey,
         enableMultiAccount: config.enableMultiAccount,
-        logRequests: config.logRequests
+        logRequests: config.logRequests,
+        autoContinueRounds: config.autoContinueRounds,
+        enableServerSideToolAutoContinue: config.clientDrivenToolExecution === false ? config.enableServerSideToolAutoContinue : false,
+        clientDrivenToolExecution: config.clientDrivenToolExecution !== false,
+        disableTools: config.disableTools
       })
 
       if (result.success) {
@@ -260,6 +287,7 @@ export function ProxyPanel() {
     try {
       const result = await window.api.proxyRefreshModels()
       if (result.success) {
+        await loadAvailableModels()
         setRefreshSuccess(true)
         setTimeout(() => setRefreshSuccess(false), 2000)
       } else {
@@ -293,6 +321,7 @@ export function ProxyPanel() {
   // 初始化
   useEffect(() => {
     fetchStatus()
+    loadAvailableModels()
 
     // 监听事件
     const unsubRequest = window.api.onProxyRequest((info) => {
@@ -343,7 +372,7 @@ export function ProxyPanel() {
       unsubError()
       unsubStatus()
     }
-  }, [fetchStatus])
+  }, [fetchStatus, loadAvailableModels])
 
   // 账号变化时同步
   useEffect(() => {
@@ -439,6 +468,10 @@ export function ProxyPanel() {
             <Button onClick={() => setShowModelsDialog(true)} variant="outline" className="gap-2" disabled={!isRunning}>
               <Cpu className="h-4 w-4" />
               {isEn ? 'View Models' : '查看模型'}
+            </Button>
+            <Button onClick={() => setShowClientConfigDialog(true)} variant="outline" className="gap-2">
+              <Settings2 className="h-4 w-4" />
+              {isEn ? 'Configure Clients' : '一键配置'}
             </Button>
           </div>
 
@@ -655,6 +688,17 @@ export function ProxyPanel() {
               />
               <Label htmlFor="logRequests">{isEn ? 'Log Requests' : '记录日志'}</Label>
             </div>
+            <div className="flex items-center gap-2">
+              <Switch
+                id="logStreamEvents"
+                checked={config.logStreamEvents || false}
+                onCheckedChange={(checked) => {
+                  setConfig(prev => ({ ...prev, logStreamEvents: checked }))
+                  window.api.proxyUpdateConfig({ logStreamEvents: checked })
+                }}
+              />
+              <Label htmlFor="logStreamEvents">{isEn ? 'Stream Events' : '流式日志'}</Label>
+            </div>
           </div>
 
           {/* 高级配置 */}
@@ -668,10 +712,11 @@ export function ProxyPanel() {
                   options={[
                     { value: '', label: isEn ? 'Auto Select' : '自动选择', description: isEn ? 'Auto select based on availability' : '根据可用性自动选择端点' },
                     { value: 'codewhisperer', label: 'CodeWhisperer', description: isEn ? 'IDE mode endpoint' : 'IDE 模式端点' },
-                    { value: 'amazonq', label: 'AmazonQ', description: isEn ? 'CLI mode endpoint' : 'CLI 模式端点' }
+                    { value: 'amazonq', label: 'AmazonQ', description: isEn ? 'IDE mode (q.amazonaws.com)' : 'IDE 模式 (q.amazonaws.com)' },
+                    { value: 'amazonq-cli', label: 'AmazonQ CLI', description: isEn ? 'CLI mode (SendMessageStreaming)' : 'CLI 模式 (SendMessageStreaming)' }
                   ]}
                   onChange={(value) => {
-                    const endpoint = value as 'codewhisperer' | 'amazonq' | undefined || undefined
+                    const endpoint = (value || undefined) as 'codewhisperer' | 'amazonq' | 'amazonq-cli' | undefined
                     setConfig(prev => ({ ...prev, preferredEndpoint: endpoint }))
                     window.api.proxyUpdateConfig({ preferredEndpoint: endpoint })
                   }}
@@ -687,15 +732,50 @@ export function ProxyPanel() {
                   max={10}
                   value={config.maxRetries || 3}
                   onChange={(e) => {
-                  const retries = parseInt(e.target.value) || 3
-                  setConfig(prev => ({ ...prev, maxRetries: retries }))
-                  window.api.proxyUpdateConfig({ maxRetries: retries })
-                }}
+                    const retries = parseInt(e.target.value) || 3
+                    setConfig(prev => ({ ...prev, maxRetries: retries }))
+                    window.api.proxyUpdateConfig({ maxRetries: retries })
+                  }}
                   disabled={isRunning}
                 />
               </div>
               <div className="space-y-2">
+                <Label htmlFor="clientDrivenToolExecution">{isEn ? 'Tool Execution Mode' : '工具执行模式'}</Label>
+                <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent">
+                  <span className="text-sm text-muted-foreground">{isEn ? 'Client-driven tool execution' : '客户端驱动工具执行'}</span>
+                  <Switch
+                    id="clientDrivenToolExecution"
+                    checked={config.clientDrivenToolExecution !== false}
+                    onCheckedChange={(checked) => {
+                      setConfig(prev => ({
+                        ...prev,
+                        clientDrivenToolExecution: checked,
+                        enableServerSideToolAutoContinue: checked ? false : prev.enableServerSideToolAutoContinue
+                      }))
+                      window.api.proxyUpdateConfig({
+                        clientDrivenToolExecution: checked,
+                        ...(checked ? { enableServerSideToolAutoContinue: false } : {})
+                      })
+                    }}
+                    disabled={isRunning}
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">{isEn ? 'Recommended for OpenCode and Claude Code. Disable only when the proxy should fabricate tool results and continue server-side.' : '推荐用于 OpenCode 和 Claude Code。仅在需要代理伪造工具结果并服务端继续时关闭。'}</p>
+              </div>
+              <div className="space-y-2">
                 <Label htmlFor="autoContinueRounds">{isEn ? 'Auto Continue Rounds' : '自动继续轮数'}</Label>
+                <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent">
+                  <span className="text-sm text-muted-foreground">{isEn ? 'Server-side tool auto continue' : '服务端工具自动继续'}</span>
+                  <Switch
+                    id="enableServerSideToolAutoContinue"
+                    checked={config.enableServerSideToolAutoContinue || false}
+                    onCheckedChange={(checked) => {
+                      setConfig(prev => ({ ...prev, enableServerSideToolAutoContinue: checked }))
+                      window.api.proxyUpdateConfig({ enableServerSideToolAutoContinue: checked })
+                    }}
+                    disabled={isRunning || config.clientDrivenToolExecution !== false}
+                  />
+                </div>
                 <Input
                   id="autoContinueRounds"
                   type="number"
@@ -707,9 +787,9 @@ export function ProxyPanel() {
                     setConfig(prev => ({ ...prev, autoContinueRounds: rounds }))
                     window.api.proxyUpdateConfig({ autoContinueRounds: rounds })
                   }}
-                  disabled={isRunning}
+                  disabled={isRunning || !config.enableServerSideToolAutoContinue || config.clientDrivenToolExecution !== false}
                 />
-                <p className="text-xs text-muted-foreground">{isEn ? '0 = disabled. Auto-send "Continue" after tool calls.' : '0 = 禁用。工具调用后自动发送"继续"。'}</p>
+                <p className="text-xs text-muted-foreground">{isEn ? 'Disabled by default for API compatibility. Enable only when you want the proxy to auto-send "Continue" after tool calls.' : '为保证 API 兼容性默认禁用。仅在需要代理自动发送“继续”时启用。'}</p>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="disableTools">{isEn ? 'Disable Tool Calls' : '禁用工具调用'}</Label>
@@ -725,44 +805,6 @@ export function ProxyPanel() {
                     disabled={isRunning}
                   />
                 </div>
-              </div>
-              <div className="space-y-2">
-                <Label>{isEn ? 'Model Thinking Mode' : '模型思考模式'}</Label>
-                <div className="grid grid-cols-4 gap-2 px-3 py-2 rounded-md border border-input bg-transparent">
-                  {['claude-sonnet-4', 'claude-sonnet-4.5', 'claude-opus-4.5', 'claude-haiku-4.5'].map(model => (
-                    <div key={model} className="flex items-center gap-1.5">
-                      <Switch
-                        checked={(config as any).modelThinkingMode?.[model] || false}
-                        onCheckedChange={(checked) => {
-                          const newMode = { ...(config as any).modelThinkingMode, [model]: checked }
-                          setConfig(prev => ({ ...prev, modelThinkingMode: newMode } as any))
-                          window.api.proxyUpdateConfig({ modelThinkingMode: newMode } as any)
-                        }}
-                        disabled={isRunning}
-                      />
-                      <span className="text-xs truncate">{model.replace('claude-', '')}</span>
-                    </div>
-                  ))}
-                </div>
-                <p className="text-xs text-muted-foreground">{isEn ? 'Auto-enable Extended Thinking for selected models' : '为选中的模型自动启用扩展思考模式'}</p>
-              </div>
-              <div className="space-y-2">
-                <Label>{isEn ? 'Thinking Output Format' : '思考内容输出格式'}</Label>
-                <Select
-                  value={(config as any).thinkingOutputFormat || 'reasoning_content'}
-                  options={[
-                    { value: 'reasoning_content', label: 'reasoning_content', description: isEn ? 'DeepSeek compatible' : 'DeepSeek 兼容' },
-                    { value: 'thinking', label: '<thinking>', description: isEn ? 'Claude native' : 'Claude 原生' },
-                    { value: 'think', label: '<think>', description: isEn ? 'OpenAI compatible' : 'OpenAI 兼容' }
-                  ]}
-                  onChange={(value) => {
-                    if (isRunning) return
-                    setConfig(prev => ({ ...prev, thinkingOutputFormat: value } as any))
-                    window.api.proxyUpdateConfig({ thinkingOutputFormat: value } as any)
-                  }}
-                  className={isRunning ? 'opacity-50 pointer-events-none' : ''}
-                />
-                <p className="text-xs text-muted-foreground">{isEn ? 'Choose how thinking content is returned in API response' : '选择思考内容在 API 响应中的返回格式'}</p>
               </div>
             </div>
           </div>
@@ -875,6 +917,11 @@ export function ProxyPanel() {
           </div>
           <div className="flex items-center gap-2">
             <span className="text-orange-500 w-11 flex-shrink-0 font-mono">POST</span>
+            <code className="text-muted-foreground flex-1 font-mono">/v1/responses</code>
+            <span className="text-xs text-muted-foreground">{isEn ? 'OpenAI Responses' : 'OpenAI Responses'}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-orange-500 w-11 flex-shrink-0 font-mono">POST</span>
             <code className="text-muted-foreground flex-1 font-mono">/v1/messages</code>
             <span className="text-xs text-muted-foreground">{isEn ? 'Claude Compatible' : 'Claude 兼容'}</span>
           </div>
@@ -892,6 +939,16 @@ export function ProxyPanel() {
             <span className="text-green-500 w-11 flex-shrink-0 font-mono">GET</span>
             <code className="text-muted-foreground flex-1 font-mono">/v1/models</code>
             <span className="text-xs text-muted-foreground">{isEn ? 'Model List' : '模型列表'}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-orange-500 w-11 flex-shrink-0 font-mono">POST</span>
+            <code className="text-muted-foreground flex-1 font-mono">/v1beta/models/*:generateContent</code>
+            <span className="text-xs text-muted-foreground">{isEn ? 'Gemini Compatible' : 'Gemini 兼容'}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-green-500 w-11 flex-shrink-0 font-mono">GET</span>
+            <code className="text-muted-foreground flex-1 font-mono">/v1beta/models</code>
+            <span className="text-xs text-muted-foreground">{isEn ? 'Gemini Models' : 'Gemini 模型'}</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-green-500 w-11 flex-shrink-0 font-mono">GET</span>
@@ -1057,6 +1114,12 @@ export function ProxyPanel() {
           setShowModelMappingDialog(true)
         }}
         mappingCount={config.modelMappings?.length || 0}
+      />
+
+      <ClientConfigDialog
+        open={showClientConfigDialog}
+        onOpenChange={setShowClientConfigDialog}
+        isEn={isEn}
       />
 
       {/* 模型映射弹窗 */}
