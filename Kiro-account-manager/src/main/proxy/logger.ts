@@ -105,11 +105,14 @@ class ProxyLogger {
     }
   }
 
+  private isWriting = false
   private write(entry: LogEntry): void {
     const line = JSON.stringify(entry) + '\n'
 
     if (this.config.logToConsole) {
       const prefix = `[${entry.level}][${entry.category}]`
+      // 设置 flag 防止 console 拦截器重复写入 proxyLogStore
+      this.isWriting = true
       if (entry.level === 'ERROR') {
         console.error(prefix, entry.message, entry.data || '')
       } else if (entry.level === 'WARN') {
@@ -117,6 +120,7 @@ class ProxyLogger {
       } else {
         console.log(prefix, entry.message, entry.data || '')
       }
+      this.isWriting = false
     }
 
     if (this.config.enabled && this.logStream) {
@@ -128,6 +132,8 @@ class ProxyLogger {
     // 同时添加到内存存储（用于 UI 显示）
     proxyLogStore.add(entry)
   }
+
+  get _isWriting(): boolean { return this.isWriting }
 
   debug(category: string, message: string, data?: unknown): void {
     this.write({
@@ -222,7 +228,10 @@ class ProxyLogStore {
   private listeners: ((entry: LogEntry) => void)[] = []
   private storePath: string = ''
 
+  private initialized = false
   initialize(userDataPath: string): void {
+    if (this.initialized) return
+    this.initialized = true
     this.storePath = path.join(userDataPath, 'proxy-logs.json')
     this.load()
   }
@@ -330,3 +339,62 @@ export const proxyLogStore = new ProxyLogStore()
 
 // 单例导出
 export const proxyLogger = new ProxyLogger()
+
+// 拦截主进程 console 输出，自动转发到 proxyLogStore
+// 这样所有 console.log/warn/error 都能在日志页面显示
+let consoleIntercepted = false
+export function interceptConsole(): void {
+  if (consoleIntercepted) return
+  consoleIntercepted = true
+
+  const originalLog = console.log
+  const originalWarn = console.warn
+  const originalError = console.error
+
+  const parseConsoleCategory = (args: unknown[]): { category: string; message: string } => {
+    const first = String(args[0] || '')
+    // 匹配 [Category] 或 [INFO][Category] 格式
+    const bracketMatch = first.match(/^\[(?:DEBUG|INFO|WARN|ERROR)\]?\[?([^\]]*)\]?\s*(.*)/)
+    if (bracketMatch) {
+      return { category: bracketMatch[1] || 'App', message: bracketMatch[2] || '' }
+    }
+    const simpleMatch = first.match(/^\[([^\]]+)\]\s*(.*)/)
+    if (simpleMatch) {
+      return { category: simpleMatch[1], message: simpleMatch[2] || '' }
+    }
+    return { category: 'App', message: first }
+  }
+
+  const buildEntry = (args: unknown[], level: 'INFO' | 'WARN' | 'ERROR'): LogEntry => {
+    const { category, message } = parseConsoleCategory(args)
+    const rest = args.slice(1)
+    // data: 后续参数（对象/数组保留结构，字符串拼接）
+    let data: unknown = undefined
+    if (rest.length === 1) {
+      data = rest[0]
+    } else if (rest.length > 1) {
+      // 如果全是字符串，拼成一个；否则保持数组
+      const allStrings = rest.every(r => typeof r === 'string')
+      data = allStrings ? (rest as string[]).join(' ') : rest
+    }
+    return { timestamp: new Date().toISOString(), level, category, message, data }
+  }
+
+  console.log = (...args: unknown[]) => {
+    originalLog.apply(console, args)
+    if (proxyLogger._isWriting) return
+    proxyLogStore.add(buildEntry(args, 'INFO'))
+  }
+
+  console.warn = (...args: unknown[]) => {
+    originalWarn.apply(console, args)
+    if (proxyLogger._isWriting) return
+    proxyLogStore.add(buildEntry(args, 'WARN'))
+  }
+
+  console.error = (...args: unknown[]) => {
+    originalError.apply(console, args)
+    if (proxyLogger._isWriting) return
+    proxyLogStore.add(buildEntry(args, 'ERROR'))
+  }
+}

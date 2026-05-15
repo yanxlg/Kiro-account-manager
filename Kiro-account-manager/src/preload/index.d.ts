@@ -566,7 +566,7 @@ interface KiroApi {
   proxyGetLogsCount: () => Promise<number>
 
   // 更新反代服务器配置
-  proxyUpdateConfig: (config: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; selectedAccountIds?: string[]; logRequests?: boolean; logStreamEvents?: boolean; autoStart?: boolean; maxRetries?: number; preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'; autoContinueRounds?: number; enableServerSideToolAutoContinue?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; autoSwitchOnQuotaExhausted?: boolean; modelMappings?: Array<{ id: string; name: string; enabled: boolean; type: 'replace' | 'alias' | 'loadbalance'; sourceModel: string; targetModels: string[]; weights?: number[]; priority: number; apiKeyIds?: string[] }> }) => Promise<{ success: boolean; config?: unknown; error?: string }>
+  proxyUpdateConfig: (config: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; selectedAccountIds?: string[]; logRequests?: boolean; logStreamEvents?: boolean; autoStart?: boolean; maxRetries?: number; preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'; autoContinueRounds?: number; enableServerSideToolAutoContinue?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; payloadSizeLimitKB?: number; autoSwitchOnQuotaExhausted?: boolean; modelMappings?: Array<{ id: string; name: string; enabled: boolean; type: 'replace' | 'alias' | 'loadbalance'; sourceModel: string; targetModels: string[]; weights?: number[]; priority: number; apiKeyIds?: string[] }> }) => Promise<{ success: boolean; config?: unknown; error?: string }>
 
   // 添加账号到反代池
   proxyAddAccount: (account: { id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }) => Promise<{ success: boolean; accountCount?: number; error?: string }>
@@ -616,7 +616,7 @@ interface KiroApi {
   onProxyRequest: (callback: (info: { path: string; method: string; accountId?: string }) => void) => () => void
 
   // 监听反代响应事件
-  onProxyResponse: (callback: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; credits?: number; error?: string }) => void) => () => void
+  onProxyResponse: (callback: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }) => void) => () => void
 
   // 监听反代错误事件
   onProxyError: (callback: (error: string) => void) => () => void

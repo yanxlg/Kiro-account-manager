@@ -12,6 +12,13 @@ import { ApiKeyManager } from './ApiKeyManager'
 import { ClientConfigDialog } from './ClientConfigDialog'
 import { createPortal } from 'react-dom'
 
+function compactNumber(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 100_000) return `${(n / 1_000).toFixed(0)}K`
+  return n.toLocaleString()
+}
+
 interface ProxyStats {
   totalRequests: number
   successRequests: number
@@ -20,6 +27,9 @@ interface ProxyStats {
   totalCredits: number
   inputTokens: number
   outputTokens: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  reasoningTokens?: number
   startTime: number
 }
 
@@ -66,6 +76,7 @@ interface ProxyConfig {
   enableServerSideToolAutoContinue?: boolean
   clientDrivenToolExecution?: boolean
   disableTools?: boolean
+  payloadSizeLimitKB?: number
   autoSwitchOnQuotaExhausted?: boolean
   modelMappings?: ModelMappingRule[]
 }
@@ -88,7 +99,7 @@ export function ProxyPanel() {
   const [availableCount, setAvailableCount] = useState(0)
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [recentLogs, setRecentLogs] = useState<Array<{ time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; credits?: number; error?: string }>>([])
+  const [recentLogs, setRecentLogs] = useState<Array<{ time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }>>([])
   const [isSyncing, setIsSyncing] = useState(false)
   const [isRefreshingModels, setIsRefreshingModels] = useState(false)
   const [syncSuccess, setSyncSuccess] = useState(false)
@@ -346,7 +357,10 @@ export function ProxyPanel() {
         tokens: info.tokens,
         inputTokens: info.inputTokens,
         outputTokens: info.outputTokens,
+        cacheReadTokens: info.cacheReadTokens,
+        reasoningTokens: info.reasoningTokens,
         credits: info.credits,
+        responseTime: info.responseTime,
         error: info.error
       }, ...prev.slice(0, 99)]) // 保留最多 100 条
 
@@ -806,6 +820,24 @@ export function ProxyPanel() {
                   />
                 </div>
               </div>
+              <div className="space-y-2">
+                <Label htmlFor="payloadSizeLimit">{isEn ? 'Payload Size Limit (KB)' : 'Payload 大小限制 (KB)'}</Label>
+                <Input
+                  id="payloadSizeLimit"
+                  type="number"
+                  min={256}
+                  max={10240}
+                  step={128}
+                  value={config.payloadSizeLimitKB || 1536}
+                  onChange={(e) => {
+                    const kb = parseInt(e.target.value) || 1536
+                    setConfig(prev => ({ ...prev, payloadSizeLimitKB: kb }))
+                    window.api.proxyUpdateConfig({ payloadSizeLimitKB: kb })
+                  }}
+                  disabled={isRunning}
+                />
+                <p className="text-xs text-muted-foreground">{isEn ? 'When payload exceeds this limit, oldest tool results will be truncated. Default 1536KB (1.5MB). Reduce if API rejects large payloads.' : '超过此限制时，最旧的工具结果将被截断。默认 1536KB (1.5MB)，如 API 拒绝大 payload 可调小。'}</p>
+              </div>
             </div>
           </div>
         </CardContent>
@@ -894,6 +926,84 @@ export function ProxyPanel() {
                 <span>{isEn ? 'Uptime' : '运行时间'}</span>
               </div>
               <div className="text-xl font-bold text-primary whitespace-nowrap">{formatUptime(uptime)}</div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {/* 第二行统计卡片 - Token 分解和 Cache */}
+      {isRunning && stats && (
+        <div className="grid grid-cols-6 gap-3">
+          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-indigo-500/5 to-transparent">
+            <CardContent className="pt-3 pb-3">
+              <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
+                <Activity className="h-3 w-3" />
+                <span>{isEn ? 'Total Tokens' : '总 Tokens'}</span>
+              </div>
+              <div className="text-xl font-bold text-indigo-500" title={((stats.inputTokens || 0) + (stats.outputTokens || 0)).toLocaleString()}>{compactNumber((stats.inputTokens || 0) + (stats.outputTokens || 0))}</div>
+            </CardContent>
+          </Card>
+          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-blue-500/5 to-transparent">
+            <CardContent className="pt-3 pb-3">
+              <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
+                <Activity className="h-3 w-3" />
+                <span>{isEn ? 'Input / Output' : '输入 / 输出'}</span>
+              </div>
+              <div className="text-sm font-bold">
+                <span className="text-blue-500" title={(stats.inputTokens || 0).toLocaleString()}>{compactNumber(stats.inputTokens || 0)}</span>
+                <span className="text-muted-foreground mx-1">/</span>
+                <span className="text-purple-500" title={(stats.outputTokens || 0).toLocaleString()}>{compactNumber(stats.outputTokens || 0)}</span>
+              </div>
+            </CardContent>
+          </Card>
+          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-emerald-500/5 to-transparent">
+            <CardContent className="pt-3 pb-3">
+              <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
+                <Cpu className="h-3 w-3" />
+                <span>{isEn ? 'Cache Hit' : '缓存命中'}</span>
+                {(() => {
+                  const read = stats.cacheReadTokens || 0
+                  const total = read + (stats.cacheWriteTokens || 0)
+                  const rate = total > 0 ? (read / total * 100) : 0
+                  return rate > 0 ? (
+                    <Badge variant="secondary" className="ml-1 text-[10px] px-1 py-0">{rate.toFixed(0)}%</Badge>
+                  ) : null
+                })()}
+              </div>
+              <div className="text-sm font-bold">
+                <span className="text-emerald-500" title={`${isEn ? 'Cache Read' : '缓存读取'}: ${(stats.cacheReadTokens || 0).toLocaleString()}`}>{compactNumber(stats.cacheReadTokens || 0)}</span>
+                <span className="text-muted-foreground mx-1">/</span>
+                <span className="text-amber-500" title={`${isEn ? 'Cache Write' : '缓存写入'}: ${(stats.cacheWriteTokens || 0).toLocaleString()}`}>{compactNumber(stats.cacheWriteTokens || 0)}</span>
+              </div>
+            </CardContent>
+          </Card>
+          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-violet-500/5 to-transparent">
+            <CardContent className="pt-3 pb-3">
+              <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
+                <Zap className="h-3 w-3" />
+                <span>{isEn ? 'Reasoning' : '推理 Tokens'}</span>
+              </div>
+              <div className="text-xl font-bold text-violet-500" title={(stats.reasoningTokens || 0).toLocaleString()}>{compactNumber(stats.reasoningTokens || 0)}</div>
+            </CardContent>
+          </Card>
+          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-green-500/5 to-transparent">
+            <CardContent className="pt-3 pb-3">
+              <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
+                <UserCheck className="h-3 w-3" />
+                <span>{isEn ? 'Success Rate' : '成功率'}</span>
+              </div>
+              <div className="text-xl font-bold text-green-500">
+                {stats.totalRequests > 0 ? `${((stats.successRequests / stats.totalRequests) * 100).toFixed(1)}%` : '-'}
+              </div>
+            </CardContent>
+          </Card>
+          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-amber-500/5 to-transparent">
+            <CardContent className="pt-3 pb-3">
+              <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
+                <Server className="h-3 w-3" />
+                <span>Credits</span>
+              </div>
+              <div className="text-xl font-bold text-amber-500">{(stats.totalCredits || 0).toFixed(4)}</div>
             </CardContent>
           </Card>
         </div>
@@ -1003,15 +1113,16 @@ export function ProxyPanel() {
           <CardContent className="pt-2">
             <div className="max-h-[150px] overflow-y-auto text-xs font-mono space-y-0.5">
               {recentLogs.slice(0, 5).map((log, idx) => (
-                <div key={idx} className="grid gap-2 py-1 px-2 rounded hover:bg-muted/50 items-center" style={{ gridTemplateColumns: '2fr 1fr 1.2fr 0.5fr 1fr 1fr 1fr 1fr' }}>
+                <div key={idx} className="grid gap-2 py-1 px-2 rounded hover:bg-muted/50 items-center" style={{ gridTemplateColumns: '2fr 1fr 1.2fr 0.5fr 0.8fr 0.8fr 0.8fr 0.8fr 0.6fr' }}>
                   <span className="text-muted-foreground whitespace-nowrap text-left">{log.time}</span>
                   <span className="truncate text-left" title={log.path}>{log.path}</span>
                   <span className="truncate text-left text-muted-foreground" title={log.model}>{log.model ? log.model.replace('anthropic.', '').replace('-v1:0', '') : '-'}</span>
                   <span className={`text-center ${log.status >= 400 ? 'text-red-500' : 'text-green-500'}`}>{log.status}</span>
                   <span className="text-muted-foreground text-right">{log.inputTokens ? log.inputTokens.toLocaleString() : '-'}</span>
                   <span className="text-muted-foreground text-right">{log.outputTokens ? log.outputTokens.toLocaleString() : '-'}</span>
-                  <span className="text-muted-foreground text-right">{log.tokens ? log.tokens.toLocaleString() : '-'}</span>
+                  <span className="text-emerald-500 text-right">{log.cacheReadTokens ? log.cacheReadTokens.toLocaleString() : '-'}</span>
                   <span className="text-muted-foreground text-right">{log.credits ? log.credits.toFixed(4) : '-'}</span>
+                  <span className="text-muted-foreground text-right">{log.responseTime ? `${(log.responseTime / 1000).toFixed(1)}s` : '-'}</span>
                 </div>
               ))}
             </div>

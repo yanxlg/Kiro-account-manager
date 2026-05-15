@@ -50,6 +50,7 @@ const en = {
     kproxy: 'K-Proxy',
     register: 'Register',
     subscription: 'Subscription',
+    logs: 'Logs',
     settings: 'Settings',
     about: 'About'
   },

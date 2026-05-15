@@ -32,6 +32,20 @@ import { ToolNameRegistry } from './toolNameRegistry'
 
 const KIRO_CACHE_POINT: KiroCachePoint = { type: 'default' }
 
+// 判断模型是否支持 additionalModelRequestFields.thinking 参数
+// 只有 Claude 4+ 系列模型支持，非 Claude 模型（deepseek/minimax/glm/qwen 等）不支持
+function modelSupportsThinkingParam(modelId: string): boolean {
+  const lower = modelId.toLowerCase()
+  // 必须是 claude 模型
+  if (!lower.includes('claude')) return false
+  // claude-3.x 不支持 thinking
+  if (lower.includes('claude-3-') || lower.includes('claude-3.')) return false
+  // auto 模型由后端决定，保守不传
+  if (lower === 'auto') return false
+  // claude-sonnet-4、claude-opus-4、claude-haiku-4.5 等都支持
+  return true
+}
+
 function toKiroCachePoint(cacheControl?: { type: string }): KiroCachePoint | undefined {
   if (!cacheControl) return undefined
   if (cacheControl.type !== 'ephemeral') {
@@ -354,9 +368,10 @@ export function openaiToKiro(
     } else if (msg.role === 'tool') {
       // Tool result - 收集到待处理列表
       if (msg.tool_call_id) {
+        const rawText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
         toolResults.push({
           toolUseId: msg.tool_call_id,
-          content: [{ text: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) }],
+          content: [{ text: rawText || '(no output)' }],
           status: 'success'
         })
       }
@@ -418,9 +433,9 @@ export function openaiToKiro(
   const kiroTools = convertOpenAITools(request.tools, toolNameRegistry)
 
   // OpenAI 兼容请求的 thinking 映射到 Kiro additionalModelRequestFields
-  // Kiro schema 只允许 thinking 字段；reasoning_effort 等 OpenAI 参数被丢弃
+  // 仅对支持 thinking 的模型传递（Claude 4+ 系列）
   let additionalModelRequestFields: Record<string, unknown> | undefined
-  if (request.thinking && request.thinking.type !== 'disabled') {
+  if (request.thinking && request.thinking.type !== 'disabled' && modelSupportsThinkingParam(modelId)) {
     additionalModelRequestFields = { thinking: { type: 'adaptive' } }
   }
 
@@ -891,10 +906,10 @@ export function claudeToKiro(
   const kiroTools = convertClaudeTools(request.tools, toolNameRegistry)
 
   // 将 Claude thinking 参数映射为 Kiro additionalModelRequestFields
-  // Kiro additionalModelRequestFields schema 只允许 thinking 字段，不接受额外属性
-  // effort / context_management / anthropic_beta 等 Claude Code 参数被丢弃（Kiro 不支持）
+  // 仅对支持 thinking 的模型传递（Claude 4+ 系列）
+  // 非 Claude 模型（deepseek/minimax/glm 等）的 schema 没有 thinking 属性，传了会 400
   let additionalModelRequestFields: Record<string, unknown> | undefined
-  if (request.thinking && request.thinking.type !== 'disabled') {
+  if (request.thinking && request.thinking.type !== 'disabled' && modelSupportsThinkingParam(modelId)) {
     additionalModelRequestFields = { thinking: { type: 'adaptive' } }
   }
 
@@ -954,16 +969,21 @@ function extractClaudeContent(msg: ClaudeMessage): { content: string; images: Ki
       } else if (block.type === 'tool_result' && block.tool_use_id) {
         let resultContent = ''
         if (typeof block.content === 'string') {
-          resultContent = block.content
+          resultContent = block.content || '(empty)'
         } else if (Array.isArray(block.content)) {
-          resultContent = block.content.map((b, index) => {
-            if (b.type !== 'text' || b.text === undefined) {
-              throw new Error(`tool_result content block ${index} requires text`)
+          // 规范化 content blocks：提取所有 text，跳过非 text 类型
+          const textParts: string[] = []
+          for (const b of block.content) {
+            if (b.type === 'text') {
+              textParts.push(b.text || '')
             }
-            return b.text
-          }).join('')
+            // 非 text 类型（image 等）跳过，不抛错
+          }
+          resultContent = textParts.join('') || '(no text output)'
+        } else if (block.content === undefined || block.content === null) {
+          resultContent = '(no output)'
         } else {
-          throw new Error(`tool_result requires content: ${block.tool_use_id}`)
+          resultContent = String(block.content) || '(empty)'
         }
         toolResults.push({
           toolUseId: block.tool_use_id,

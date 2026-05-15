@@ -50,6 +50,7 @@ const zh = {
     kproxy: 'K-Proxy',
     register: '注册',
     subscription: '批量订阅',
+    logs: '系统日志',
     settings: '设置',
     about: '关于'
   },

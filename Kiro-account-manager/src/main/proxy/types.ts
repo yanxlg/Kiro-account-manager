@@ -491,6 +491,8 @@ export interface ProxyConfig {
   clientDrivenToolExecution?: boolean
   // 禁用工具调用（移除 tools 参数）
   disableTools?: boolean
+  // Payload 大小限制（KB），超过时截断工具结果
+  payloadSizeLimitKB?: number
   // 单账号模式下额度耗尽自动切换到下一个账号
   autoSwitchOnQuotaExhausted?: boolean
   // 模型映射规则
@@ -523,6 +525,9 @@ export interface ProxyStats {
   totalCredits: number // 累计总 credits（所有请求）
   inputTokens: number
   outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
   startTime: number
   accountStats: Map<string, AccountStats>
   // 按端点统计
@@ -565,6 +570,9 @@ export interface RequestLog {
   accountId: string
   inputTokens: number
   outputTokens: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  reasoningTokens?: number
   credits?: number // Kiro API 返回的 credit 使用量
   responseTime: number
   success: boolean

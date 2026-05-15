@@ -31,6 +31,12 @@ export function setLogStreamEvents(enabled: boolean): void {
   logStreamEvents = enabled
 }
 
+// Payload 大小限制（KB），用户可在高级设置中调整
+let payloadSizeLimitKB = 1536 // 默认 1.5MB
+export function setPayloadSizeLimitKB(limitKB: number): void {
+  payloadSizeLimitKB = Math.max(256, Math.min(10240, limitKB))
+}
+
 // 获取网络代理 agent（优先 K-Proxy，其次用户设置代理，其次系统代理）
 function getNetworkAgent(): ProxyAgent | undefined {
   if (useKProxyForApi) {
@@ -80,7 +86,7 @@ const KIRO_ENDPOINTS = [
   },
   {
     url: 'https://q.us-east-1.amazonaws.com/SendMessageStreaming',
-    origin: 'AI_EDITOR',
+    origin: 'CLI',
     amzTarget: 'AmazonQDeveloperStreamingService.SendMessage',
     name: 'AmazonQCLI'
   }
@@ -859,9 +865,9 @@ export function buildKiroPayload(
   }
 
   // 工具结果裁剪：payload 超过限制时，从最旧的历史 toolResult 开始截断内容
-  // Kiro API 限制约 400KB；保留 380KB 阈值给请求头和增量空间
-  const PAYLOAD_SIZE_LIMIT = 380 * 1024
-  const TOOL_RESULT_TRUNCATE_LENGTH = 2000
+  // 用户可在高级设置中调整限制值（默认 1536KB = 1.5MB）
+  const PAYLOAD_SIZE_LIMIT = (payloadSizeLimitKB || 1536) * 1024
+  const TOOL_RESULT_TRUNCATE_LENGTH = 4000
   let initialPayloadSize = JSON.stringify(payload).length
   if (initialPayloadSize > PAYLOAD_SIZE_LIMIT && payload.conversationState.history) {
     const historyMessages = payload.conversationState.history
@@ -1217,6 +1223,9 @@ async function parseEventStream(
   // 累积输出文本长度，用于估算 tokens
   let totalOutputChars = 0
   
+  // 流式事件聚合计数（logStreamEvents 开启时，结束后输出摘要而非逐条输出）
+  const streamEventCounts: Record<string, number> = {}
+  
   // 估算 input tokens（基于输入字符长度，仅 Kiro 后端不返回 tokenUsage 时使用）
   // 英文约 1 字符 = 0.3 token，中文约 1 字符 = 0.6 token
   // payload 是 JSON 以英文为主，使用 0.3 系数
@@ -1441,7 +1450,8 @@ async function parseEventStream(
             }
             
             if (logStreamEvents) {
-              proxyLogger.debug('Kiro', 'Event: ' + (eventType || 'unknown'), JSON.stringify(event).slice(0, 500))
+              // 聚合流式事件（不逐条输出，在 onComplete 时输出摘要）
+              streamEventCounts[eventType || 'unknown'] = (streamEventCounts[eventType || 'unknown'] || 0) + 1
             }
             
             // 处理 usageEvent
@@ -1632,6 +1642,12 @@ async function parseEventStream(
     if (usage.outputTokens === 0 && totalOutputChars > 0) {
       usage.outputTokens = Math.max(1, Math.round(totalOutputChars * 0.4))
       proxyLogger.info('Kiro', `Estimated output tokens: ${totalOutputChars} chars -> ${usage.outputTokens} tokens`)
+    }
+    
+    // 流式事件聚合摘要
+    if (logStreamEvents && Object.keys(streamEventCounts).length > 0) {
+      const total = Object.values(streamEventCounts).reduce((a, b) => a + b, 0)
+      proxyLogger.debug('Kiro', `Stream events summary (${total} total)`, streamEventCounts)
     }
     
     throwIfAborted(signal)
@@ -1825,19 +1841,14 @@ export async function fetchAvailableSubscriptions(account: ProxyAccount): Promis
   const profileArn = resolveProfileArn(account)
   const body = JSON.stringify({ profileArn })
 
-  console.log('[KiroAPI] ListAvailableSubscriptions request:', {
-    url,
-    headers: { ...headers, Authorization: `Bearer ${account.accessToken?.substring(0, 20)}...` },
-    body
+  console.log(`[KiroAPI] ListAvailableSubscriptions [${account.email || account.id.slice(0, 8)}]`, {
+    url
   })
 
   try {
     const response = await fetchWithProxy(url, { method: 'POST', headers, body })
     const responseText = await response.text()
-    console.log('[KiroAPI] ListAvailableSubscriptions response:', {
-      status: response.status,
-      body: responseText.substring(0, 500)
-    })
+    console.log(`[KiroAPI] ListAvailableSubscriptions → ${response.status}`, JSON.parse(responseText))
     
     if (!response.ok) {
       return {}

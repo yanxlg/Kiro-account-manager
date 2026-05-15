@@ -272,6 +272,53 @@ npx electron-builder --linux --arm64
 ## 📋 更新日志
 
 
+### v1.6.5 (2026-5-15)
+
+#### Prompt Cache 模拟器
+- **新增**: 完整的 prompt cache 模拟 — 追踪 `cache_control` 断点，按账号计算 `cache_read_input_tokens` 和 `cache_creation_input_tokens`，在 API 响应中返回真实缓存 usage
+- **新增**: 反代面板显示缓存命中率百分比 badge
+- **新增**: 三级检测：工具 → system → 消息块，支持 `ephemeral` TTL（5分钟/1小时）
+
+#### 前端面板增强
+- **新增**: 第二行统计卡片 — 总 Tokens、输入/输出、缓存命中率、推理 Tokens、成功率、Credits
+- **新增**: 大数字自动缩写（如 `206.3M`、`1096K`），hover 显示完整数值
+- **新增**: 日志表新增列 — 缓存读取（绿色）、响应耗时
+- **新增**: 侧边栏新增系统日志页面 — 完整控制台输出、虚拟滚动、级别筛选、搜索、自动跟随
+
+#### 系统日志页面
+- **新增**: 独立日志页面，显示所有系统输出（反代、API、账号、后台任务）
+- **新增**: Console 拦截器，`console.log/warn/error` 全部进入日志存储
+- **新增**: 虚拟滚动（`@tanstack/react-virtual`）— 10 万条以上不卡顿
+- **新增**: 智能自动滚动 — 在底部自动跟随，向上滚动暂停，浮动「回到底部」按钮显示新日志数
+- **新增**: 级别筛选按钮组（ALL/DEBUG/INFO/WARN/ERROR），每个级别显示彩色计数
+- **新增**: Grid 对齐列、分类颜色编码（Kiro=蓝、ProxyServer=紫、KiroAPI=青）
+- **新增**: 点击展开数据详情（JSON 格式化），流式事件聚合为单条摘要
+
+#### 日志优化
+- **优化**: 所有 API 日志（CBOR/REST）显示账号邮箱，方便识别来源
+- **优化**: API 响应日志拆分为一行摘要 + 可展开 JSON 详情（点击 ⓘ 查看）
+- **优化**: 日志中移除 token 明文（安全），改为 `token=N字符` 长度指示
+- **优化**: 冗余多行日志合并 — `[IPC]`、`[Kiro API]`、`[Kiro REST API]` 每次请求/响应各 1 行
+- **优化**: `[KiroPayload]` 和 `[KiroAPI] Request to` 结构化数据放入可展开详情
+- **移除**: `[REST->Unified] Converting response` 重复日志、`Using K-Proxy agent` 噪音日志
+
+#### 日志查看器增强
+- **优化**: 反代详细日志弹窗 — 分页改为虚拟滚动 + 智能自动跟随 + 「回到底部」浮动按钮
+- **优化**: 系统日志页面 — 新增时间范围筛选（1h/6h/1d/7d）、分类下拉、显示条数选择器（5K–100K）
+- **优化**: 系统日志拉取数量跟随用户选择的显示条数，不再固定 3000
+- **优化**: 两个日志页面统一交互体验：向上滚动暂停跟随、底部状态指示、新日志数 badge
+
+#### 高级配置
+- **新增**: Payload 大小限制可在高级设置中配置（256KB–10240KB，默认 1536KB/1.5MB）
+- **变更**: Payload 截断阈值从 380KB 提升到 1.5MB — 支持 200K+ token 大上下文模型，避免误截断
+- **变更**: 工具结果截断长度从 2000 提升到 4000 字符
+
+#### Bug 修复
+- **修复**: `tool_result content block N requires text` — 空/null 工具结果规范化为 `"(no output)"`，不再抛 400
+- **修复**: Thinking 参数发送给非 Claude 模型导致 400 — 现在仅对 Claude 4+ 模型发送（`modelSupportsThinkingParam()`）
+- **修复**: 流式事件日志刷屏 — 开启 `logStreamEvents` 时聚合为单条请求摘要
+- **新增**: 隐藏模型 ID 加入模型列表 — `simple-task`、`CLAUDE_SONNET_4_20250514_V1_0`、`CLAUDE_HAIKU_4_5_20251001_V1_0`、`CLAUDE_3_7_SONNET_20250219_V1_0`
+
 ### v1.6.4 (2026-5-14)
 
 #### API 反代

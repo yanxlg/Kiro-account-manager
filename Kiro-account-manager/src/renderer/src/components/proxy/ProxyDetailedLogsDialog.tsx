@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Button, Badge, Input } from '../ui'
-import { Trash2, RefreshCw, Download, Search, X, Copy, ChevronDown, ChevronUp, ArrowDownToLine, Pause, ChevronLeft, ChevronRight } from 'lucide-react'
+import { Trash2, RefreshCw, Download, Search, X, Copy, ChevronDown, ChevronUp, ChevronsDown, ArrowDown, Filter } from 'lucide-react'
 import { useTranslation } from '../../hooks/useTranslation'
+import { useVirtualizer } from '@tanstack/react-virtual'
 
 interface LogEntry {
   timestamp: string
@@ -96,13 +97,10 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
   const [searchText, setSearchText] = useState('')
   const [levelFilter, setLevelFilter] = useState<string>('all')
   const [categoryFilter, setCategoryFilter] = useState<string>('all')
-  const [autoScroll, setAutoScroll] = useState(true)
+  const [isAtBottom, setIsAtBottom] = useState(true)
+  const [newLogCount, setNewLogCount] = useState(0)
   const [expandedLogs, setExpandedLogs] = useState<Set<number>>(new Set())
-  const [currentPage, setCurrentPage] = useState(1)
-  const [pageSize, setPageSize] = useState(() => {
-    const saved = localStorage.getItem('proxyLogs_pageSize')
-    return saved ? parseInt(saved) : 1000
-  })
+  const prevLogCount = useRef(0)
   const [timeRange, setTimeRange] = useState<string>(() => {
     return localStorage.getItem('proxyLogs_timeRange') || 'all'
   })
@@ -126,8 +124,16 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
       setLoading(true)
       loadLogs().finally(() => setLoading(false))
       
-      // 每 2 秒刷新一次
-      pollIntervalRef.current = setInterval(loadLogs, 2000)
+      // 每 1.5 秒刷新一次
+      pollIntervalRef.current = setInterval(() => {
+        loadLogs().then(() => {
+          // 如果用户不在底部，累计新日志数
+          if (!isAtBottom && logs.length > prevLogCount.current) {
+            setNewLogCount(prev => prev + (logs.length - prevLogCount.current))
+          }
+          prevLogCount.current = logs.length
+        })
+      }, 1500)
     }
 
     return () => {
@@ -136,19 +142,24 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
         pollIntervalRef.current = null
       }
     }
-  }, [open, loadLogs])
+  }, [open, loadLogs, isAtBottom, logs.length])
 
-  useEffect(() => {
-    if (autoScroll && scrollRef.current) {
-      // 最新日志在顶部，滚动到顶部
-      scrollRef.current.scrollTop = 0
+  // 监听滚动位置判断是否在底部
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+    setIsAtBottom(atBottom)
+    if (atBottom) setNewLogCount(0)
+  }, [])
+
+  const scrollToBottom = () => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+      setIsAtBottom(true)
+      setNewLogCount(0)
     }
-  }, [logs, autoScroll])
-
-  // 持久化保存设置
-  useEffect(() => {
-    localStorage.setItem('proxyLogs_pageSize', pageSize.toString())
-  }, [pageSize])
+  }
 
   useEffect(() => {
     localStorage.setItem('proxyLogs_timeRange', timeRange)
@@ -260,20 +271,24 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
       if (limit > 0) result = result.slice(-limit)
     }
     
-    // 反转顺序，最新的在前面
-    return result.reverse()
+    // 正序，最新在底部（配合智能跟随滚到底部）
+    return result
   }, [logs, timeRange, levelFilter, categoryFilter, searchText, displayLimit])
 
-  // 分页逻辑
-  const totalPages = Math.ceil(filteredLogs.length / pageSize)
-  const startIndex = (currentPage - 1) * pageSize
-  const endIndex = Math.min(startIndex + pageSize, filteredLogs.length)
-  const paginatedLogs = filteredLogs.slice(startIndex, endIndex)
+  // 虚拟滚动
+  const virtualizer = useVirtualizer({
+    count: filteredLogs.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: (idx) => expandedLogs.has(idx) ? 120 : 32,
+    overscan: 20
+  })
 
-  // 当过滤条件变化时重置到第一页
+  // 智能滚动：在底部时自动跟随新日志
   useEffect(() => {
-    setCurrentPage(1)
-  }, [searchText, levelFilter, categoryFilter, timeRange, displayLimit])
+    if (isAtBottom && filteredLogs.length > 0) {
+      virtualizer.scrollToIndex(filteredLogs.length - 1, { align: 'end' })
+    }
+  }, [filteredLogs.length, isAtBottom, virtualizer])
 
   const getLevelColor = (level: string) => {
     switch (level) {
@@ -426,210 +441,133 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
 
           <div className="h-5 w-px bg-border flex-shrink-0" />
 
+          {/* 显示条数 */}
+          <CustomDropdown
+            value={displayLimit}
+            onChange={setDisplayLimit}
+            className="min-w-[60px]"
+            options={[
+              { value: 'all', label: isEn ? 'All' : '全部' },
+              { value: '5000', label: '5K' },
+              { value: '10000', label: '10K' },
+              { value: '50000', label: '50K' },
+              { value: '100000', label: '100K' },
+            ]}
+          />
+
+          {/* 时间范围 */}
+          <CustomDropdown
+            value={timeRange}
+            onChange={setTimeRange}
+            className="min-w-[60px]"
+            options={[
+              { value: 'all', label: isEn ? 'All' : '全部' },
+              { value: '1h', label: '1h' },
+              { value: '6h', label: '6h' },
+              { value: '1d', label: '1d' },
+              { value: '7d', label: '7d' },
+            ]}
+          />
+
+          <div className="h-5 w-px bg-border flex-shrink-0" />
+
           {/* 操作按钮 */}
-          <div className="flex items-center gap-1 flex-shrink-0">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={loadLogs}
-              disabled={loading}
-              className="h-7 px-2 text-xs hover:border-primary/50"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 mr-1 ${loading ? 'animate-spin' : ''}`} />
-              {isEn ? 'Refresh' : '刷新'}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleExportLogs}
-              disabled={logs.length === 0}
-              className="h-7 px-2 text-xs hover:border-primary/50"
-            >
-              <Download className="w-3.5 h-3.5 mr-1" />
-              {isEn ? 'Export' : '导出'}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleClearLogs}
-              disabled={logs.length === 0}
-              className="h-7 px-2 text-xs text-destructive hover:bg-destructive/10 hover:border-destructive/50"
-            >
-              <Trash2 className="w-3.5 h-3.5 mr-1" />
-              {isEn ? 'Clear' : '清空'}
-            </Button>
-          </div>
-
-          <div className="h-5 w-px bg-border flex-shrink-0" />
-
-          {/* 自动滚动 */}
-          <Button
-            variant={autoScroll ? 'default' : 'outline'}
-            size="sm"
-            onClick={() => setAutoScroll(!autoScroll)}
-            className="h-7 px-2 text-xs flex-shrink-0"
-          >
-            {autoScroll ? (
-              <>
-                <ArrowDownToLine className="w-3.5 h-3.5 mr-1" />
-                {isEn ? 'Auto' : '自动'}
-              </>
-            ) : (
-              <>
-                <Pause className="w-3.5 h-3.5 mr-1" />
-                {isEn ? 'Paused' : '暂停'}
-              </>
-            )}
+          <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={loadLogs} disabled={loading}>
+            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
           </Button>
-
-          <div className="h-5 w-px bg-border flex-shrink-0" />
-
-          {/* 分页控件 */}
-          <div className="flex items-center gap-1.5 flex-shrink-0">
-            <CustomDropdown
-              value={pageSize.toString()}
-              onChange={(v) => { setPageSize(Number(v)); setCurrentPage(1) }}
-              className="min-w-[60px]"
-              options={[
-                { value: '100', label: '100' },
-                { value: '500', label: '500' },
-                { value: '1000', label: '1000' },
-                { value: '2000', label: '2000' },
-                { value: '5000', label: '5000' },
-              ]}
-            />
-            <div className="flex items-center gap-0.5">
-              <Button
-                variant="outline"
-                size="icon"
-                className="h-7 w-7"
-                onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                disabled={currentPage <= 1}
-              >
-                <ChevronLeft className="w-3.5 h-3.5" />
-              </Button>
-              <div className="flex items-center text-xs text-muted-foreground whitespace-nowrap tabular-nums">
-                <input
-                  type="text"
-                  className="w-8 h-6 text-center text-xs bg-background border rounded px-0.5 focus:outline-none focus:ring-1 focus:ring-ring"
-                  value={currentPage}
-                  onChange={(e) => {
-                    const val = e.target.value
-                    if (val === '' || /^\d+$/.test(val)) {
-                      const num = parseInt(val) || 1
-                      if (num >= 1 && num <= totalPages) {
-                        setCurrentPage(num)
-                      }
-                    }
-                  }}
-                  onBlur={(e) => {
-                    const num = parseInt(e.target.value) || 1
-                    setCurrentPage(Math.min(Math.max(1, num), totalPages || 1))
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      const num = parseInt((e.target as HTMLInputElement).value) || 1
-                      setCurrentPage(Math.min(Math.max(1, num), totalPages || 1))
-                    }
-                  }}
-                />
-                <span className="px-0.5">/</span>
-                <span>{totalPages || 1}</span>
-              </div>
-              <Button
-                variant="outline"
-                size="icon"
-                className="h-7 w-7"
-                onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                disabled={currentPage >= totalPages}
-              >
-                <ChevronRight className="w-3.5 h-3.5" />
-              </Button>
-            </div>
-          </div>
+          <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={handleExportLogs} disabled={logs.length === 0}>
+            <Download className="w-3.5 h-3.5" />
+          </Button>
+          <Button variant="ghost" size="sm" className="h-7 px-2 text-xs text-destructive" onClick={handleClearLogs} disabled={logs.length === 0}>
+            <Trash2 className="w-3.5 h-3.5" />
+          </Button>
         </div>
 
-        {/* 日志列表 */}
-        <div className="flex-1 overflow-auto bg-muted/10" ref={scrollRef}>
-          <div className="p-3 font-mono text-xs space-y-0.5">
+        {/* 日志列表（虚拟滚动） */}
+        <div className="flex-1 overflow-hidden relative">
+          <div
+            ref={scrollRef}
+            className="h-full overflow-y-auto font-mono text-xs"
+            onScroll={handleScroll}
+          >
             {filteredLogs.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
-                <svg className="w-12 h-12 mb-3 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                </svg>
+              <div className="flex flex-col items-center justify-center h-full text-muted-foreground gap-2">
+                <Filter className="h-8 w-8 opacity-20" />
                 <span className="text-sm">{logs.length === 0 ? (isEn ? 'No logs yet' : '暂无日志记录') : (isEn ? 'No matching logs' : '没有匹配的日志')}</span>
-                {logs.length === 0 && (
-                  <span className="text-xs mt-1 opacity-70">{isEn ? 'Logs will appear here after proxy requests' : '发起反代请求后日志将显示在这里'}</span>
-                )}
               </div>
             ) : (
-              paginatedLogs.map((log, index) => {
-                const globalIndex = startIndex + index
-                const isExpanded = expandedLogs.has(globalIndex)
-                const hasData = log.data !== undefined && log.data !== null
+              <div style={{ height: virtualizer.getTotalSize(), width: '100%', position: 'relative' }}>
+                {virtualizer.getVirtualItems().map(virtualRow => {
+                  const index = virtualRow.index
+                  const log = filteredLogs[index]
+                  const isExpanded = expandedLogs.has(index)
+                  const hasData = log.data !== undefined && log.data !== null
 
-                return (
-                  <div
-                    key={index}
-                    className={`group rounded-lg px-3 py-2 transition-colors ${getLevelRowBg(log.level)}`}
-                  >
-                    <div className="flex items-start gap-3">
-                      {/* 时间 */}
-                      <span className="text-muted-foreground whitespace-nowrap flex-shrink-0 tabular-nums">
-                        {formatTime(log.timestamp)}
-                      </span>
-
-                      {/* 级别 */}
-                      <Badge 
-                        variant="outline" 
-                        className={`text-[10px] px-1.5 py-0.5 flex-shrink-0 font-semibold ${getLevelColor(log.level)}`}
-                      >
-                        {log.level}
-                      </Badge>
-
-                      {/* 类别 */}
-                      <span className="text-primary/80 flex-shrink-0 font-medium">[{log.category}]</span>
-
-                      {/* 消息 */}
-                      <span className="flex-1 break-all text-foreground/90">{log.message}</span>
-
-                      {/* 操作按钮 */}
-                      <div className="flex-shrink-0 opacity-0 group-hover:opacity-100 flex items-center gap-1 transition-opacity">
-                        {hasData && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="w-6 h-6 rounded-full hover:bg-primary/10"
-                            onClick={() => toggleExpand(globalIndex)}
-                          >
-                            {isExpanded ? (
-                              <ChevronUp className="w-3.5 h-3.5" />
-                            ) : (
-                              <ChevronDown className="w-3.5 h-3.5" />
-                            )}
-                          </Button>
-                        )}
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="w-6 h-6 rounded-full hover:bg-primary/10"
-                          onClick={() => handleCopyLog(log)}
+                  return (
+                    <div
+                      key={virtualRow.key}
+                      data-index={index}
+                      ref={virtualizer.measureElement}
+                      style={{ position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${virtualRow.start}px)` }}
+                      className={`group rounded-lg px-3 py-1.5 transition-colors ${getLevelRowBg(log.level)}`}
+                    >
+                      <div className="flex items-start gap-2">
+                        <span className="text-muted-foreground whitespace-nowrap flex-shrink-0 tabular-nums text-[10px]">
+                          {formatTime(log.timestamp)}
+                        </span>
+                        <Badge 
+                          variant="outline" 
+                          className={`text-[9px] px-1 py-0 flex-shrink-0 font-semibold ${getLevelColor(log.level)}`}
                         >
-                          <Copy className="w-3.5 h-3.5" />
-                        </Button>
+                          {log.level}
+                        </Badge>
+                        <span className="text-primary/80 flex-shrink-0 font-medium text-[10px]">{log.category}</span>
+                        <span className="flex-1 break-all text-foreground/90 text-[11px]">{log.message}</span>
+                        <div className="flex-shrink-0 opacity-0 group-hover:opacity-100 flex items-center gap-0.5 transition-opacity">
+                          {hasData && (
+                            <Button variant="ghost" size="icon" className="w-5 h-5 rounded-full" onClick={() => toggleExpand(index)}>
+                              {isExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                            </Button>
+                          )}
+                          <Button variant="ghost" size="icon" className="w-5 h-5 rounded-full" onClick={() => handleCopyLog(log)}>
+                            <Copy className="w-3 h-3" />
+                          </Button>
+                        </div>
                       </div>
+                      {isExpanded && hasData && (
+                        <pre className="mt-1.5 ml-20 p-2 rounded-md bg-muted/50 border border-border text-primary overflow-x-auto text-[10px] leading-4">
+                          {JSON.stringify(log.data, null, 2)}
+                        </pre>
+                      )}
                     </div>
-
-                    {/* 展开的数据 */}
-                    {isExpanded && hasData && (
-                      <pre className="mt-2 ml-24 p-3 rounded-lg bg-muted/50 border border-border text-primary overflow-x-auto text-[11px]">
-                        {JSON.stringify(log.data, null, 2)}
-                      </pre>
-                    )}
-                  </div>
-                )
-              })
+                  )
+                })}
+              </div>
             )}
+          </div>
+
+          {/* 回到底部浮动按钮 */}
+          {!isAtBottom && (
+            <button
+              className="absolute bottom-3 right-3 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-primary text-primary-foreground text-xs font-medium shadow-lg hover:bg-primary/90 transition-all"
+              onClick={scrollToBottom}
+            >
+              <ChevronsDown className="h-3.5 w-3.5" />
+              {newLogCount > 0 ? (
+                <>{isEn ? `${newLogCount} new` : `${newLogCount} 条新`}</>
+              ) : (
+                <>{isEn ? 'Bottom' : '底部'}</>
+              )}
+            </button>
+          )}
+        </div>
+
+        {/* 底部状态栏 */}
+        <div className="flex-shrink-0 flex items-center justify-between px-4 py-1.5 border-t border-border text-[10px] text-muted-foreground">
+          <span>{isEn ? 'Showing' : '显示'} {filteredLogs.length.toLocaleString()} / {logs.length.toLocaleString()}</span>
+          <div className="flex items-center gap-1">
+            <ArrowDown className={`h-3 w-3 ${isAtBottom ? 'text-green-500' : 'text-muted-foreground/40'}`} />
+            <span>{isAtBottom ? (isEn ? 'Following' : '跟随中') : (isEn ? 'Scrolled up' : '已暂停跟随')}</span>
           </div>
         </div>
       </div>

@@ -634,7 +634,7 @@ const api = {
   },
 
   // 更新反代服务器配置
-  proxyUpdateConfig: (config: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; selectedAccountIds?: string[]; logRequests?: boolean; autoStart?: boolean; maxRetries?: number; preferredEndpoint?: 'codewhisperer' | 'amazonq'; autoContinueRounds?: number; enableServerSideToolAutoContinue?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; autoSwitchOnQuotaExhausted?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think'; modelMappings?: Array<{ id: string; name: string; enabled: boolean; type: 'replace' | 'alias' | 'loadbalance'; sourceModel: string; targetModels: string[]; weights?: number[]; priority: number; apiKeyIds?: string[] }> }): Promise<{ success: boolean; config?: unknown; error?: string }> => {
+  proxyUpdateConfig: (config: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; selectedAccountIds?: string[]; logRequests?: boolean; autoStart?: boolean; maxRetries?: number; preferredEndpoint?: 'codewhisperer' | 'amazonq'; autoContinueRounds?: number; enableServerSideToolAutoContinue?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; payloadSizeLimitKB?: number; autoSwitchOnQuotaExhausted?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think'; modelMappings?: Array<{ id: string; name: string; enabled: boolean; type: 'replace' | 'alias' | 'loadbalance'; sourceModel: string; targetModels: string[]; weights?: number[]; priority: number; apiKeyIds?: string[] }> }): Promise<{ success: boolean; config?: unknown; error?: string }> => {
     return ipcRenderer.invoke('proxy-update-config', config)
   },
 
@@ -724,8 +724,8 @@ const api = {
   },
 
   // 监听反代响应事件
-  onProxyResponse: (callback: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; credits?: number; error?: string }) => void): (() => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; credits?: number; error?: string }): void => {
+  onProxyResponse: (callback: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }): void => {
       callback(info)
     }
     ipcRenderer.on('proxy-response', handler)

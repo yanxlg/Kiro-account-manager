@@ -10,7 +10,10 @@ interface LogEntry {
   tokens?: number
   inputTokens?: number
   outputTokens?: number
+  cacheReadTokens?: number
+  reasoningTokens?: number
   credits?: number
+  responseTime?: number
   error?: string
 }
 
@@ -122,8 +125,9 @@ export function ProxyLogsDialog({
                     <th className="text-center p-2 font-medium">{isEn ? 'Status' : '状态'}</th>
                     <th className="text-center p-2 font-medium">{isEn ? 'In' : '输入'}</th>
                     <th className="text-center p-2 font-medium">{isEn ? 'Out' : '输出'}</th>
-                    <th className="text-right p-2 font-medium">Tokens</th>
+                    <th className="text-center p-2 font-medium">Cache</th>
                     <th className="text-right p-2 font-medium">Credits</th>
+                    <th className="text-right p-2 font-medium">{isEn ? 'Time' : '耗时'}</th>
                   </tr>
                 </thead>
                 <tbody className="font-mono">
@@ -163,8 +167,9 @@ export function ProxyLogsDialog({
                       </td>
                       <td className="p-2 text-center text-muted-foreground">{log.inputTokens ? log.inputTokens.toLocaleString() : '-'}</td>
                       <td className="p-2 text-center text-muted-foreground">{log.outputTokens ? log.outputTokens.toLocaleString() : '-'}</td>
-                      <td className="p-2 text-right text-muted-foreground">{log.tokens ? log.tokens.toLocaleString() : '-'}</td>
+                      <td className="p-2 text-center text-emerald-500">{log.cacheReadTokens ? log.cacheReadTokens.toLocaleString() : '-'}</td>
                       <td className="p-2 text-right text-muted-foreground">{log.credits ? log.credits.toFixed(6) : '-'}</td>
+                      <td className="p-2 text-right text-muted-foreground">{log.responseTime ? `${(log.responseTime / 1000).toFixed(1)}s` : '-'}</td>
                     </tr>
                   ))}
                 </tbody>
