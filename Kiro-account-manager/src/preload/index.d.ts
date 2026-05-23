@@ -583,6 +583,9 @@ interface KiroApi {
   // 重置反代池状态
   proxyResetPool: () => Promise<{ success: boolean; error?: string }>
 
+  // 手动解除账号封禁标记
+  proxyClearAccountSuspended: (accountId: string) => Promise<{ success: boolean; error?: string }>
+
   // 刷新模型缓存
   proxyRefreshModels: () => Promise<{ success: boolean; error?: string }>
 
@@ -623,6 +626,9 @@ interface KiroApi {
 
   // 监听反代状态变化事件
   onProxyStatusChange: (callback: (status: { running: boolean; port: number }) => void) => () => void
+
+  // 监听反代账号被封禁事件（TEMPORARILY_SUSPENDED / AccountSuspendedException）
+  onProxyAccountSuspended: (callback: (info: { id: string; email?: string; reason: string; message: string; suspendedAt: number }) => void) => () => void
 
   // ============ Usage API 类型设置 ============
 
@@ -719,6 +725,16 @@ interface KiroApi {
 
   // 监听 K-Proxy MITM 拦截事件
   onKproxyMitm: (callback: (info: { host: string; modified: boolean }) => void) => () => void
+
+  // ============ 自定义 titlebar API ============
+  window: {
+    minimize: () => void
+    maximizeToggle: () => void
+    close: () => void
+    isMaximized: () => Promise<boolean>
+    getPlatform: () => Promise<NodeJS.Platform>
+    onMaximizeChange: (callback: (isMaximized: boolean) => void) => () => void
+  }
 
   // ============ 托盘相关 API ============
 
