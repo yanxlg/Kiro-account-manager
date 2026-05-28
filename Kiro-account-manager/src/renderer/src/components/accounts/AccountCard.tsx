@@ -160,8 +160,18 @@ export const AccountCard = memo(function AccountCard({
     maskEmail,
     maskNickname,
     usagePrecision,
-    updateAccountStatus
+    updateAccountStatus,
+    accountProxyBindings,
+    proxyPool,
+    unbindAccountFromProxy
   } = useAccountsStore()
+
+  // 该账号绑定的代理（如有）
+  const boundProxy = useMemo(() => {
+    const proxyId = accountProxyBindings[account.id]
+    if (!proxyId) return null
+    return proxyPool.get(proxyId) || null
+  }, [accountProxyBindings, account.id, proxyPool])
 
   // 解除封禁标记中（loading 状态）
   const [isClearingSuspended, setIsClearingSuspended] = useState(false)
@@ -592,6 +602,32 @@ export const AccountCard = memo(function AccountCard({
             <Badge variant="outline" className="text-[10px] h-5 px-2 text-muted-foreground font-normal border-muted-foreground/30 bg-muted/30">
                 {account.idp}
             </Badge>
+            {/* 代理绑定徽章：可点击解绑 */}
+            {boundProxy && (
+              <Badge
+                variant="outline"
+                className={cn(
+                  'text-[10px] h-5 px-1.5 font-normal cursor-pointer transition-colors group',
+                  boundProxy.enabled && boundProxy.status !== 'dead'
+                    ? 'border-cyan-500/40 text-cyan-700 dark:text-cyan-300 bg-cyan-500/10 hover:bg-cyan-500/20'
+                    : 'border-amber-500/40 text-amber-700 dark:text-amber-300 bg-amber-500/10'
+                )}
+                title={`${isEn ? 'Bound proxy:' : '绑定代理：'} ${boundProxy.host}:${boundProxy.port}${boundProxy.label ? ` (${boundProxy.label})` : ''}\n${isEn ? 'Click to unbind' : '点击解绑'}`}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  if (confirm(isEn
+                    ? `Unbind ${account.email} from ${boundProxy.host}:${boundProxy.port}?`
+                    : `解绑 ${account.email} 与 ${boundProxy.host}:${boundProxy.port}？`
+                  )) {
+                    unbindAccountFromProxy(account.id)
+                  }
+                }}
+              >
+                <span className="opacity-70 group-hover:hidden">⇄</span>
+                <span className="hidden group-hover:inline">✕</span>
+                <span className="ml-0.5">{boundProxy.host.length > 15 ? boundProxy.host.slice(0, 12) + '…' : boundProxy.host}</span>
+              </Badge>
+            )}
             {account.isActive && (
               <Badge variant="default" className="ml-auto h-5 bg-success text-white border-0 hover:bg-success/90">
                 {isEn ? 'Active' : '当前使用'}

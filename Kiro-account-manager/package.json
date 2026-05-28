@@ -1,6 +1,6 @@
 {
   "name": "kiro-account-manager",
-  "version": "1.6.9",
+  "version": "1.7.0",
   "description": "Kiro Account Manager - Manage your Kiro accounts, usage and subscriptions",
   "main": "./out/main/index.js",
   "author": "Kiro",
@@ -37,6 +37,7 @@
     "js-tiktoken": "^1.0.21",
     "lucide-react": "^0.555.0",
     "node-forge": "^1.3.3",
+    "socks": "^2.8.9",
     "tailwind-merge": "^3.4.0",
     "tailwindcss": "^4.1.17",
     "tlsclientwrapper": "^4.2.0",

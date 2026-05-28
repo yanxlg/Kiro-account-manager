@@ -222,9 +222,17 @@ class ProxyLogger {
 }
 
 // 内存日志存储（用于 UI 显示）
+//
+// 性能修复要点：
+// 1. maxLogs 从 100万 降至 5万 — 避免序列化数百 MB 大对象阻塞主进程
+// 2. save() 改为异步 fs.promises.writeFile — 不再 freeze 主进程事件循环
+// 3. 单次写盘原子化（in-flight guard）防止并发 writeFile 导致竞态
+// 4. 写盘节流间隔从 5s 提至 30s — 大幅降低高频日志场景下的 IO 频率
+// 5. 应用退出时通过 flushSaveNow() 强制写盘，防止数据丢失
 class ProxyLogStore {
   private logs: LogEntry[] = []
-  private maxLogs: number = 1000000 // 最大保存条数（100万）
+  // 5 万条 × 平均 200 字节 ≈ 10 MB；既能覆盖常规调试需求，又把单次写盘成本控制在可接受范围内
+  private maxLogs: number = 50000
   private listeners: ((entry: LogEntry) => void)[] = []
   private storePath: string = ''
 
@@ -242,17 +250,13 @@ class ProxyLogStore {
         const data = fs.readFileSync(this.storePath, 'utf-8')
         const parsed = JSON.parse(data)
         // 验证并过滤有效的日志条目
-        this.logs = Array.isArray(parsed) ? parsed.filter((log: LogEntry) => {
-          // 必须有有效的 timestamp
-          if (!log.timestamp || isNaN(new Date(log.timestamp).getTime())) {
-            return false
-          }
-          // 必须有 level 和 category
-          if (!log.level || !log.category) {
-            return false
-          }
+        const filtered = Array.isArray(parsed) ? parsed.filter((log: LogEntry) => {
+          if (!log.timestamp || isNaN(new Date(log.timestamp).getTime())) return false
+          if (!log.level || !log.category) return false
           return true
         }) : []
+        // 加载时也施加上限，避免旧版本遗留的超大日志文件导致首次启动卡顿
+        this.logs = filtered.length > this.maxLogs ? filtered.slice(-this.maxLogs) : filtered
         console.log(`[ProxyLogStore] Loaded ${this.logs.length} valid logs`)
       }
     } catch (error) {
@@ -261,50 +265,67 @@ class ProxyLogStore {
     }
   }
 
-  save(): void {
+  /** 异步保存日志（不阻塞主进程事件循环）。并发调用通过 in-flight 标志合并。 */
+  private writeInFlight = false
+  private writePending = false
+
+  async save(): Promise<void> {
+    if (this.writeInFlight) {
+      // 已有写盘进行中：标记 pending，让其完成后立即重写最新数据
+      this.writePending = true
+      return
+    }
+    this.writeInFlight = true
     try {
-      fs.writeFileSync(this.storePath, JSON.stringify(this.logs), 'utf-8')
+      // 拷贝引用快照（不复制数组）以保证 JSON.stringify 期间数据稳定
+      const snapshot = this.logs
+      await fs.promises.writeFile(this.storePath, JSON.stringify(snapshot), 'utf-8')
     } catch (error) {
       console.error('[ProxyLogStore] Failed to save logs:', error)
+    } finally {
+      this.writeInFlight = false
+      if (this.writePending) {
+        this.writePending = false
+        // 用 microtask 而不是立即递归，避免栈深问题
+        queueMicrotask(() => { void this.save() })
+      }
     }
   }
 
   private saveTimer: NodeJS.Timeout | null = null
-  private pendingSave = false
 
   add(entry: LogEntry): void {
     this.logs.push(entry)
-    
+
     // 超过最大数量时删除最旧的
     if (this.logs.length > this.maxLogs) {
       this.logs = this.logs.slice(-this.maxLogs)
     }
 
-    // 通知监听器
+    // 通知监听器（异常隔离）
     for (const listener of this.listeners) {
-      try {
-        listener(entry)
-      } catch (e) {
-        // ignore
-      }
+      try { listener(entry) } catch { /* ignore */ }
     }
 
-    // 延迟保存（避免频繁写入）
+    // 节流调度异步保存
     this.scheduleSave()
   }
 
   private scheduleSave(): void {
-    if (this.pendingSave) return
-    this.pendingSave = true
-    
+    if (this.saveTimer) return  // 已调度，等待 flush
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null
+      void this.save()
+    }, 30_000) // 30 秒批量写盘一次（异步、不阻塞）
+  }
+
+  /** 强制立即写盘（用于退出场景），保证最新数据落盘 */
+  async flushSaveNow(): Promise<void> {
     if (this.saveTimer) {
       clearTimeout(this.saveTimer)
+      this.saveTimer = null
     }
-    
-    this.saveTimer = setTimeout(() => {
-      this.save()
-      this.pendingSave = false
-    }, 5000) // 5秒后保存
+    await this.save()
   }
 
   getAll(): LogEntry[] {
@@ -317,7 +338,7 @@ class ProxyLogStore {
 
   clear(): void {
     this.logs = []
-    this.save()
+    void this.save()
   }
 
   count(): number {

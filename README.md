@@ -272,6 +272,155 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.0 (2026-5-28) — Security Hardening + Major Feature Expansion
+
+> This release packs 70+ improvements covering reverse-proxy security hardening, batch registration concurrency isolation, SOCKS proxy support, unified task center, webhook notifications, analytics reporting, one-click diagnostics, config import/export, and major performance optimizations.
+
+#### 🛡️ Reverse-Proxy Security Hardening (21 fixes)
+
+**P0 Critical Security**
+- **Fix**: `readBody` now enforces a max body size (default 10MB), rejects oversized Content-Length early + breaks connection on stream overflow → HTTP 413 (DoS protection)
+- **Fix**: Refuse to start when `host=0.0.0.0`/`::` without any API Key; red banner in UI + explicit `allowExternalWithoutApiKey` flag required to bypass
+- **Fix**: API Key comparison now uses `crypto.timingSafeEqual` to prevent timing-attack key guessing
+- **Fix**: 5xx responses return generic "Internal server error"; auto-sanitize Bearer/access_token/JWT/system paths
+- **Fix**: `/admin/config` GET masks `apiKeys[].key` plaintext, showing only `xxxx***last4`
+
+**P1 Operations & Observability**
+- **New**: IP allowlist / denylist (single IP + IPv4/IPv6 CIDR)
+- **New**: Critical proxy events trigger webhooks (account suspended / all accounts exhausted, with 5-min dedup)
+- **New**: `/admin/config` POST field allowlist, blocks remote mutation of port/host/apiKeys/tls
+- **New**: Per-API-Key / per-IP request rate limit (sliding window, configurable)
+- **New**: Session affinity (route same `conversation_id` to same account → preserve prompt cache + anti-risk-control)
+- **New**: keep-alive / headers idle timeout (default 65s/60s, configurable)
+- **New**: One-click TLS self-signed certificate generation (2-year validity + SAN covers localhost/127.0.0.1/::1/user host)
+- **New**: Graceful `stop()` (5s grace period → activeRequests.abort → socket.destroy)
+- **New**: Log sanitization (removes Bearer/access_token/JWT/system path fragments)
+
+**P2 Advanced**
+- **New**: Prometheus `/metrics` endpoint (8 core metrics: requests/tokens/credits/accounts/uptime)
+- **New**: Proxy audit log (rolling 200 entries + `/admin/audit` GET + `enableAuditLog` toggle)
+- **New**: API Key → Account allowlist (`apiKeyAccountBindings`: apiKey id → allowed account id array)
+- **New**: HTTP + HTTPS dual-port (with TLS enabled, listen HTTP on `fallbackPort` simultaneously)
+- **New**: Configurable `recentRequests` limit (default 100, max 10000)
+- **New**: Mark restart required on port/host/tls changes + one-click restart button in UI
+- **New**: Stream response socket-level backpressure monitoring
+
+**New files**: `src/main/proxy/selfSignedCert.ts`, `ProxySecurityPanel.tsx`
+**New IPC**: `proxySelfSignedCertInfo` / `proxySelfSignedCertRegenerate` / `proxyNeedsRestart` / `proxyRestart` / `proxyAuditLog` / `onProxyWebhookTrigger`
+
+#### 🌐 Multi-Protocol Proxy Support
+
+- **New**: SOCKS5 / SOCKS5h / SOCKS4 / SOCKS4a proxy support (via `socks` library + undici custom Agent + TLS upgrade)
+- **New**: Account-Proxy N:1 binding (reverse-proxy bucketing, multiple accounts share single IP to reduce risk-control correlation)
+- **New**: All account requests (token refresh, background check, Kiro API) go through bound proxy
+- **New**: Advanced proxy pool search (9-field full-text: host / port / protocol / user / label / email / url / tags / source)
+- **New**: Multi-dimensional filtering (protocol / enabled status / latency range / last validation time) with live match count
+
+#### 🚀 Batch Registration Major Upgrade
+
+**Concurrency Isolation Fixes**
+- **Fix**: Outlook concurrent email contention (frontend pre-shuffles outlookData + each task takes one line exclusively; main process compatible with single/multi-line)
+- **Fix**: Mixed mode source selection only effective once (each task independently calls `buildAutoConfig`, weight rotation now actually works)
+- **Fix**: Registration history "Direct connection" false report (`resolvedProxyUrl()` now includes system/env proxies)
+
+**Feature Expansion**
+- **New**: Rate limiter (token bucket) + exponential backoff + success rate monitoring
+- **New**: Failure retry queue (by error type: network / otp_timeout / email_used / rate_limit / auth / risk_control)
+- **New**: Auto-detect AWS risk control ("TEMPORARILY_SUSPENDED" / "please try again later") + auto-pause batch
+- **New**: Email pre-validation blacklist (auto-add used emails, skip to save time)
+- **New**: Mixed email source weighted round-robin (SWRR algorithm, same as nginx)
+- **New**: Daily registration quota + cron-style scheduled launch
+- **New**: Registration strategy templates (save/apply/import/export)
+- **New**: Dynamic 6-8 step progress bar (auto-adjusts based on `batchAutoImport` and `autoFetchProLink`)
+- **Fix**: Chinese mojibake errors during registration (tlsclientwrapper Latin-1 → UTF-8 re-decoding)
+- **Remove**: MoEmail registration mode (no longer useful)
+
+#### 📊 Task Center + Webhooks
+
+- **New**: Unified task center (`useTaskStore`, titlebar entry + drawer UI)
+- **New**: Task state machine: running / paused / success / failed / cancelled
+- **New**: Persisted finished tasks (saved to localStorage)
+- **New**: Cancel All button / progress bars / sub-task details
+- **New**: Webhooks (DingTalk / Telegram / Discord / Slack / Generic JSON)
+- **New**: Webhook retry (3 attempts with exponential backoff) + rate limit (20 msg/min/webhook)
+- **New**: Critical proxy events → Webhook (suspended / all exhausted)
+
+#### 🩺 One-Click Diagnostics
+
+- **New**: Diagnostics page (network / Kiro API / email service / proxy / custom endpoint connectivity)
+- **New**: Custom probe URL (replaces MoEmail field; any HTTP/HTTPS endpoint accepted)
+- **New**: Run diagnostics through proxy + report export (clipboard)
+- **New**: Auto-migrate legacy MoEmail config to new probe URL key
+
+#### 🔧 Subscription Management
+
+- **New**: Bulk subscription pre-flight check (eligibility + report)
+- **New**: Cancel / downgrade / renew entries
+- **New**: Subscription link expiry detection (HTTP HEAD probe + generatedAt timestamp)
+- **New**: Manage Subscriptions tab (bulk open portal + one-click disable overage)
+- **New**: Subscribed accounts virtual list (@tanstack/react-virtual)
+
+#### 📈 Analytics Reports
+
+- **New**: Registration analytics report (success/fail donut + 24h smooth curve + 7-day trend)
+- **New**: Error classification stats (OTP timeout / network / email used / rate limit / risk control)
+- **New**: CSV export
+
+#### 📦 Config Import / Export
+
+- **New**: One-click full config export (accounts / proxies / webhooks / strategy templates)
+- **New**: AES-GCM encrypted export (KCFG format, PBKDF2-SHA256 key derivation)
+- **New**: Cross-device config sync
+
+#### ⚡ Performance Optimization (Anti-Lag)
+
+**I/O & Persistence**
+- **Optimize**: `saveToStorage` 500ms debounce + `flushSaveImmediately` force-flush API
+- **Optimize**: `createBackup` 5-minute throttle (previously backed up on every save)
+- **Optimize**: `ProxyLogStore` async `fs.promises.writeFile` + 30s throttle + maxLogs 1M → 50K
+- **Optimize**: `proxy-account-suspended` IPC updates memory snapshot only, deferred disk write
+- **Optimize**: SSO accounts `queueMicrotask` async loading (no longer blocks loadFromStorage)
+
+**Render & Compute**
+- **Optimize**: `getFilteredAccounts` / `getStats` / `activeAccount` module-level memoization
+- **Optimize**: `applyBackgroundRefreshResults` / `applyBackgroundCheckResults` batch merge (120ms buffer)
+- **Optimize**: `importAccounts` / `importFromExportData` single set call
+- **Optimize**: `updateTrayInfo` 400ms debounce
+- **Optimize**: `AccountToolbar` selection status with `useMemo` + `useCallback`
+- **Optimize**: Proxy pool / accounts / subscriptions use virtual list (`@tanstack/react-virtual`, only render visible area)
+
+#### 🐛 Critical Bug Fixes
+
+- **Fix**: `Invalid URL protocol` (Windows registry ProxyServer multi-protocol string parsing, take only HTTP/HTTPS)
+- **Fix**: `tls-client-wrapper` DLL moved to `userData/tls-client/` for permanent storage (was in `%TEMP%`, could be cleaned by system)
+- **Fix**: Network response Latin-1 → UTF-8 conversion (Chinese errors display correctly)
+- **Fix**: `proxyServer.stop()` socket force-destroy was too early, truncating responses
+- **Fix**: Memory leaks (rate limit buckets / session affinity entries auto-cleaned every 5 min)
+
+#### 🆕 New Pages
+
+- **`ProxyPoolPage`** — Proxy pool management + advanced search + account binding + scheduled validation
+- **`WebhooksPage`** — Webhook configuration + testing + event subscription
+- **`DiagnosePage`** — One-click diagnostics (network / API / email / proxy / custom)
+- **`ConfigSyncPage`** — Config import/export + AES-GCM encryption
+
+#### 🔧 Theme & UI
+
+- **New**: Task center button (titlebar) + global progress display
+- **New**: Reverse-proxy "Security & Observability (v1.8)" card (collapsible, unified entry for new settings)
+- **Improve**: Failure error code localized display
+- **Improve**: Dangerous binding (0.0.0.0) auto-show red warning + risk confirmation toggle
+
+#### 🔄 ProxyAccount Data Model Extension
+
+- New `proxyUrl` field (account-bound egress proxy)
+- New `machineId` field (account-bound device ID)
+
+#### 📋 New ProxyConfig fields (14 items)
+
+`maxRequestBodyBytes` / `allowedIPs` / `deniedIPs` / `allowExternalWithoutApiKey` / `rateLimitPerKeyPerMinute` / `sessionAffinityEnabled` / `keepAliveTimeoutMs` / `headersTimeoutMs` / `recentRequestsLimit` / `enableMetrics` / `apiKeyAccountBindings` / `fallbackPort` / `enableAuditLog` / `apiKeyGroupBindings`(deprecated)
+
+
 ### v1.6.9 (2026-5-24)
 
 #### Full Theme Adaptation

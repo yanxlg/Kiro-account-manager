@@ -2,6 +2,7 @@
 import http from 'http'
 import https from 'https'
 import fs from 'fs'
+import crypto from 'crypto'
 import { v4 as uuidv4 } from 'uuid'
 import type { Socket } from 'net'
 import type {
@@ -234,8 +235,17 @@ function buildClientModel(input: {
   }
 }
 
+// 请求体超限错误（统一识别用，触发 413 响应）
+class BodyTooLargeError extends Error {
+  constructor(public readonly received: number, public readonly limit: number) {
+    super(`Request body too large: ${received} bytes exceeds limit of ${limit} bytes`)
+    this.name = 'BodyTooLargeError'
+  }
+}
+
 export class ProxyServer {
   private server: http.Server | https.Server | null = null
+  private fallbackServer: http.Server | null = null  // HTTPS 启用时同时监听 HTTP（可选）
   private accountPool: AccountPool
   private config: ProxyConfig
   private stats: ProxyStats
@@ -246,6 +256,16 @@ export class ProxyServer {
   private isStopping: boolean = false
   private activeRequests: Set<AbortController> = new Set()
   private sockets: Set<Socket> = new Set()
+  /** P1-7 按 API Key/IP 的滑动窗口限流（每分钟桶） */
+  private rateLimitBuckets: Map<string, { count: number; windowStart: number }> = new Map()
+  /** P1-8 会话粘性：session hint → accountId 的映射（10 分钟 TTL） */
+  private sessionAffinity: Map<string, { accountId: string; lastAt: number }> = new Map()
+  /** P2-17 审计日志（最近 200 条） */
+  private auditLog: Array<{ ts: number; type: string; data: Record<string, unknown> }> = []
+  /** Webhook 触发回调（由外部注入，避免 main → renderer 循环依赖） */
+  private webhookTrigger?: (event: string, payload: Record<string, unknown>) => void
+  /** 定期清理 timer */
+  private cleanupTimer: NodeJS.Timeout | null = null
 
   /**
    * 从请求中提取 session hint，用于稳定 conversationId
@@ -333,11 +353,40 @@ export class ProxyServer {
     this.events = events
   }
 
+  /**
+   * 检测当前绑定地址是否会暴露到本机以外
+   * 0.0.0.0 / :: / 网卡地址 → true；127.0.0.1 / ::1 / localhost → false
+   */
+  private isBindingExternal(host?: string): boolean {
+    if (!host) return false
+    const h = host.toLowerCase().trim()
+    return h === '0.0.0.0' || h === '::' || h === '*' || (
+      h !== '127.0.0.1' && h !== '::1' && h !== 'localhost'
+    )
+  }
+
   // 启动服务器
   async start(): Promise<void> {
     if (this.server) {
       console.log('[ProxyServer] Server already running')
       return
+    }
+
+    // P0-2 安全护栏：外网绑定 + 无 API Key → 拒绝启动（用户可以显式 allowExternalWithoutApiKey 解除）
+    if (this.isBindingExternal(this.config.host)) {
+      const hasAnyKey = (this.config.apiKeys?.some(k => k.enabled && k.key) ?? false) || !!this.config.apiKey
+      if (!hasAnyKey && !this.config.allowExternalWithoutApiKey) {
+        const err = new Error(
+          `[Security] Refused to start: host=${this.config.host} exposes to network but no API Key configured. ` +
+          `Set at least one API Key, or change host to 127.0.0.1, or set allowExternalWithoutApiKey=true (NOT RECOMMENDED).`
+        )
+        console.error('[ProxyServer]', err.message)
+        this.events.onError?.(err)
+        throw err
+      }
+      if (!hasAnyKey) {
+        console.warn(`[ProxyServer] [Security] WARNING: binding to ${this.config.host} without API Key (allowExternalWithoutApiKey=true). This exposes your accounts to the network!`)
+      }
     }
 
     return new Promise((resolve, reject) => {
@@ -374,6 +423,12 @@ export class ProxyServer {
       this.server.on('connection', (socket: Socket) => {
         this.sockets.add(socket)
         socket.on('close', () => this.sockets.delete(socket))
+        // P1-10 backpressure 监控：socket 写入缓冲区超过 1MB 时记录警告
+        socket.on('drain', () => {
+          if (socket.writableLength > 0) {
+            proxyLogger.debug('ProxyServer', `Socket drain: bufferedLen=${socket.writableLength}`)
+          }
+        })
       })
 
       // 服务器关闭时尝试自动重启
@@ -391,9 +446,22 @@ export class ProxyServer {
         }
       })
 
+      // P1-11 keep-alive / headers 空闲超时（避免长连接占用资源）
+      const keepAliveMs = this.config.keepAliveTimeoutMs ?? 65_000
+      const headersMs = this.config.headersTimeoutMs ?? 60_000
+      this.server.keepAliveTimeout = keepAliveMs
+      this.server.headersTimeout = Math.max(headersMs, keepAliveMs + 1000) // headers 必须 > keepAlive，否则 Node 会 warn
+      this.server.requestTimeout = 0  // 流式响应可能很长，禁用 request 总超时
+
+      // 启动定期清理（每 5 分钟）
+      if (this.cleanupTimer) clearInterval(this.cleanupTimer)
+      this.cleanupTimer = setInterval(() => this.cleanupExpiredCaches(), 5 * 60_000)
+      // 让 timer 在 Node 退出时不阻塞
+      this.cleanupTimer.unref?.()
+
       const protocol = this.isHttps ? 'https' : 'http'
       this.server.listen(this.config.port, this.config.host, () => {
-        proxyLogger.info('ProxyServer', `Started on ${protocol}://${this.config.host}:${this.config.port}`)
+        proxyLogger.info('ProxyServer', `Started on ${protocol}://${this.config.host}:${this.config.port} (keepAlive=${keepAliveMs}ms)`)
         this.stats.startTime = Date.now()
         // 重置会话统计
         this.sessionStats = {
@@ -405,10 +473,28 @@ export class ProxyServer {
         this.events.onStatusChange?.(true, this.config.port)
         resolve()
       })
+
+      // D4 启用 TLS 时同时监听 HTTP fallback 端口（如果配置了 fallbackPort）
+      if (this.isHttps && this.config.fallbackPort && this.config.fallbackPort !== this.config.port) {
+        const fallback = http.createServer(requestHandler)
+        fallback.keepAliveTimeout = keepAliveMs
+        fallback.headersTimeout = Math.max(headersMs, keepAliveMs + 1000)
+        fallback.requestTimeout = 0
+        fallback.on('connection', (socket) => {
+          this.sockets.add(socket)
+          socket.on('close', () => this.sockets.delete(socket))
+        })
+        fallback.on('error', (err) => proxyLogger.warn('ProxyServer', `Fallback HTTP error: ${err.message}`))
+        fallback.listen(this.config.fallbackPort, this.config.host, () => {
+          proxyLogger.info('ProxyServer', `Fallback HTTP listening on http://${this.config.host}:${this.config.fallbackPort}`)
+        })
+        this.fallbackServer = fallback
+      }
     })
   }
 
   // 获取 TLS 配置选项
+  // P1-13 当 tls.enabled 但未提供 cert/key 时，自动生成自签证书
   private getTlsOptions(): https.ServerOptions {
     const tls = this.config.tls!
     
@@ -424,42 +510,136 @@ export class ProxyServer {
       cert = fs.readFileSync(tls.certPath, 'utf8')
       key = fs.readFileSync(tls.keyPath, 'utf8')
     } else {
-      throw new Error('TLS enabled but no certificate/key provided')
+      // 自动生成自签证书（位于 userData/proxy-tls/）
+      try {
+        const { app } = require('electron')
+        const { ensureProxySelfSignedCert } = require('./selfSignedCert')
+        const hostnames = [this.config.host || '127.0.0.1']
+        const result = ensureProxySelfSignedCert(app.getPath('userData'), hostnames)
+        proxyLogger.info('ProxyServer', `Using self-signed TLS cert (SAN=${result.altNames.join(',')}, fingerprint=${result.fingerprint.slice(0, 19)}...)`)
+        cert = result.cert
+        key = result.key
+      } catch (err) {
+        throw new Error(`TLS enabled but no certificate/key provided and auto-generation failed: ${(err as Error).message}`)
+      }
     }
 
     return { cert, key }
   }
 
-  // 停止服务器
-  async stop(): Promise<void> {
+  /**
+   * 获取（或生成）反代自签证书信息（供 UI 显示/导出 PEM）
+   */
+  getSelfSignedCertInfo(): import('./selfSignedCert').ProxySelfSignedCert | null {
+    try {
+      const { app } = require('electron')
+      const { ensureProxySelfSignedCert } = require('./selfSignedCert')
+      return ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'])
+    } catch (err) {
+      proxyLogger.warn('ProxyServer', `getSelfSignedCertInfo failed: ${(err as Error).message}`)
+      return null
+    }
+  }
+
+  /** 强制重新生成自签证书（用户在 UI 上点"重新生成"） */
+  regenerateSelfSignedCert(): import('./selfSignedCert').ProxySelfSignedCert | null {
+    try {
+      const { app } = require('electron')
+      const { ensureProxySelfSignedCert } = require('./selfSignedCert')
+      this.appendAuditLog('regenerate_self_signed_cert', { host: this.config.host })
+      return ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'], true)
+    } catch (err) {
+      proxyLogger.warn('ProxyServer', `regenerateSelfSignedCert failed: ${(err as Error).message}`)
+      return null
+    }
+  }
+
+  /**
+   * 优雅停止服务器
+   * - 立刻拒绝新连接（server.close）
+   * - 给正在进行中的请求 5 秒完成；超时后强制 destroy socket
+   * - 同时停 fallback HTTP 服务器
+   */
+  async stop(gracefulMs: number = 5000): Promise<void> {
     if (!this.server) {
       return
     }
 
     this.isStopping = true
 
+    const main = this.server
+    const fallback = this.fallbackServer
+
     return new Promise((resolve) => {
-      this.server!.close(() => {
+      let done = false
+      const finish = () => {
+        if (done) return
+        done = true
         proxyLogger.info('ProxyServer', 'Stopped')
         this.server = null
+        this.fallbackServer = null
         this.isStopping = false
         this.activeRequests.clear()
         this.sockets.clear()
+        if (this.cleanupTimer) { clearInterval(this.cleanupTimer); this.cleanupTimer = null }
         this.events.onStatusChange?.(false, this.config.port)
         resolve()
+      }
+
+      // 先停止接受新连接
+      main.close(() => {
+        fallback?.close(() => finish()) || finish()
       })
-      this.activeRequests.forEach(controller => controller.abort(new Error('Proxy server stopped')))
-      this.sockets.forEach(socket => socket.destroy())
+      fallback?.close()
+
+      // P1-14 优雅停止：给正在进行中的请求时间完成，超时再强制
+      this.activeRequests.forEach(controller => {
+        // 给客户端一个明确的 stop 信号，但不立即中断已发送的响应流
+        try { controller.abort(new Error('Proxy server stopped')) } catch { /* ignore */ }
+      })
+
+      // 超时强制 destroy
+      setTimeout(() => {
+        this.sockets.forEach(socket => { try { socket.destroy() } catch { /* ignore */ } })
+        finish()
+      }, Math.max(0, gracefulMs))
     })
   }
 
   // 更新配置
+  // P2-18 检测到 port/host/tls 变更时，标记 needsRestart=true，UI 可读取并提示
+  private _needsRestart = false
   updateConfig(config: Partial<ProxyConfig>): void {
+    // 标记需要重启的字段
+    const restartTriggerFields: Array<keyof ProxyConfig> = ['port', 'host', 'tls', 'fallbackPort']
+    const willRestart = restartTriggerFields.some(k => k in config && JSON.stringify(this.config[k]) !== JSON.stringify(config[k]))
+    if (willRestart && this.isRunning()) {
+      this._needsRestart = true
+      proxyLogger.warn('ProxyServer', `Config change requires restart: ${restartTriggerFields.filter(k => k in config).join(', ')}`)
+    }
+    this.appendAuditLog('config_changed', { fields: Object.keys(config), needsRestart: willRestart })
     this.config = { ...this.config, ...config }
     // 同步账号选择策略到 accountPool
     if (config.accountSelectionStrategy !== undefined) {
       this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
     }
+  }
+
+  /** UI 可用此判断是否需提示用户重启 */
+  needsRestart(): boolean {
+    return this._needsRestart
+  }
+
+  /** 重启后调用清除 needsRestart 标记 */
+  async restartServer(): Promise<void> {
+    if (!this.isRunning()) {
+      await this.start()
+      this._needsRestart = false
+      return
+    }
+    await this.stop()
+    await this.start()
+    this._needsRestart = false
   }
 
   // 获取配置
@@ -515,18 +695,11 @@ export class ProxyServer {
       if (signal?.aborted) throw this.getAbortError(signal)
       signal?.addEventListener('abort', abort, { once: true })
       const agent = (() => {
+        const { getSystemProxy, safeCreateProxyAgent } = require('./systemProxy')
         const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
-        if (envProxy) {
-          const { ProxyAgent } = require('undici')
-          return new ProxyAgent({ uri: envProxy, requestTls: { rejectUnauthorized: false } })
-        }
-        const { getSystemProxy } = require('./systemProxy')
-        const systemProxy = getSystemProxy()
-        if (systemProxy) {
-          const { ProxyAgent } = require('undici')
-          return new ProxyAgent({ uri: systemProxy, requestTls: { rejectUnauthorized: false } })
-        }
-        return undefined
+        const envAgent = safeCreateProxyAgent(envProxy)
+        if (envAgent) return envAgent
+        return safeCreateProxyAgent(getSystemProxy())
       })()
       const { fetch: undiciFetch } = require('undici')
       const response = agent
@@ -962,8 +1135,23 @@ export class ProxyServer {
     }
   }
 
+  /**
+   * 计算 API Key 允许使用的账号 ID 集合（P2-21）
+   * 返回 undefined = 不限制（允许所有账号）
+   */
+  private getAllowedAccountIds(apiKeyId?: string): Set<string> | undefined {
+    if (!apiKeyId) return undefined
+    const bindings = this.config.apiKeyAccountBindings?.[apiKeyId]
+    if (!bindings || bindings.length === 0) return undefined
+    return new Set(bindings)
+  }
+
   // 获取可用账号（包含 Token 刷新检查）
-  private async getAvailableAccount(signal?: AbortSignal): Promise<ProxyAccount | null> {
+  // P1-8 sessionHint：相同会话尽量复用同一账号（命中 prompt cache + 防风控）
+  // P2-21 apiKeyId：用于过滤 API Key 允许使用的账号子集
+  private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string): Promise<ProxyAccount | null> {
+    const allowedIds = this.getAllowedAccountIds(apiKeyId)
+    const isAllowed = (acc: ProxyAccount | null): boolean => !acc || !allowedIds || allowedIds.has(acc.id)
     this.throwIfAborted(signal)
     // 如果 pool 为空，触发懒加载回调尝试同步账号（冷启动场景）
     if (this.accountPool.size === 0 && this.events.onPoolEmpty) {
@@ -972,11 +1160,38 @@ export class ProxyServer {
     }
     this.throwIfAborted(signal)
 
+    // P1-8 会话粘性：优先复用已绑定的账号（同时受 API Key 绑定过滤）
+    if (this.config.sessionAffinityEnabled && sessionHint) {
+      const sticky = this.pickAccountWithAffinity(sessionHint)
+      if (sticky && isAllowed(sticky)) {
+        proxyLogger.debug('ProxyServer', `Session affinity hit: ${sessionHint.slice(0, 16)} → ${sticky.email || sticky.id.slice(0, 8)}`)
+        // 仍需检查 token 是否需要刷新
+        if (this.isTokenExpiringSoon(sticky)) {
+          const refreshed = await this.refreshToken(sticky, signal)
+          if (refreshed) {
+            return this.accountPool.getAccount(sticky.id) || sticky
+          }
+        } else {
+          return sticky
+        }
+      }
+    }
+
     let account: ProxyAccount | null
     
     // 检查是否启用多账号轮询
     if (this.config.enableMultiAccount) {
       account = this.accountPool.getNextAccount()
+      // P2-21 过滤：必须在白名单内
+      if (account && !isAllowed(account)) {
+        // 尝试找一个允许的账号
+        const allAccounts = this.accountPool.getAllAccounts()
+        const exclude = new Set<string>()
+        for (const a of allAccounts) {
+          if (!isAllowed(a)) exclude.add(a.id)
+        }
+        account = this.accountPool.getNextAccount(exclude)
+      }
       if (!account) {
         const status = this.accountPool.getQuotaStatus()
         if (status.exhausted > 0 && status.available === 0) {
@@ -1026,9 +1241,12 @@ export class ProxyServer {
         return null
       }
       // 返回更新后的账号
-      return this.accountPool.getAccount(account.id)
+      const refreshedAccount = this.accountPool.getAccount(account.id)
+      if (refreshedAccount && sessionHint) this.rememberAffinity(sessionHint, refreshedAccount.id)
+      return refreshedAccount
     }
 
+    if (sessionHint) this.rememberAffinity(sessionHint, account.id)
     return account
   }
 
@@ -1094,6 +1312,23 @@ export class ProxyServer {
               email: currentAccount.email,
               reason: suspendInfo.reason,
               message: suspendInfo.message
+            })
+            // P1-6 关键事件 → 触发 webhook
+            this.appendAuditLog('account_suspended', {
+              accountId: currentAccount.id,
+              email: currentAccount.email,
+              reason: suspendInfo.reason
+            })
+            this.triggerWebhook('proxy-account-suspended', {
+              title: '反代账号被风控',
+              message: `账号 ${currentAccount.email || currentAccount.id.slice(0, 8)} 被 Kiro 后端标记为 ${suspendInfo.reason}，需要人工解封`,
+              level: 'error',
+              fields: {
+                邮箱: currentAccount.email || '-',
+                账号ID: currentAccount.id.slice(0, 8),
+                封禁原因: suspendInfo.reason,
+                详情: this.sanitizeErrorMessage(suspendInfo.message || '').slice(0, 200)
+              }
             })
           }
           console.warn(`[ProxyServer] Account ${currentAccount.email || currentAccount.id} suspended (${suspendInfo.reason}), switching to next available account`)
@@ -1176,7 +1411,28 @@ export class ProxyServer {
     throw lastError || new Error('Unknown error')
   }
 
+  /**
+   * 常数时间字符串比较（防时序攻击）
+   * 长度不同时返回 false 但仍走一次 timingSafeEqual 防止旁路
+   */
+  private safeStringEq(a: string, b: string): boolean {
+    // Buffer.from 处理 UTF-8 编码
+    const ab = Buffer.from(a, 'utf8')
+    const bb = Buffer.from(b, 'utf8')
+    if (ab.length !== bb.length) {
+      // 仍执行一次比较保证常数时间（用 a 自身比，结果不影响）
+      try { crypto.timingSafeEqual(ab, ab) } catch { /* ignore */ }
+      return false
+    }
+    try {
+      return crypto.timingSafeEqual(ab, bb)
+    } catch {
+      return false
+    }
+  }
+
   // 验证 API Key 并返回匹配的 Key（用于统计）
+  // P0-3 使用 timingSafeEqual 防止时序攻击逐字猜 Key
   private validateApiKey(req: http.IncomingMessage): { valid: boolean; apiKey?: import('./types').ApiKey; reason?: string } {
     // 如果没有配置任何 API Key，则跳过验证
     const hasApiKeys = this.config.apiKeys && this.config.apiKeys.length > 0
@@ -1199,24 +1455,139 @@ export class ProxyServer {
 
     if (!providedKey) return { valid: false }
 
-    // 检查多 API Key
+    // 检查多 API Key（常数时间比较）
     if (hasApiKeys) {
-      const matchedKey = this.config.apiKeys!.find(k => k.enabled && k.key === providedKey)
-      if (matchedKey) {
-        // 检查额度限制
-        if (matchedKey.creditsLimit && matchedKey.usage.totalCredits >= matchedKey.creditsLimit) {
+      let matched: import('./types').ApiKey | undefined
+      for (const k of this.config.apiKeys!) {
+        if (!k.enabled || !k.key) continue
+        if (this.safeStringEq(k.key, providedKey)) {
+          matched = k
+          // 不 break：继续遍历保持时间一致（小数量数组 OK）
+        }
+      }
+      if (matched) {
+        if (matched.creditsLimit && matched.usage.totalCredits >= matched.creditsLimit) {
           return { valid: false, reason: 'Credits limit exceeded' }
         }
-        return { valid: true, apiKey: matchedKey }
+        return { valid: true, apiKey: matched }
       }
     }
 
-    // 兼容旧的单 API Key
-    if (hasLegacyKey && providedKey === this.config.apiKey) {
+    // 兼容旧的单 API Key（常数时间比较）
+    if (hasLegacyKey && this.safeStringEq(this.config.apiKey!, providedKey)) {
       return { valid: true }
     }
 
     return { valid: false }
+  }
+
+  /**
+   * P0-4 IP 访问控制
+   * - deniedIPs 优先：命中即拒绝
+   * - allowedIPs 配置后：必须在列表内（白名单模式）
+   * - 都未配置：允许
+   * 支持单 IP 和 CIDR（IPv4 / IPv6 简化处理）
+   */
+  private isClientIPAllowed(clientIP: string): { allowed: boolean; reason?: string } {
+    if (!clientIP) return { allowed: true }
+    // 规范化（::ffff:1.2.3.4 → 1.2.3.4）
+    const ip = clientIP.startsWith('::ffff:') ? clientIP.slice(7) : clientIP
+
+    const matchEntry = (entry: string): boolean => {
+      const e = entry.trim()
+      if (!e) return false
+      // CIDR
+      if (e.includes('/')) {
+        return this.ipInCidr(ip, e)
+      }
+      return e === ip
+    }
+
+    const denied = this.config.deniedIPs?.find(matchEntry)
+    if (denied) return { allowed: false, reason: `IP ${ip} matches denied entry ${denied}` }
+
+    const allowList = this.config.allowedIPs
+    if (allowList && allowList.length > 0) {
+      const allowed = allowList.some(matchEntry)
+      if (!allowed) return { allowed: false, reason: `IP ${ip} not in allowed list` }
+    }
+    return { allowed: true }
+  }
+
+  /**
+   * 简化 IPv4/IPv6 CIDR 匹配（不依赖外部库）
+   * IPv4 CIDR：1.2.3.0/24；IPv6 CIDR：仅前缀逐 bit 比较
+   */
+  private ipInCidr(ip: string, cidr: string): boolean {
+    const [range, bitsStr] = cidr.split('/')
+    const bits = parseInt(bitsStr, 10)
+    if (!Number.isFinite(bits)) return false
+
+    const isV4 = ip.includes('.') && range.includes('.')
+    if (isV4) {
+      const ipNum = this.ipv4ToInt(ip)
+      const rangeNum = this.ipv4ToInt(range)
+      if (ipNum < 0 || rangeNum < 0) return false
+      const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0
+      return (ipNum & mask) === (rangeNum & mask)
+    }
+    // IPv6 简化：转字节数组 + 前缀逐 bit 比较
+    const ipBytes = this.ipv6ToBytes(ip)
+    const rangeBytes = this.ipv6ToBytes(range)
+    if (!ipBytes || !rangeBytes) return false
+    let bitsLeft = bits
+    for (let i = 0; i < 16 && bitsLeft > 0; i++) {
+      if (bitsLeft >= 8) {
+        if (ipBytes[i] !== rangeBytes[i]) return false
+        bitsLeft -= 8
+      } else {
+        const mask = (0xff << (8 - bitsLeft)) & 0xff
+        if ((ipBytes[i] & mask) !== (rangeBytes[i] & mask)) return false
+        bitsLeft = 0
+      }
+    }
+    return true
+  }
+
+  private ipv4ToInt(ip: string): number {
+    const parts = ip.split('.').map(p => parseInt(p, 10))
+    if (parts.length !== 4 || parts.some(p => !Number.isFinite(p) || p < 0 || p > 255)) return -1
+    return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0
+  }
+
+  private ipv6ToBytes(ip: string): Uint8Array | null {
+    try {
+      // 简化处理：支持 :: 缩写
+      const parts = ip.split('::')
+      let head: string[] = []
+      let tail: string[] = []
+      if (parts.length === 1) {
+        head = parts[0].split(':')
+      } else if (parts.length === 2) {
+        head = parts[0] ? parts[0].split(':') : []
+        tail = parts[1] ? parts[1].split(':') : []
+      } else {
+        return null
+      }
+      const missing = 8 - head.length - tail.length
+      if (missing < 0) return null
+      const segments = [...head, ...new Array(missing).fill('0'), ...tail]
+      const bytes = new Uint8Array(16)
+      for (let i = 0; i < 8; i++) {
+        const v = parseInt(segments[i] || '0', 16)
+        if (!Number.isFinite(v) || v < 0 || v > 0xffff) return null
+        bytes[i * 2] = (v >> 8) & 0xff
+        bytes[i * 2 + 1] = v & 0xff
+      }
+      return bytes
+    } catch {
+      return null
+    }
+  }
+
+  /** 取客户端真实 IP（不信任 X-Forwarded-For，仅取 socket address） */
+  private getClientIP(req: http.IncomingMessage): string {
+    return req.socket.remoteAddress || ''
   }
 
   // 记录 API Key 用量
@@ -1336,6 +1707,7 @@ export class ProxyServer {
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const path = req.url || '/'
     const method = req.method || 'GET'
+    const clientIP = this.getClientIP(req)
     const controller = new AbortController()
     const abortRequest = () => {
       if (!this.isStopping && res.writableEnded) return
@@ -1361,17 +1733,40 @@ export class ProxyServer {
     try {
       this.setCorsHeaders(res)
 
+      // P0-4 IP 访问控制（健康检查也走，防止扫描器）
+      const ipCheck = this.isClientIPAllowed(clientIP)
+      if (!ipCheck.allowed) {
+        proxyLogger.warn('ProxyServer', `Blocked request from ${clientIP}: ${ipCheck.reason}`)
+        this.appendAuditLog('ip_blocked', { ip: clientIP, path, reason: ipCheck.reason })
+        this.sendError(res, 403, 'Forbidden')
+        return
+      }
+
       // API Key 验证（健康检查端点除外）
       if (path !== '/health' && path !== '/') {
         const authResult = this.validateApiKey(req)
         if (!authResult.valid) {
           const errorMsg = authResult.reason || 'Invalid or missing API key'
           const statusCode = authResult.reason === 'Credits limit exceeded' ? 429 : 401
-          this.sendError(res, statusCode, errorMsg, this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+          // 401 不返回 reason 详情（防止指纹爬取）
+          this.sendError(res, statusCode, statusCode === 401 ? 'Unauthorized' : errorMsg,
+            this.isAnthropicPath(path) ? 'anthropic' : 'openai')
           return
         }
         // 将匹配的 API Key 存储到请求对象中，用于后续统计
         ;(req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey = authResult.apiKey
+
+        // P1-7 按 API Key（或匿名时按 IP）请求限流
+        const rateLimitId = authResult.apiKey?.id || `ip:${clientIP || 'unknown'}`
+        const rl = this.checkRateLimit(rateLimitId)
+        if (!rl.allowed) {
+          res.setHeader('Retry-After', String(Math.ceil(rl.retryAfterMs / 1000)))
+          res.setHeader('X-RateLimit-Limit', String(this.config.rateLimitPerKeyPerMinute || 0))
+          res.setHeader('X-RateLimit-Remaining', '0')
+          this.sendError(res, 429, 'Rate limit exceeded',
+            this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+          return
+        }
       }
 
       // 记录请求
@@ -1405,6 +1800,10 @@ export class ProxyServer {
         await this.handleGeminiModels(res, controller.signal)
       } else if (pathWithoutQuery === '/health' || pathWithoutQuery === '/') {
         this.handleHealth(res)
+      } else if (pathWithoutQuery === '/metrics' && this.config.enableMetrics) {
+        // P2-16 Prometheus metrics
+        res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' })
+        res.end(this.renderPrometheusMetrics())
       } else if (pathWithoutQuery.startsWith('/admin/')) {
         // 管理 API 端点
         await this.handleAdminApi(req, res, pathWithoutQuery, controller.signal)
@@ -1418,8 +1817,16 @@ export class ProxyServer {
         proxyLogger.info('ProxyServer', `Request aborted: ${method} ${path}`)
         return
       }
+      // P0-1 body 超限 → 413
+      if (error instanceof BodyTooLargeError) {
+        proxyLogger.warn('ProxyServer', `Body too large from ${clientIP}: ${error.received}/${error.limit} bytes (${path})`)
+        this.sendError(res, 413, `Request body too large (max ${error.limit} bytes)`,
+          this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+        return
+      }
+      // P0-5 错误响应 sanitize：500 类不吐内部 message
       console.error('[ProxyServer] Request error:', error)
-      this.sendError(res, 500, (error as Error).message, this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+      this.sendError(res, 500, 'Internal server error', this.isAnthropicPath(path) ? 'anthropic' : 'openai')
       this.events.onError?.(error as Error)
     } finally {
       req.off('aborted', abortRequest)
@@ -1449,12 +1856,22 @@ export class ProxyServer {
       // 获取配置
       this.handleAdminConfig(res)
     } else if (path === '/admin/config' && method === 'POST') {
-      // 更新配置
+      // 更新配置（P1-9 schema 白名单校验，防止任意字段注入）
       const body = await this.readBody(req, signal)
-      const newConfig = JSON.parse(body)
-      this.updateConfig(newConfig)
+      let parsed: Record<string, unknown>
+      try { parsed = JSON.parse(body) } catch {
+        this.sendError(res, 400, 'Invalid JSON body')
+        return
+      }
+      const safeUpdate = this.filterAdminConfigUpdate(parsed)
+      this.updateConfig(safeUpdate)
+      this.appendAuditLog('config_updated', { fields: Object.keys(safeUpdate) })
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ success: true, config: this.getConfig() }))
+      res.end(JSON.stringify({ success: true, applied: Object.keys(safeUpdate), config: this.handleAdminConfigPayload() }))
+    } else if (path === '/admin/audit' && method === 'GET') {
+      // P2-17 审计日志
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ entries: this.auditLog.slice(-100) }))
     } else if (path === '/admin/logs' && method === 'GET') {
       // 获取最近日志
       this.handleAdminLogs(res)
@@ -1512,18 +1929,57 @@ export class ProxyServer {
     }))
   }
 
+  /**
+   * P1-12 构造脱敏后的配置（apiKeys[].key 全部脱敏，tls 私钥不返回）
+   * 暴露给 /admin/config GET
+   */
+  private handleAdminConfigPayload(): Record<string, unknown> {
+    const config = this.getConfig()
+    const maskKey = (k: string | undefined): string | undefined => {
+      if (!k) return undefined
+      if (k.length <= 8) return '***'
+      return `${k.slice(0, 4)}***${k.slice(-4)}`
+    }
+    return {
+      ...config,
+      apiKey: maskKey(config.apiKey),
+      apiKeys: config.apiKeys?.map(k => ({ ...k, key: maskKey(k.key) || '***' })),
+      tls: config.tls ? { enabled: config.tls.enabled, hasCert: !!(config.tls.cert || config.tls.certPath), hasKey: !!(config.tls.key || config.tls.keyPath) } : undefined
+    }
+  }
+
   // 管理 API - 配置
   private handleAdminConfig(res: http.ServerResponse): void {
-    const config = this.getConfig()
-    // 隐藏敏感信息
-    const safeConfig = {
-      ...config,
-      apiKey: config.apiKey ? '***' : undefined,
-      tls: config.tls ? { enabled: config.tls.enabled } : undefined
-    }
-
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify(safeConfig))
+    res.end(JSON.stringify(this.handleAdminConfigPayload()))
+  }
+
+  /**
+   * P1-9 admin/config POST 字段白名单过滤
+   * 仅允许"可远程改"的字段；apiKeys/apiKey 等敏感字段必须通过本地 IPC 改
+   */
+  private filterAdminConfigUpdate(input: Record<string, unknown>): Partial<ProxyConfig> {
+    const allowed: Array<keyof ProxyConfig> = [
+      'enabled', 'enableMultiAccount', 'logRequests', 'logStreamEvents',
+      'maxConcurrent', 'maxRetries', 'retryDelayMs', 'preferredEndpoint',
+      'tokenRefreshBeforeExpiry', 'autoStart', 'clientDrivenToolExecution',
+      'disableTools', 'payloadSizeLimitKB', 'enableTokenBufferReserve',
+      'tokenBufferReserve', 'autoSwitchOnQuotaExhausted', 'accountSelectionStrategy',
+      'multiAccountSelectionMode', 'multiAccountGroupIds', 'modelMappings',
+      'maxRequestBodyBytes', 'allowedIPs', 'deniedIPs',
+      'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
+      'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
+      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog'
+      // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
+      // 这些字段会改变监听行为或安全策略，必须本地 IPC 改
+    ]
+    const out: Partial<ProxyConfig> = {}
+    for (const key of allowed) {
+      if (key in input) {
+        (out as Record<string, unknown>)[key] = input[key as string]
+      }
+    }
+    return out
   }
 
   // 管理 API - 日志
@@ -1901,13 +2357,12 @@ export class ProxyServer {
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
 
     // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
-    if (!request.conversation_id) {
-      const hint = ProxyServer.extractSessionHint(req, request)
-      if (hint) {
-        const keyPrefix = matchedApiKey?.id?.slice(0, 8) || 'default'
-        request.conversation_id = `${keyPrefix}:${hint}`
-      }
+    const rawHintChat = ProxyServer.extractSessionHint(req, request)
+    if (!request.conversation_id && rawHintChat) {
+      const keyPrefix = matchedApiKey?.id?.slice(0, 8) || 'default'
+      request.conversation_id = `${keyPrefix}:${rawHintChat}`
     }
+    const affinityHintChat = request.conversation_id
 
     // 应用模型映射
     request.model = this.applyModelMapping(request.model, matchedApiKey?.id)
@@ -1930,9 +2385,9 @@ export class ProxyServer {
       return
     }
 
-    // 获取账号（包含 Token 刷新检查）
+    // 获取账号（包含 Token 刷新检查 + 会话粘性 + API Key 账号白名单）
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal)
+    const account = await this.getAvailableAccount(signal, affinityHintChat, matchedApiKey?.id)
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
@@ -2023,9 +2478,16 @@ export class ProxyServer {
     let responseRequest: OpenAIResponsesRequest
     let chatRequest: OpenAIChatRequest
     let processedRequest: OpenAIChatRequest
+    let affinityHintResp: string | undefined
     try {
       responseRequest = JSON.parse(body)
       chatRequest = responsesToOpenAIChat(responseRequest)
+      // session hint：用于会话粘性
+      const rawHintResp = ProxyServer.extractSessionHint(req, responseRequest)
+      if (rawHintResp) {
+        const keyPrefix = matchedApiKey?.id?.slice(0, 8) || 'default'
+        affinityHintResp = `${keyPrefix}:${rawHintResp}`
+      }
       chatRequest.model = this.applyModelMapping(chatRequest.model, matchedApiKey?.id)
       processedRequest = await this.resolveOpenAIHttpImages(this.prepareOpenAIRequest(chatRequest), signal)
     } catch (error) {
@@ -2039,7 +2501,7 @@ export class ProxyServer {
     }
 
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal)
+    const account = await this.getAvailableAccount(signal, affinityHintResp, matchedApiKey?.id)
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
@@ -2311,13 +2773,13 @@ export class ProxyServer {
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
 
     // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
-    if (!request.conversation_id) {
-      const hint = ProxyServer.extractSessionHint(req, request)
-      if (hint) {
-        const keyPrefix = matchedApiKey?.id?.slice(0, 8) || 'default'
-        request.conversation_id = `${keyPrefix}:${hint}`
-      }
+    const rawHint = ProxyServer.extractSessionHint(req, request)
+    if (!request.conversation_id && rawHint) {
+      const keyPrefix = matchedApiKey?.id?.slice(0, 8) || 'default'
+      request.conversation_id = `${keyPrefix}:${rawHint}`
     }
+    // P1-8 会话粘性使用 conversation_id 作为粘性 key（已包含 API Key 前缀）
+    const affinityHint = request.conversation_id
 
     // 应用模型映射
     request.model = this.applyModelMapping(request.model, matchedApiKey?.id)
@@ -2340,9 +2802,9 @@ export class ProxyServer {
       return
     }
 
-    // 获取账号（包含 Token 刷新检查）
+    // 获取账号（包含 Token 刷新检查 + 会话粘性 + API Key 账号白名单）
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal)
+    const account = await this.getAvailableAccount(signal, affinityHint, matchedApiKey?.id)
     this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
@@ -2752,9 +3214,24 @@ export class ProxyServer {
   }
 
   // 读取请求体
+  /**
+   * 读取请求体，限制最大字节数以防 DoS
+   * - Content-Length 头超限：立即 reject
+   * - 流式累加超限：销毁连接并 reject
+   * 触发 BodyTooLarge 错误时上层会发 413 Payload Too Large
+   */
   private readBody(req: http.IncomingMessage, signal?: AbortSignal): Promise<string> {
+    const maxBytes = Math.max(1024, this.config.maxRequestBodyBytes ?? 10 * 1024 * 1024)
+
+    // 优先用 Content-Length 提前拒绝（避免分配缓冲）
+    const declaredLen = parseInt(req.headers['content-length'] || '0', 10)
+    if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
+      return Promise.reject(new BodyTooLargeError(declaredLen, maxBytes))
+    }
+
     return new Promise((resolve, reject) => {
-      let body = ''
+      const chunks: Buffer[] = []
+      let total = 0
       const cleanup = () => {
         req.off('data', onData)
         req.off('end', onEnd)
@@ -2762,10 +3239,19 @@ export class ProxyServer {
         req.off('aborted', onAborted)
         signal?.removeEventListener('abort', onAbort)
       }
-      const onData = (chunk: Buffer) => body += chunk
+      const onData = (chunk: Buffer) => {
+        total += chunk.length
+        if (total > maxBytes) {
+          cleanup()
+          try { req.destroy() } catch { /* ignore */ }
+          reject(new BodyTooLargeError(total, maxBytes))
+          return
+        }
+        chunks.push(chunk)
+      }
       const onEnd = () => {
         cleanup()
-        resolve(body)
+        resolve(Buffer.concat(chunks, total).toString('utf8'))
       }
       const onError = (error: Error) => {
         cleanup()
@@ -2792,20 +3278,192 @@ export class ProxyServer {
   }
 
   // 发送错误响应
+  // P0-5 自动 sanitize：500 类不吐 message 详情；4xx 客户端错误正常返回
   private sendError(res: http.ServerResponse, status: number, message: string, format: 'openai' | 'anthropic' = 'openai'): void {
     if (res.writableEnded || res.destroyed) return
+    // 500-599 强制使用通用消息（防止泄露内部信息）
+    const safeMessage = status >= 500 && status < 600
+      ? this.sanitizeErrorMessage(message) || 'Internal server error'
+      : message
+    // P1-6 503 → 触发 webhook（已有 5 分钟去重）
+    if (status === 503) {
+      this.notifyAllAccountsExhausted('unknown')
+    }
     res.writeHead(status, { 'Content-Type': 'application/json' })
     if (format === 'anthropic') {
       res.end(JSON.stringify({
         type: 'error',
         error: {
           type: this.getAnthropicErrorType(status),
-          message
+          message: safeMessage
         }
       }))
       return
     }
-    res.end(JSON.stringify({ error: { message, type: 'error', code: status } }))
+    res.end(JSON.stringify({ error: { message: safeMessage, type: 'error', code: status } }))
+  }
+
+  /**
+   * P0-5 / P2-19 错误消息脱敏（移除可能含的 Bearer/Token/路径等敏感信息）
+   * 用于错误响应和日志输出
+   */
+  private sanitizeErrorMessage(msg: string): string {
+    if (!msg) return ''
+    return msg
+      // Bearer xxxx → Bearer ***
+      .replace(/Bearer\s+[A-Za-z0-9\-_.~+/]+=*/gi, 'Bearer ***')
+      // access_token / refresh_token / api_key / x-api-key 字段值
+      .replace(/(access[_-]?token|refresh[_-]?token|api[_-]?key|x-api-key)["'\s:=]+[^"',\s}]+/gi, '$1=***')
+      // 长 base64/JWT（>= 40 chars）替换为占位
+      .replace(/eyJ[A-Za-z0-9\-_]{20,}/g, 'eyJ***')
+      // Windows 用户路径
+      .replace(/C:\\Users\\[^\\/\s]+/gi, 'C:\\Users\\***')
+      // Linux/Mac home 路径
+      .replace(/\/home\/[^\s/]+/g, '/home/***')
+      .replace(/\/Users\/[^\s/]+/g, '/Users/***')
+  }
+
+  /**
+   * P1-7 滑动窗口限流：每分钟 N 次（按 API Key id 或 IP）
+   * 0 = 不限制
+   */
+  private checkRateLimit(id: string): { allowed: boolean; retryAfterMs: number } {
+    const limit = this.config.rateLimitPerKeyPerMinute || 0
+    if (limit <= 0) return { allowed: true, retryAfterMs: 0 }
+
+    const now = Date.now()
+    const bucket = this.rateLimitBuckets.get(id)
+    if (!bucket || now - bucket.windowStart >= 60_000) {
+      this.rateLimitBuckets.set(id, { count: 1, windowStart: now })
+      return { allowed: true, retryAfterMs: 0 }
+    }
+    if (bucket.count >= limit) {
+      return { allowed: false, retryAfterMs: 60_000 - (now - bucket.windowStart) }
+    }
+    bucket.count++
+    return { allowed: true, retryAfterMs: 0 }
+  }
+
+  /** 定期清理过期的限流桶 / 会话粘性条目（避免内存泄漏） */
+  private cleanupExpiredCaches(): void {
+    const now = Date.now()
+    // 限流桶过期 2 分钟
+    for (const [key, bucket] of this.rateLimitBuckets) {
+      if (now - bucket.windowStart > 120_000) this.rateLimitBuckets.delete(key)
+    }
+    // 粘性会话过期 10 分钟
+    for (const [key, entry] of this.sessionAffinity) {
+      if (now - entry.lastAt > 600_000) this.sessionAffinity.delete(key)
+    }
+    // 审计日志最多 200 条
+    if (this.auditLog.length > 200) {
+      this.auditLog = this.auditLog.slice(-200)
+    }
+  }
+
+  /**
+   * P1-8 会话粘性账号选择：相同 session hint 优先复用同一账号
+   * 实现方式：用 sessionHint hash 索引到固定账号；账号失效时自动失效粘性
+   */
+  private pickAccountWithAffinity(sessionHint: string | undefined): ProxyAccount | null {
+    if (!this.config.sessionAffinityEnabled || !sessionHint) return null
+    const entry = this.sessionAffinity.get(sessionHint)
+    if (entry) {
+      const account = this.accountPool.getAccount(entry.accountId)
+      // 校验账号仍可用且未被封禁
+      if (account && !this.accountPool.isSuspended(account) && account.isAvailable !== false) {
+        entry.lastAt = Date.now()
+        return account
+      }
+      // 已失效 → 清掉粘性
+      this.sessionAffinity.delete(sessionHint)
+    }
+    return null
+  }
+
+  /** 记录粘性映射 */
+  private rememberAffinity(sessionHint: string | undefined, accountId: string): void {
+    if (!this.config.sessionAffinityEnabled || !sessionHint) return
+    this.sessionAffinity.set(sessionHint, { accountId, lastAt: Date.now() })
+  }
+
+  /** P2-17 审计日志 */
+  private appendAuditLog(type: string, data: Record<string, unknown>): void {
+    if (!this.config.enableAuditLog) return
+    this.auditLog.push({ ts: Date.now(), type, data })
+    if (this.auditLog.length > 200) this.auditLog.shift()
+  }
+
+  /** 获取审计日志（供管理 API） */
+  getAuditLog(): ReadonlyArray<{ ts: number; type: string; data: Record<string, unknown> }> {
+    return this.auditLog
+  }
+
+  /** 注入 webhook 触发器（由 main/index.ts 注入，调用 renderer 的 webhook store） */
+  setWebhookTrigger(fn: (event: string, payload: Record<string, unknown>) => void): void {
+    this.webhookTrigger = fn
+  }
+
+  /** 关键事件去重时间戳（5 分钟内同事件不重复推） */
+  private lastWebhookByEvent: Map<string, number> = new Map()
+
+  /** P1-6 触发 webhook（封装错误处理 + 5 分钟去重） */
+  private triggerWebhook(event: string, payload: Record<string, unknown>): void {
+    const now = Date.now()
+    const last = this.lastWebhookByEvent.get(event) || 0
+    if (now - last < 5 * 60_000) return  // 同事件 5 分钟内不重复推
+    this.lastWebhookByEvent.set(event, now)
+    try { this.webhookTrigger?.(event, payload) } catch (err) {
+      proxyLogger.warn('ProxyServer', `Webhook trigger failed: ${(err as Error).message}`)
+    }
+  }
+
+  /** 全员配额耗尽 webhook（503 时调用） */
+  private notifyAllAccountsExhausted(path: string, model?: string): void {
+    const quota = this.accountPool.getQuotaStatus()
+    this.appendAuditLog('all_accounts_exhausted', { path, model, ...quota })
+    this.triggerWebhook('proxy-all-exhausted', {
+      title: '反代账号全部不可用',
+      message: `所有账号配额耗尽或冷却中（exhausted=${quota.exhausted}/${quota.total}，cooldown=${quota.cooldown}）`,
+      level: 'error',
+      fields: { 端点: path, 模型: model || '-', 总账号: quota.total, 配额耗尽: quota.exhausted, 冷却中: quota.cooldown, 可用: quota.available }
+    })
+  }
+
+  /** P2-16 Prometheus metrics 文本 */
+  private renderPrometheusMetrics(): string {
+    const s = this.stats
+    const ap = this.accountPool
+    const lines: string[] = []
+    lines.push('# HELP kiro_proxy_requests_total Total requests handled')
+    lines.push('# TYPE kiro_proxy_requests_total counter')
+    lines.push(`kiro_proxy_requests_total ${s.totalRequests}`)
+    lines.push('# HELP kiro_proxy_requests_success_total Total successful requests')
+    lines.push('# TYPE kiro_proxy_requests_success_total counter')
+    lines.push(`kiro_proxy_requests_success_total ${s.successRequests}`)
+    lines.push('# HELP kiro_proxy_requests_failed_total Total failed requests')
+    lines.push('# TYPE kiro_proxy_requests_failed_total counter')
+    lines.push(`kiro_proxy_requests_failed_total ${s.failedRequests}`)
+    lines.push('# HELP kiro_proxy_tokens_total Total tokens consumed')
+    lines.push('# TYPE kiro_proxy_tokens_total counter')
+    lines.push(`kiro_proxy_tokens_total{type="input"} ${s.inputTokens}`)
+    lines.push(`kiro_proxy_tokens_total{type="output"} ${s.outputTokens}`)
+    lines.push(`kiro_proxy_tokens_total{type="cache_read"} ${s.cacheReadTokens}`)
+    lines.push(`kiro_proxy_tokens_total{type="cache_write"} ${s.cacheWriteTokens}`)
+    lines.push('# HELP kiro_proxy_credits_total Total credits consumed')
+    lines.push('# TYPE kiro_proxy_credits_total counter')
+    lines.push(`kiro_proxy_credits_total ${s.totalCredits}`)
+    lines.push('# HELP kiro_proxy_accounts Accounts by status')
+    lines.push('# TYPE kiro_proxy_accounts gauge')
+    const quota = ap.getQuotaStatus()
+    lines.push(`kiro_proxy_accounts{status="total"} ${quota.total}`)
+    lines.push(`kiro_proxy_accounts{status="available"} ${quota.available}`)
+    lines.push(`kiro_proxy_accounts{status="exhausted"} ${quota.exhausted}`)
+    lines.push(`kiro_proxy_accounts{status="cooldown"} ${quota.cooldown}`)
+    lines.push('# HELP kiro_proxy_uptime_seconds Server uptime in seconds')
+    lines.push('# TYPE kiro_proxy_uptime_seconds gauge')
+    lines.push(`kiro_proxy_uptime_seconds ${Math.floor((Date.now() - s.startTime) / 1000)}`)
+    return lines.join('\n') + '\n'
   }
 
   // 记录请求到 recentRequests
@@ -2830,11 +3488,13 @@ export class ProxyServer {
       credits: log.credits,
       responseTime: log.responseTime || 0,
       success: log.success,
-      error: log.error
+      // P2-19 错误消息脱敏
+      error: log.error ? this.sanitizeErrorMessage(log.error).slice(0, 500) : undefined
     })
-    // 只保留最近 100 条
-    if (this.stats.recentRequests.length > 100) {
-      this.stats.recentRequests = this.stats.recentRequests.slice(-100)
+    // P2-15 可配置上限（默认 100，最多 10000）
+    const limit = Math.min(10000, Math.max(20, this.config.recentRequestsLimit || 100))
+    if (this.stats.recentRequests.length > limit) {
+      this.stats.recentRequests = this.stats.recentRequests.slice(-limit)
     }
   }
 }

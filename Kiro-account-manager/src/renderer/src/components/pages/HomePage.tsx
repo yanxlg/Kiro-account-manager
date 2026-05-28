@@ -20,7 +20,7 @@ const getSubscriptionColor = (type: string, title?: string): string => {
 }
 
 export function HomePage() {
-  const { accounts, getStats, darkMode, usagePrecision } = useAccountsStore()
+  const { accounts, activeAccountId, getStats, darkMode, usagePrecision } = useAccountsStore()
   const { t } = useTranslation()
   const stats = getStats()
 
@@ -87,8 +87,11 @@ export function HomePage() {
     },
   ]
 
-  // 获取当前活跃账号
-  const activeAccount = Array.from(accounts.values()).find(a => a.isActive)
+  // 获取当前活跃账号：用 activeAccountId 直接 O(1) 命中，避免每次 re-render 都 O(n) 遍历
+  const activeAccount = useMemo(
+    () => (activeAccountId ? accounts.get(activeAccountId) ?? null : null),
+    [accounts, activeAccountId]
+  )
 
   return (
     <div className="flex-1 p-6 space-y-6 overflow-auto">

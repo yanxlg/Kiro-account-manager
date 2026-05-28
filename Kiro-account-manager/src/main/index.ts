@@ -5,7 +5,7 @@ import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { writeFile, readFile } from 'fs/promises'
 import { encode, decode } from 'cbor-x'
-import { ProxyAgent, fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
+import { fetch as undiciFetch, type RequestInit as UndiciRequestInit, type Dispatcher } from 'undici'
 import icon from '../../resources/icon.png?asset'
 import { ProxyServer, configureProxyClients, type ProxyAccount, type ProxyConfig, type ProxyClientTarget, type ProxyClientModel } from './proxy'
 import { 
@@ -17,7 +17,7 @@ import {
   type DeviceIdMapping
 } from './kproxy'
 import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve } from './proxy/kiroApi'
-import { getSystemProxy } from './proxy/systemProxy'
+import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import {
@@ -143,28 +143,42 @@ export function getUseKProxyForApi(): boolean {
 }
 
 // 获取网络代理 agent（优先 K-Proxy，其次用户设置代理，其次系统代理）
-function getNetworkAgent(): ProxyAgent | undefined {
+function getNetworkAgent(): Dispatcher | undefined {
   if (useKProxyForApi) {
     const kproxyService = getKProxyService()
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      return new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
+      const agent = safeCreateProxyAgent(proxyUrl)
+      if (agent) return agent
     }
   }
   const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
-  if (envProxy) {
-    return new ProxyAgent({ uri: envProxy, requestTls: { rejectUnauthorized: false } })
-  }
-  const systemProxy = getSystemProxy()
-  if (systemProxy) {
-    return new ProxyAgent({ uri: systemProxy, requestTls: { rejectUnauthorized: false } })
-  }
-  return undefined
+  const envAgent = safeCreateProxyAgent(envProxy)
+  if (envAgent) return envAgent
+  return safeCreateProxyAgent(getSystemProxy())
 }
 
-// 通用 fetch 函数，使用 getNetworkAgent 获取代理
-async function fetchWithAppProxy(url: string, options: RequestInit): Promise<Response> {
+/**
+ * 通用 fetch 函数
+ * @param url 请求 URL
+ * @param options fetch 选项
+ * @param overrideProxyUrl 可选：账号绑定的代理 URL（优先级最高，覆盖全局代理逻辑）
+ *
+ * 优先级：overrideProxyUrl > K-Proxy > 用户设置代理 > 系统代理 > 直连
+ */
+async function fetchWithAppProxy(
+  url: string,
+  options: RequestInit,
+  overrideProxyUrl?: string
+): Promise<Response> {
+  // 优先尝试账号绑定代理
+  if (overrideProxyUrl) {
+    const accountAgent = safeCreateProxyAgent(overrideProxyUrl)
+    if (accountAgent) {
+      return await undiciFetch(url, { ...options, dispatcher: accountAgent } as UndiciRequestInit) as unknown as Response
+    }
+  }
   const agent = getNetworkAgent()
   if (agent) {
     return await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
@@ -173,7 +187,7 @@ async function fetchWithAppProxy(url: string, options: RequestInit): Promise<Res
 }
 
 // 兼容函数，指向 getNetworkAgent
-function getKProxyAgent(): ProxyAgent | undefined {
+function getKProxyAgent(): Dispatcher | undefined {
   return getNetworkAgent()
 }
 
@@ -338,16 +352,17 @@ function initProxyServer(): ProxyServer {
       onStatusChange: (running, port) => {
         mainWindow?.webContents.send('proxy-status-change', { running, port })
       },
-      // Token 刷新回调 - 复用已有的刷新逻辑
+      // Token 刷新回调 - 复用已有的刷新逻辑，含账号绑定代理
       onTokenRefresh: async (account) => {
         try {
-          console.log(`[ProxyServer] Refreshing token for ${account.email || account.id}`)
+          console.log(`[ProxyServer] Refreshing token for ${account.email || account.id}${account.proxyUrl ? ' [via bound proxy]' : ''}`)
           const refreshResult = await refreshTokenByMethod(
             account.refreshToken || '',
             account.clientId || '',
             account.clientSecret || '',
             account.region || 'us-east-1',
-            account.authMethod
+            account.authMethod,
+            account.proxyUrl  // 账号绑定的代理（如有）
           )
 
           if (refreshResult.success && refreshResult.accessToken) {
@@ -384,22 +399,22 @@ function initProxyServer(): ProxyServer {
           message: info.message,
           suspendedAt: Date.now()
         })
-        // 同步写入 store accountData[id].lastError, 保证下次启动时 UI 仍然能看到封禁状态
-        if (store) {
+        // 持久化封禁状态：依赖 renderer store 接收 IPC 后通过 saveToStorage 防抖落盘，
+        // 主进程仅在 lastSavedData 内存快照上做轻量更新，避免每次封禁都触发整库加解密 IO。
+        // 这能从根本上消除频繁封禁场景下的主进程阻塞（旧代码 store.get + store.set 各做一次 AES 全库加解密）
+        if (lastSavedData && typeof lastSavedData === 'object') {
           try {
-            const accountData = store.get('accountData') as { accounts?: Record<string, Record<string, unknown>> } | undefined
-            if (accountData?.accounts?.[info.accountId]) {
-              accountData.accounts[info.accountId] = {
-                ...accountData.accounts[info.accountId],
+            const data = lastSavedData as { accounts?: Record<string, Record<string, unknown>> }
+            if (data.accounts?.[info.accountId]) {
+              data.accounts[info.accountId] = {
+                ...data.accounts[info.accountId],
                 status: 'error',
                 lastError: `[${info.reason}] ${info.message}`,
                 lastCheckedAt: Date.now()
               }
-              store.set('accountData', accountData)
-              lastSavedData = accountData
             }
           } catch (e) {
-            console.error('[ProxyServer] Failed to persist suspended state:', e)
+            console.error('[ProxyServer] Failed to update suspended state in memory:', e)
           }
         }
       },
@@ -424,8 +439,24 @@ function initProxyServer(): ProxyServer {
       onPoolEmpty: async () => {
         await initStore()
         if (!store) return
-        const accountData = store.get('accountData') as { accounts?: Record<string, any> } | undefined
+        const accountData = store.get('accountData') as {
+          accounts?: Record<string, any>
+          accountProxyBindings?: Record<string, string>
+          proxyPool?: Record<string, { url?: string; enabled?: boolean; status?: string }>
+        } | undefined
         if (!accountData?.accounts) return
+
+        // 构建 accountId → proxyUrl 映射（用于反代时 N:1 分桶）
+        const bindings = accountData.accountProxyBindings || {}
+        const proxyPool = accountData.proxyPool || {}
+        const buildProxyUrl = (accountId: string): string | undefined => {
+          const proxyId = bindings[accountId]
+          if (!proxyId) return undefined
+          const p = proxyPool[proxyId]
+          if (!p || !p.enabled || p.status === 'dead') return undefined
+          return p.url
+        }
+
         const proxyAccounts = Object.values(accountData.accounts)
           .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
           .map((acc: any) => ({
@@ -440,16 +471,24 @@ function initProxyServer(): ProxyServer {
             clientSecret: acc.credentials?.clientSecret,
             region: acc.credentials?.region || 'us-east-1',
             authMethod: acc.credentials?.authMethod,
-            provider: acc.credentials?.provider || acc.idp
+            provider: acc.credentials?.provider || acc.idp,
+            proxyUrl: buildProxyUrl(acc.id)
           }))
         if (proxyAccounts.length > 0 && proxyServer) {
           const pool = proxyServer.getAccountPool()
           proxyAccounts.forEach(acc => pool.addAccount(acc))
-          console.log(`[ProxyServer] Lazy-synced ${proxyAccounts.length} accounts from store`)
+          const boundCount = proxyAccounts.filter(a => a.proxyUrl).length
+          console.log(`[ProxyServer] Lazy-synced ${proxyAccounts.length} accounts from store (${boundCount} with bound proxy)`)
         }
       }
     }
   )
+
+  // P1-6 注入 webhook 触发器：让反代关键事件（封号 / 全员配额耗尽 / 限流）能推送通知
+  proxyServer.setWebhookTrigger((event, payload) => {
+    // 通过 IPC 转发到 renderer，由 useWebhookStore.triggerEvent 实际发送
+    mainWindow?.webContents.send('proxy-webhook-trigger', { event, payload })
+  })
 
   // 恢复保存的累计 credits
   if (savedTotalCredits > 0) {
@@ -587,19 +626,20 @@ async function refreshOidcToken(
   refreshToken: string,
   clientId: string,
   clientSecret: string,
-  region: string = 'us-east-1'
+  region: string = 'us-east-1',
+  proxyUrl?: string  // 账号绑定的代理 URL（可选，优先级最高）
 ): Promise<OidcRefreshResult> {
-  console.log(`[OIDC] Refreshing token with clientId: ${clientId.substring(0, 20)}...`)
-  
+  console.log(`[OIDC] Refreshing token with clientId: ${clientId.substring(0, 20)}...${proxyUrl ? ' [via bound proxy]' : ''}`)
+
   const url = `https://oidc.${region}.amazonaws.com/token`
-  
+
   const payload = {
     clientId,
     clientSecret,
     refreshToken,
     grantType: 'refresh_token'
   }
-  
+
   try {
     const response = await fetchWithAppProxy(url, {
       method: 'POST',
@@ -607,7 +647,7 @@ async function refreshOidcToken(
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(payload)
-    })
+    }, proxyUrl)
     
     if (!response.ok) {
       const errorText = await response.text()
@@ -631,12 +671,15 @@ async function refreshOidcToken(
 }
 
 // 社交登录 (GitHub/Google) 的 Token 刷新
-async function refreshSocialToken(refreshToken: string): Promise<OidcRefreshResult> {
-  console.log(`[Social] Refreshing token...`)
-  
+async function refreshSocialToken(
+  refreshToken: string,
+  proxyUrl?: string  // 账号绑定的代理 URL（可选，优先级最高）
+): Promise<OidcRefreshResult> {
+  console.log(`[Social] Refreshing token...${proxyUrl ? ' [via bound proxy]' : ''}`)
+
   const url = `${KIRO_AUTH_ENDPOINT}/refreshToken`
   const machineId = getCurrentMachineId()
-  
+
   try {
     const response = await fetchWithAppProxy(url, {
       method: 'POST',
@@ -645,7 +688,7 @@ async function refreshSocialToken(refreshToken: string): Promise<OidcRefreshResu
         'User-Agent': getKiroUserAgent(machineId)
       },
       body: JSON.stringify({ refreshToken })
-    })
+    }, proxyUrl)
     
     if (!response.ok) {
       const errorText = await response.text()
@@ -674,14 +717,15 @@ async function refreshTokenByMethod(
   clientId: string,
   clientSecret: string,
   region: string = 'us-east-1',
-  authMethod?: string
+  authMethod?: string,
+  proxyUrl?: string  // 账号绑定的代理 URL（可选，优先级最高）
 ): Promise<OidcRefreshResult> {
   // 如果是社交登录，使用 Kiro Auth Service 刷新
   if (authMethod === 'social') {
-    return refreshSocialToken(token)
+    return refreshSocialToken(token, proxyUrl)
   }
   // 否则使用 OIDC 刷新 (IdC/BuilderId)
-  return refreshOidcToken(token, clientId, clientSecret, region)
+  return refreshOidcToken(token, clientId, clientSecret, region, proxyUrl)
 }
 
 function generateInvocationId(): string {
@@ -1365,19 +1409,69 @@ async function initStore(): Promise<void> {
   }
 }
 
-// 创建数据备份
+// ============ 备份节流配置 ============
+// 备份是为容灾兜底，不需要每次保存都全量重写文件，按时间节流即可大幅降低磁盘 IO。
+const BACKUP_THROTTLE_MS = 5 * 60 * 1000 // 5 分钟最多写一次备份
+let lastBackupTime = 0
+let pendingBackupData: unknown = null
+let pendingBackupTimer: ReturnType<typeof setTimeout> | null = null
+
+/**
+ * 创建数据备份（节流）
+ * - 距上次备份不足 BACKUP_THROTTLE_MS 时，仅记录数据指针，不立即写盘
+ * - 节流窗口结束后，自动 flush 最新一份数据
+ * - 退出前可手动调用 flushBackupNow() 强制写盘
+ */
 async function createBackup(data: unknown): Promise<void> {
-  if (!store) return
-  
+  pendingBackupData = data
+  const now = Date.now()
+  const elapsed = now - lastBackupTime
+
+  if (elapsed >= BACKUP_THROTTLE_MS) {
+    // 节流窗口已过，立即写盘
+    await writeBackupNow()
+    return
+  }
+
+  // 在节流窗口内：调度一次延迟 flush（如果尚未调度）
+  if (!pendingBackupTimer) {
+    const delay = BACKUP_THROTTLE_MS - elapsed
+    pendingBackupTimer = setTimeout(() => {
+      pendingBackupTimer = null
+      void writeBackupNow()
+    }, delay)
+  }
+}
+
+/**
+ * 真正执行备份写盘。仅当 pendingBackupData 非空时写入。
+ */
+async function writeBackupNow(): Promise<void> {
+  if (!store || pendingBackupData == null) return
+  const data = pendingBackupData
+  pendingBackupData = null
+  lastBackupTime = Date.now()
   try {
     const fs = await import('fs/promises')
     const path = await import('path')
     const backupPath = path.join(path.dirname(store.path), 'kiro-accounts.backup.json')
-    
     await fs.writeFile(backupPath, JSON.stringify(data, null, 2), 'utf-8')
     console.log('[Backup] Data backup created')
   } catch (error) {
     console.error('[Backup] Failed to create backup:', error)
+  }
+}
+
+/**
+ * 强制 flush 待写的备份（用于退出前兜底）
+ */
+async function flushBackupNow(): Promise<void> {
+  if (pendingBackupTimer) {
+    clearTimeout(pendingBackupTimer)
+    pendingBackupTimer = null
+  }
+  if (pendingBackupData != null) {
+    await writeBackupNow()
   }
 }
 
@@ -1538,7 +1632,7 @@ function createWindow(): void {
   mainWindow = new BrowserWindow({
     title: `Kiro 账号管理器 v${app.getVersion()}`,
     width: 1200,   // 刚好容纳 3 列卡片 (340*3 + 16*2 + 边距)
-    height: 1100,
+    height: 1200,
     minWidth: 800,
     minHeight: 600,
     show: false,
@@ -1581,8 +1675,23 @@ function createWindow(): void {
         
         // 自启动时同步账号到代理池（含重试机制应对冷启动数据延迟）
         const syncAccountsToPool = (): number => {
-          const accountData = store!.get('accountData') as { accounts?: Record<string, any> } | undefined
+          const accountData = store!.get('accountData') as {
+            accounts?: Record<string, any>
+            accountProxyBindings?: Record<string, string>
+            proxyPool?: Record<string, { url?: string; enabled?: boolean; status?: string }>
+          } | undefined
           if (!accountData?.accounts) return 0
+
+          const bindings = accountData.accountProxyBindings || {}
+          const proxyPool = accountData.proxyPool || {}
+          const buildProxyUrl = (accountId: string): string | undefined => {
+            const proxyId = bindings[accountId]
+            if (!proxyId) return undefined
+            const p = proxyPool[proxyId]
+            if (!p || !p.enabled || p.status === 'dead') return undefined
+            return p.url
+          }
+
           const proxyAccounts = Object.values(accountData.accounts)
             .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
             .map((acc: any) => ({
@@ -1597,7 +1706,8 @@ function createWindow(): void {
               clientSecret: acc.credentials?.clientSecret,
               region: acc.credentials?.region || 'us-east-1',
               authMethod: acc.credentials?.authMethod,
-              provider: acc.credentials?.provider || acc.idp
+              provider: acc.credentials?.provider || acc.idp,
+              proxyUrl: buildProxyUrl(acc.id)
             }))
           if (proxyAccounts.length > 0) {
             const pool = server.getAccountPool()
@@ -2061,6 +2171,184 @@ app.whenReady().then(async () => {
     }
   })
 
+  // ============ 一键诊断 ============
+  /**
+   * 测试一组目标 URL 的连通性（用于诊断面板）
+   * 支持指定代理 URL；返回每个目标的延迟与错误
+   */
+  ipcMain.handle('diagnose:run', async (_event, params: {
+    proxyUrl?: string
+    targets: Array<{ id: string; label: string; url: string; timeoutMs?: number; expectStatus?: number[] }>
+  }) => {
+    const { proxyUrl, targets } = params || {}
+    const agent = proxyUrl ? safeCreateProxyAgent(proxyUrl) : undefined
+
+    const results = await Promise.all((targets || []).map(async (t) => {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), t.timeoutMs ?? 8000)
+      const start = Date.now()
+      try {
+        const init: UndiciRequestInit = {
+          method: 'GET',
+          signal: controller.signal,
+          headers: { 'User-Agent': 'KiroAccountManager-Diagnose/1.0' }
+        }
+        if (agent) init.dispatcher = agent
+        const resp = await undiciFetch(t.url, init)
+        const latencyMs = Date.now() - start
+        const expected = t.expectStatus
+        const ok = expected ? expected.includes(resp.status) : (resp.status >= 200 && resp.status < 400)
+        return {
+          id: t.id,
+          label: t.label,
+          url: t.url,
+          success: ok,
+          httpStatus: resp.status,
+          latencyMs,
+          error: ok ? undefined : `HTTP ${resp.status}`
+        }
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err)
+        return {
+          id: t.id,
+          label: t.label,
+          url: t.url,
+          success: false,
+          latencyMs: Date.now() - start,
+          error: controller.signal.aborted ? '超时' : errMsg
+        }
+      } finally {
+        clearTimeout(timer)
+      }
+    }))
+
+    return { results }
+  })
+
+  // ============ 代理池验活 ============
+  /**
+   * 通过指定代理 URL 请求测试地址，返回延迟与出口 IP
+   * 仅支持 http/https 协议代理（受 undici ProxyAgent 限制；socks 协议会被 safeCreateProxyAgent 静默跳过）
+   */
+  ipcMain.handle('proxy-pool:validate', async (_event, params: {
+    url: string
+    testUrl?: string
+    timeoutMs?: number
+  }) => {
+    const { url, testUrl = 'https://api.ipify.org?format=json', timeoutMs = 8000 } = params || {}
+    if (!url) {
+      return { success: false, error: 'Missing proxy URL' }
+    }
+
+    const agent = safeCreateProxyAgent(url)
+    if (!agent) {
+      // SOCKS / 无效协议会走到这里
+      return {
+        success: false,
+        error: '代理协议不支持（仅支持 http/https）或 URL 无效'
+      }
+    }
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const start = Date.now()
+    try {
+      const resp = await undiciFetch(testUrl, {
+        method: 'GET',
+        dispatcher: agent,
+        signal: controller.signal,
+        headers: { 'User-Agent': 'KiroAccountManager-ProxyValidator/1.0' }
+      } as UndiciRequestInit)
+      const latencyMs = Date.now() - start
+      if (resp.status >= 200 && resp.status < 400) {
+        // 尝试提取出口 IP
+        let externalIp: string | undefined
+        try {
+          const ct = resp.headers.get('content-type') || ''
+          if (ct.includes('json')) {
+            const body = await resp.json() as { ip?: string; query?: string }
+            externalIp = body.ip || body.query
+          } else {
+            const text = await resp.text()
+            const m = text.match(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/)
+            if (m) externalIp = m[0]
+          }
+        } catch { /* 出口 IP 提取失败不影响验活成功 */ }
+        return { success: true, latencyMs, externalIp }
+      }
+      return { success: false, latencyMs, error: `HTTP ${resp.status}` }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err)
+      const isAbort = controller.signal.aborted
+      return {
+        success: false,
+        latencyMs: Date.now() - start,
+        error: isAbort ? `请求超时 (${timeoutMs}ms)` : errMsg
+      }
+    } finally {
+      clearTimeout(timer)
+    }
+  })
+
+  // ============ 账号-代理绑定（反代时 N 账号一个 IP）============
+  /**
+   * 设置账号在反代场景下使用的出口代理 URL
+   * 同时更新：反代账号池里现存的 ProxyAccount.proxyUrl + store 持久化的 accountProxyBindings
+   */
+  ipcMain.handle('account-set-proxy-binding', async (_event, accountId: string, proxyUrl: string | undefined) => {
+    try {
+      if (!accountId) return { success: false }
+      // 更新反代账号池内存中的 proxyUrl
+      if (proxyServer) {
+        const pool = proxyServer.getAccountPool()
+        const acc = pool.getAccount(accountId)
+        if (acc) {
+          acc.proxyUrl = proxyUrl || undefined
+          console.log(`[ProxyServer] Account ${acc.email || accountId.slice(0, 8)} proxy ${proxyUrl ? `bound to ${proxyUrl.replace(/:([^:@/]+)@/, ':***@')}` : 'unbound'}`)
+        }
+      }
+      return { success: true }
+    } catch (err) {
+      console.error('[account-set-proxy-binding] error:', err)
+      return { success: false }
+    }
+  })
+
+  // ============ 通用 HTTP 诊断探测 ============
+  /**
+   * 使用应用代理设置发起一次 GET/HEAD 请求，返回延迟、状态码、错误信息。
+   * 用于"一键诊断"面板中检测 Kiro API / 邮箱服务 / 公网连通性。
+   */
+  ipcMain.handle('diagnose:http-probe', async (_event, params: {
+    url: string
+    method?: 'GET' | 'HEAD'
+    timeoutMs?: number
+  }) => {
+    const { url, method = 'GET', timeoutMs = 5000 } = params || {}
+    if (!url) return { success: false, error: 'Missing url' }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const start = Date.now()
+    try {
+      const resp = await fetchWithAppProxy(url, {
+        method,
+        signal: controller.signal,
+        headers: { 'User-Agent': 'KiroAccountManager-Diagnose/1.0' }
+      })
+      const latencyMs = Date.now() - start
+      return { success: resp.ok, latencyMs, status: resp.status }
+    } catch (err) {
+      const isAbort = controller.signal.aborted
+      return {
+        success: false,
+        latencyMs: Date.now() - start,
+        error: isAbort ? `Timeout (${timeoutMs}ms)` : (err instanceof Error ? err.message : String(err))
+      }
+    } finally {
+      clearTimeout(timer)
+    }
+  })
+
   // IPC: 加载账号数据
   ipcMain.handle('load-accounts', async () => {
     try {
@@ -2103,15 +2391,21 @@ app.whenReady().then(async () => {
         return { success: false, error: { message: '缺少 OIDC 刷新凭证 (clientId/clientSecret)' } }
       }
 
-      console.log(`[IPC] Refreshing token (authMethod: ${authMethod || 'IdC'})...`)
+      // 查找账号绑定的代理 URL（账号池中已有 proxyUrl 字段）
+      const boundProxyUrl = proxyServer
+        ? (proxyServer.getAccountPool().getAccount(account.id || '')?.proxyUrl)
+        : undefined
 
-      // 根据 authMethod 选择刷新方式
+      console.log(`[IPC] Refreshing token (authMethod: ${authMethod || 'IdC'})...${boundProxyUrl ? ' [via bound proxy]' : ''}`)
+
+      // 根据 authMethod 选择刷新方式（透传账号绑定代理）
       const refreshResult = await refreshTokenByMethod(
         refreshToken,
         clientId || '',
         clientSecret || '',
         region || 'us-east-1',
-        authMethod
+        authMethod,
+        boundProxyUrl
       )
 
       if (!refreshResult.success || !refreshResult.accessToken) {
@@ -2479,7 +2773,12 @@ app.whenReady().then(async () => {
 
     try {
       const { accessToken, refreshToken, clientId, clientSecret, region, authMethod, provider } = account.credentials || {}
-      
+
+      // 查询账号绑定的代理（账号池）
+      const boundProxyUrl = proxyServer
+        ? proxyServer.getAccountPool().getAccount(account.id || '')?.proxyUrl
+        : undefined
+
       // 确定正确的 idp：优先使用 credentials.provider，否则回退到 account.idp
       // 社交登录使用实际的 provider (Github/Google)，IdC 使用 BuilderId
       let idp = 'BuilderId'
@@ -2527,15 +2826,16 @@ app.whenReady().then(async () => {
         // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret
         const canRefresh = refreshToken && (authMethod === 'social' || (clientId && clientSecret))
         if (errorMsg.includes('401') && canRefresh) {
-          console.log(`[IPC] Token expired, attempting to refresh (authMethod: ${authMethod || 'IdC'})...`)
-          
-          // 尝试刷新 token - 根据 authMethod 选择刷新方式
+          console.log(`[IPC] Token expired, attempting to refresh (authMethod: ${authMethod || 'IdC'})...${boundProxyUrl ? ' [via bound proxy]' : ''}`)
+
+          // 尝试刷新 token - 根据 authMethod 选择刷新方式（透传账号代理）
           const refreshResult = await refreshTokenByMethod(
             refreshToken,
             clientId || '',
             clientSecret || '',
             region || 'us-east-1',
-            authMethod
+            authMethod,
+            boundProxyUrl
           )
           
           if (refreshResult.success && refreshResult.accessToken) {
@@ -2610,7 +2910,12 @@ app.whenReady().then(async () => {
           try {
             const { refreshToken, clientId, clientSecret, region, authMethod, accessToken, provider } = account.credentials
             const needsTokenRefresh = account.needsTokenRefresh !== false // 默认为 true（兼容旧版本）
-            
+
+            // 查询账号绑定的代理（从主进程账号池）
+            const boundProxyUrl = proxyServer
+              ? proxyServer.getAccountPool().getAccount(account.id)?.proxyUrl
+              : undefined
+
             // 确定正确的 idp
             let idp = 'BuilderId'
             if (authMethod === 'social') {
@@ -2631,13 +2936,14 @@ app.whenReady().then(async () => {
                 return
               }
 
-              // 刷新 Token
+              // 刷新 Token（透传账号绑定代理）
               const refreshResult = await refreshTokenByMethod(
                 refreshToken,
                 clientId || '',
                 clientSecret || '',
                 region || 'us-east-1',
-                authMethod
+                authMethod,
+                boundProxyUrl
               )
 
               if (!refreshResult.success) {
@@ -5035,6 +5341,63 @@ app.whenReady().then(async () => {
     }
   })
 
+  // ============ 反代安全 / 可观测 IPC（v1.8 新增） ============
+
+  // 获取自签证书信息（PEM、指纹、有效期、SAN）
+  ipcMain.handle('proxy-self-signed-cert-info', () => {
+    try {
+      if (!proxyServer) return { success: false, error: 'Proxy server not initialized' }
+      const info = proxyServer.getSelfSignedCertInfo()
+      if (!info) return { success: false, error: 'Failed to get self-signed cert info' }
+      return { success: true, ...info }
+    } catch (err) {
+      return { success: false, error: (err as Error).message }
+    }
+  })
+
+  // 重新生成自签证书（用户主动触发）
+  ipcMain.handle('proxy-self-signed-cert-regenerate', () => {
+    try {
+      if (!proxyServer) return { success: false, error: 'Proxy server not initialized' }
+      const info = proxyServer.regenerateSelfSignedCert()
+      if (!info) return { success: false, error: 'Failed to regenerate self-signed cert' }
+      return { success: true, ...info }
+    } catch (err) {
+      return { success: false, error: (err as Error).message }
+    }
+  })
+
+  // 检查反代配置是否需要重启
+  ipcMain.handle('proxy-needs-restart', () => {
+    try {
+      if (!proxyServer) return { needsRestart: false }
+      return { needsRestart: proxyServer.needsRestart() }
+    } catch {
+      return { needsRestart: false }
+    }
+  })
+
+  // 重启反代（用户在 UI 点"立即重启"时调用）
+  ipcMain.handle('proxy-restart', async () => {
+    try {
+      if (!proxyServer) return { success: false, error: 'Proxy server not initialized' }
+      await proxyServer.restartServer()
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: (err as Error).message }
+    }
+  })
+
+  // 获取反代审计日志
+  ipcMain.handle('proxy-audit-log', () => {
+    try {
+      if (!proxyServer) return { entries: [] }
+      return { entries: proxyServer.getAuditLog().slice(-200) }
+    } catch {
+      return { entries: [] }
+    }
+  })
+
   // ============ API Key 管理 IPC ============
 
   // IPC: 获取所有 API Keys
@@ -6105,7 +6468,16 @@ app.on('will-quit', async (event) => {
       // 刷新待写入的防抖数据
       flushStoreWrites()
       store.set('accountData', lastSavedData)
+      // 退出场景跳过节流，确保备份立即落盘
       await createBackup(lastSavedData)
+      await flushBackupNow()
+      // 强制落盘代理日志（异步节流中的尾巴数据）
+      try {
+        const { proxyLogStore } = await import('./proxy/logger')
+        await proxyLogStore.flushSaveNow()
+      } catch (err) {
+        console.error('[Exit] Failed to flush proxy logs:', err)
+      }
       console.log('[Exit] Data saved successfully')
     } catch (error) {
       console.error('[Exit] Failed to save data:', error)

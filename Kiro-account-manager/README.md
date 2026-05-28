@@ -60,15 +60,26 @@
 
 ### 📝 Account Registration
 - Built-in Kiro Builder ID registration
-- Four modes: Manual, MoEmail (temp email), Outlook IMAP, Custom Domain (TempMail.Plus)
-- Concurrent batch registration with configurable parallelism (1-10)
-- Auto-import registered accounts after verification
-- Registration history with one-click import
-- Session-persistent logs, progress, and history
+- Four modes: Manual, Outlook IMAP, Custom Domain (TempMail.Plus), Mixed (weighted round-robin)
+- Concurrent batch registration + rate limit + backoff + risk control auto-pause
+- Failure retry queue (bucketed by error category)
+- Pause/Resume + progress persistence
+- Scheduled launch + daily quota + weekday mask
+- Strategy templates (save/load/import/export)
+- Analytics report (donut chart, 24h curves, 7-day trend, failure breakdown, CSV export)
+- Email used blacklist + empirical pre-validation
 - Full i18n support
 
 ### 🌐 Proxy Support
-- Support HTTP/HTTPS/SOCKS5 proxy
+- Built-in proxy pool (http/https/socks5/socks4) with 4 dispatch strategies + auto-validate + scheduled refresh
+- Reverse proxy account-to-IP bucketing (mitigates risk control association)
+- Once an account is bound to a proxy, ALL its requests (token refresh, batch operations, etc.) route through it
+
+### 🔔 Notifications & Ops
+- Webhook notifications (DingTalk/WeCom/Feishu/Telegram/Discord/custom), 7 event types
+- Unified task center (global progress panel)
+- One-click diagnostics panel (Network/Kiro/AWS/Email/Proxy connectivity)
+- Config import/export (with optional AES-GCM encryption)
 
 ---
 
@@ -128,7 +139,77 @@ npm run typecheck
 
 ## 📋 Changelog
 
-### Current
+### v1.7.0 (Current)
+
+#### 🔥 Major Features (4 phases, 19 new features)
+
+##### Registration Reliability
+- **Proxy Pool** — Standalone page for IP rotation during registration. 4 dispatch strategies (round-robin/random/least-used/fastest), auto-validate + auto-disable dead proxies, supports http/https/socks5/socks4 + multiple formats (user:pass@host:port, host:port:user:pass)
+- **Failure Retry Queue** — Auto-classify errors (network/OTP timeout/email used/rate limit/AWS risk control/auth/unknown), selectively retry by bucket
+- **Batch Pause/Resume** — One-click pause new task launches, seamless resume
+- **Unified Task Center** — TitleBar real-time badge + side drawer. All batch tasks (register, subscription, overage, token refresh, proxy validation) centralized, supports "Cancel All"
+
+##### Operations Efficiency
+- **Rate Limiting + Backoff** — Token bucket (max-per-minute starts) + consecutive failure exponential backoff (configurable base/max) + risk-control auto-pause
+- **Risk Signal Detection** — Live panel: throughput, success rate, window failures, consecutive failures, backoff remaining. Webhook + optional auto-pause on trigger
+- **Subscription Pre-flight Check** — Auto-classify blocked accounts (already subscribed/no token/banned/can't upgrade/unknown status)
+- **Subscription Cancel/Downgrade** — New "Manage" tab: bulk open portals, bulk disable overage, card-view management
+- **Fingerprint Snapshot** — Save chromeVer/UA/GPU/CanvasHash/Screen + masked proxy URL after registration. History shows badges
+
+##### Automation
+- **Mixed Email Source Concurrency** — New Mixed mode with Outlook + TempMail.Plus smooth weighted round-robin (SWRR)
+- **Email Pre-validation** — Empirical blacklist auto-populated from `email_used` failures, visualized management UI
+- **Cron + Daily Quota** — Auto-launch at configurable time + weekday mask (Mon-Sun any combo) + daily quota cap (manual reset)
+- **Webhook Notifications** — Dedicated config page, supports DingTalk/WeCom/Feishu/Telegram/Discord/custom JSON template, 7 event types subscription (batch completed, risk warning, account banned, register success/fail, token expired, etc.), auto-retry + rate limiting
+
+##### UX Enhancements
+- **Registration Strategy Templates** — Save current full config as named template, one-click load, supports JSON import/export
+- **Registration Analytics Report** — Donut chart (success rate) + 24-hour smooth curves (Catmull-Rom dual-line) + 7-day stacked trend bars + colorful error category cards + auth method comparison + CSV export
+- **Subscription Link Expiry Detection** — 15-minute threshold + HTTP HEAD live probe, one-click regenerate expired links
+- **Diagnostics Panel** — Check public/Kiro/AWS/email service/proxy pool connectivity, with report export
+- **Config Sync** — Multi-device sync of proxy pool/webhooks/register templates/rate limit settings/app preferences, supports AES-GCM + PBKDF2 password encryption
+
+#### 🌐 Reverse Proxy: Account-to-IP Bucketing (new end-to-end feature)
+
+- Accounts can be bound to any active proxy IP, with "N accounts per proxy" auto-distribution
+- Reverse proxy Kiro API calls strictly follow [account-bound proxy > global proxy] priority
+- Quick bind via toolbar / account card / list row / detail dialog (4 access points)
+- **All outbound requests for the account** (including token refresh, background batch refresh/check, Subscription/SetOverage API) route through the bound proxy
+- Auto-sync to main process account pool on proxy URL/status/disable changes, deletion auto-clears bindings
+- One-click auto-distribute (only-unbound mode or re-distribute-all)
+
+#### 🔌 Network Layer
+- **SOCKS5/SOCKS4 proxy support** — Via socks library + undici Agent.connect hook, HTTPS auto TLS upgrade
+- **Registration response Chinese decoding fix** — tls-client's latin1 byte stream auto re-decoded as UTF-8
+- **AWS risk control error recognition** — `AWS-RISK-CONTROL` auto-classified, error message includes fix suggestions
+- **Invalid URL protocol fix** — Windows multi-protocol proxy string parsing, macOS HTTPS proxy detection, unified safeCreateProxyAgent factory
+
+#### ⚡ Performance Optimizations (4 deep rounds)
+- saveToStorage 500ms debounce (1000-account scenario: 1000 writes → 1)
+- createBackup 5-minute throttle (eliminates double-write)
+- Background refresh result 120ms buffer batching (N Map copies → 1)
+- ProxyLogStore async write + 50K cap (no more 1-5s main process freeze)
+- Proxy suspended callback uses memory snapshot (eliminates full-DB AES cycle)
+- Tray IPC 400ms debounce
+- getFilteredAccounts / getStats reference cache (O(n) → O(1) hit)
+- importAccounts/importFromExportData O(n²) → O(n) batched
+
+#### 🗑️ Removed
+- MoEmail email mode removed from UI (service code retained as recoverable implementation)
+
+#### 🔧 Edge Cases (22 fixes)
+- Auto-sync bound accounts to main process pool on proxy URL/status/disable changes
+- Auto-clear bindings on proxy deletion
+- 6 Webhook event types fully wired
+- Task center persistence (200 finished tasks to localStorage)
+- Config export with PBKDF2 + AES-GCM encryption option
+- Cron supports weekday mask (workdays/daily/custom)
+- Smooth weighted round-robin (SWRR) for mixed email sources
+- Report SVG donut chart + Catmull-Rom smooth curves + 7-day stacked bar trend
+
+---
+
+### v1.6.x
 
 #### Proxy API Enhancements
 - **New**: Gemini v1beta API compatibility (`/v1beta/models`, `/v1beta/models/{model}:generateContent`, `/v1beta/models/{model}:streamGenerateContent`)

@@ -39,6 +39,12 @@ interface AccountData {
     accountId?: string
     accountEmail?: string
   }>
+  // 代理池
+  proxyPool?: Record<string, unknown>
+  proxyPoolConfig?: unknown
+  proxyPoolCursor?: number
+  /** 账号-代理绑定映射 */
+  accountProxyBindings?: Record<string, string>
 }
 
 interface RefreshResult {
@@ -566,7 +572,15 @@ interface KiroApi {
   proxyGetLogsCount: () => Promise<number>
 
   // 更新反代服务器配置
-  proxyUpdateConfig: (config: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; selectedAccountIds?: string[]; logRequests?: boolean; logStreamEvents?: boolean; autoStart?: boolean; maxRetries?: number; preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'; clientDrivenToolExecution?: boolean; disableTools?: boolean; payloadSizeLimitKB?: number; enableTokenBufferReserve?: boolean; tokenBufferReserve?: number; autoSwitchOnQuotaExhausted?: boolean; accountSelectionStrategy?: 'round-robin' | 'sticky'; multiAccountSelectionMode?: 'all' | 'groups'; multiAccountGroupIds?: string[]; modelMappings?: Array<{ id: string; name: string; enabled: boolean; type: 'replace' | 'alias' | 'loadbalance'; sourceModel: string; targetModels: string[]; weights?: number[]; priority: number; apiKeyIds?: string[] }> }) => Promise<{ success: boolean; config?: unknown; error?: string }>
+  proxyUpdateConfig: (config: Record<string, unknown>) => Promise<{ success: boolean; config?: unknown; error?: string }>
+
+  // ============ v1.8 反代安全 / 可观测 IPC ============
+  proxySelfSignedCertInfo: () => Promise<{ success: boolean; cert?: string; key?: string; fingerprint?: string; notBefore?: number; notAfter?: number; subject?: string; altNames?: string[]; error?: string }>
+  proxySelfSignedCertRegenerate: () => Promise<{ success: boolean; cert?: string; key?: string; fingerprint?: string; notBefore?: number; notAfter?: number; subject?: string; altNames?: string[]; error?: string }>
+  proxyNeedsRestart: () => Promise<{ needsRestart: boolean }>
+  proxyRestart: () => Promise<{ success: boolean; error?: string }>
+  proxyAuditLog: () => Promise<{ entries: Array<{ ts: number; type: string; data: Record<string, unknown> }> }>
+  onProxyWebhookTrigger: (callback: (event: string, payload: Record<string, unknown>) => void) => (() => void)
 
   // 添加账号到反代池
   proxyAddAccount: (account: { id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }) => Promise<{ success: boolean; accountCount?: number; error?: string }>
@@ -828,6 +842,30 @@ interface KiroApi {
   registrationCancel: () => Promise<{ success: boolean }>
 
   registrationStatus: () => Promise<{ inProgress: boolean }>
+
+  // 代理池验活
+  proxyPoolValidate: (params: {
+    url: string
+    testUrl?: string
+    timeoutMs?: number
+  }) => Promise<{ success: boolean; latencyMs?: number; externalIp?: string; error?: string }>
+
+  // 诊断：通用 HTTP 探测
+  diagnoseHttpProbe: (params: { url: string; method?: 'GET' | 'HEAD'; timeoutMs?: number }) => Promise<{
+    success: boolean
+    latencyMs?: number
+    status?: number
+    error?: string
+  }>
+
+  // 账号-代理绑定（反代分桶）
+  accountSetProxyBinding: (accountId: string, proxyUrl: string | undefined) => Promise<{ success: boolean }>
+
+  // 一键诊断
+  diagnoseRun: (params: {
+    proxyUrl?: string
+    targets: Array<{ id: string; label: string; url: string; timeoutMs?: number; expectStatus?: number[] }>
+  }) => Promise<{ results: Array<{ id: string; label: string; url: string; success: boolean; httpStatus?: number; latencyMs?: number; error?: string }> }>
 
   onRegistrationLog: (callback: (msg: string) => void) => () => void
 

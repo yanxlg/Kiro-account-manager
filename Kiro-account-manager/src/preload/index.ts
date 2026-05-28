@@ -634,8 +634,44 @@ const api = {
   },
 
   // 更新反代服务器配置
-  proxyUpdateConfig: (config: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; selectedAccountIds?: string[]; logRequests?: boolean; autoStart?: boolean; maxRetries?: number; preferredEndpoint?: 'codewhisperer' | 'amazonq'; clientDrivenToolExecution?: boolean; disableTools?: boolean; payloadSizeLimitKB?: number; enableTokenBufferReserve?: boolean; tokenBufferReserve?: number; autoSwitchOnQuotaExhausted?: boolean; accountSelectionStrategy?: 'round-robin' | 'sticky'; multiAccountSelectionMode?: 'all' | 'groups'; multiAccountGroupIds?: string[]; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think'; modelMappings?: Array<{ id: string; name: string; enabled: boolean; type: 'replace' | 'alias' | 'loadbalance'; sourceModel: string; targetModels: string[]; weights?: number[]; priority: number; apiKeyIds?: string[] }> }): Promise<{ success: boolean; config?: unknown; error?: string }> => {
+  proxyUpdateConfig: (config: Record<string, unknown>): Promise<{ success: boolean; config?: unknown; error?: string }> => {
     return ipcRenderer.invoke('proxy-update-config', config)
+  },
+
+  // ============ v1.8 反代安全 / 可观测 IPC ============
+
+  /** 获取反代自签证书信息（用于在 UI 显示指纹/有效期 + 让用户导出 .crt） */
+  proxySelfSignedCertInfo: (): Promise<{ success: boolean; cert?: string; key?: string; fingerprint?: string; notBefore?: number; notAfter?: number; subject?: string; altNames?: string[]; error?: string }> => {
+    return ipcRenderer.invoke('proxy-self-signed-cert-info')
+  },
+
+  /** 强制重新生成反代自签证书（重启 server 后生效） */
+  proxySelfSignedCertRegenerate: (): Promise<{ success: boolean; cert?: string; key?: string; fingerprint?: string; notBefore?: number; notAfter?: number; subject?: string; altNames?: string[]; error?: string }> => {
+    return ipcRenderer.invoke('proxy-self-signed-cert-regenerate')
+  },
+
+  /** 查询是否需要重启反代（port/host/tls 变更后 UI 提示） */
+  proxyNeedsRestart: (): Promise<{ needsRestart: boolean }> => {
+    return ipcRenderer.invoke('proxy-needs-restart')
+  },
+
+  /** 立即重启反代 */
+  proxyRestart: (): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('proxy-restart')
+  },
+
+  /** 获取反代审计日志 */
+  proxyAuditLog: (): Promise<{ entries: Array<{ ts: number; type: string; data: Record<string, unknown> }> }> => {
+    return ipcRenderer.invoke('proxy-audit-log')
+  },
+
+  /** 监听 main 进程推送的 webhook 事件（关键告警） */
+  onProxyWebhookTrigger: (callback: (event: string, payload: Record<string, unknown>) => void): (() => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, data: { event: string; payload: Record<string, unknown> }): void => {
+      callback(data.event, data.payload)
+    }
+    ipcRenderer.on('proxy-webhook-trigger', handler)
+    return () => ipcRenderer.off('proxy-webhook-trigger', handler)
   },
 
   // 添加账号到反代池
@@ -1119,6 +1155,47 @@ const api = {
   // 取消注册
   registrationCancel: (): Promise<{ success: boolean }> => {
     return ipcRenderer.invoke('registration-cancel')
+  },
+
+  // ============ 代理池 API ============
+  /**
+   * 验活单个代理：使用 undici ProxyAgent 通过指定代理 URL 请求测试 URL
+   * @returns latencyMs / externalIp（如果测试 URL 返回 IP）
+   */
+  proxyPoolValidate: (params: {
+    url: string
+    testUrl?: string
+    timeoutMs?: number
+  }): Promise<{ success: boolean; latencyMs?: number; externalIp?: string; error?: string }> => {
+    return ipcRenderer.invoke('proxy-pool:validate', params)
+  },
+
+  // ============ 诊断 API ============
+  /** 测试一个 URL 的连通性（GET，5 秒超时，不带代理特殊处理由主进程默认逻辑） */
+  diagnoseHttpProbe: (params: { url: string; method?: 'GET' | 'HEAD'; timeoutMs?: number }): Promise<{
+    success: boolean
+    latencyMs?: number
+    status?: number
+    error?: string
+  }> => {
+    return ipcRenderer.invoke('diagnose:http-probe', params)
+  },
+
+  /**
+   * 设置账号 → 代理 URL 绑定（用于反代时"N 个账号一个 IP"分桶）
+   * @param accountId 账号 ID
+   * @param proxyUrl 代理 URL；undefined 表示解绑
+   */
+  accountSetProxyBinding: (accountId: string, proxyUrl: string | undefined): Promise<{ success: boolean }> => {
+    return ipcRenderer.invoke('account-set-proxy-binding', accountId, proxyUrl)
+  },
+
+  // ============ 一键诊断 ============
+  diagnoseRun: (params: {
+    proxyUrl?: string
+    targets: Array<{ id: string; label: string; url: string; timeoutMs?: number; expectStatus?: number[] }>
+  }): Promise<{ results: Array<{ id: string; label: string; url: string; success: boolean; httpStatus?: number; latencyMs?: number; error?: string }> }> => {
+    return ipcRenderer.invoke('diagnose:run', params)
   },
 
   // 获取注册状态

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Play, Square, RefreshCw, Copy, Check, Server, Activity, AlertCircle, Globe, Zap, Loader2, FileText, Eye, EyeOff, Dices, Cpu, UserCheck, RotateCcw, Users, Clock, Settings2 } from 'lucide-react'
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Switch, Badge, Select } from '../ui'
+import { ProxySecurityPanel } from './ProxySecurityPanel'
 import { useAccountsStore } from '../../store/accounts'
 import { useTranslation } from '../../hooks/useTranslation'
 import { ProxyLogsDialog } from './ProxyLogsDialog'
@@ -83,6 +84,19 @@ interface ProxyConfig {
   multiAccountSelectionMode?: 'all' | 'groups'
   multiAccountGroupIds?: string[]
   modelMappings?: ModelMappingRule[]
+  // v1.8 安全 / 限流 / 可观测
+  maxRequestBodyBytes?: number
+  allowedIPs?: string[]
+  deniedIPs?: string[]
+  allowExternalWithoutApiKey?: boolean
+  rateLimitPerKeyPerMinute?: number
+  sessionAffinityEnabled?: boolean
+  keepAliveTimeoutMs?: number
+  headersTimeoutMs?: number
+  recentRequestsLimit?: number
+  enableMetrics?: boolean
+  fallbackPort?: number
+  enableAuditLog?: boolean
 }
 
 export function ProxyPanel() {
@@ -1007,6 +1021,14 @@ export function ProxyPanel() {
           </div>
         </CardContent>
       </Card>
+
+      {/* v1.8 反代安全 / 可观测设置（独立卡片，可折叠） */}
+      <ProxySecurityPanel
+        config={config as unknown as Parameters<typeof ProxySecurityPanel>[0]['config']}
+        setConfig={setConfig as unknown as Parameters<typeof ProxySecurityPanel>[0]['setConfig']}
+        isRunning={isRunning}
+        isEn={isEn}
+      />
 
       {/* 统计卡片 */}
       {isRunning && (

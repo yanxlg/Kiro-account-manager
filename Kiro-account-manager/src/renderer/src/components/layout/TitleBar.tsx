@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Minus, Square, X, Copy as RestoreIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { TaskCenterButton } from './TaskCenter'
 
 /**
  * 跨平台自定义 titlebar
@@ -70,6 +71,11 @@ export function TitleBar(): React.ReactNode {
         <span className="font-medium tracking-wide text-foreground/70">
           Kiro 账号管理器{appVersion && ` v${appVersion}`}
         </span>
+      </div>
+
+      {/* 任务中心入口（仅当有任务时显示） */}
+      <div className="flex items-center gap-1 px-2" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+        <TaskCenterButton />
       </div>
 
       {/* Windows/Linux 按钮组 */}

@@ -1,5 +1,5 @@
 import { ModuleClient, SessionClient } from 'tlsclientwrapper'
-import { fetch as undiciFetch, ProxyAgent, type RequestInit as UndiciRequestInit } from 'undici'
+import { fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
 import { RegistrationConfig } from './config'
 import { BrowserIdentity, randomIdentity } from './browser-identity'
 import { FingerprintContext, newFPContext, resetPerfTiming, generateFingerprint } from './fingerprint'
@@ -15,9 +15,20 @@ import {
   TempEmailService, MoEmailService, TempMailPlusService,
   parseOutlookLines, getInboxCount, waitForOTP
 } from './email-service'
-import { getSystemProxy } from '../proxy/systemProxy'
+import { getSystemProxy, safeCreateProxyAgent } from '../proxy/systemProxy'
 
 export type LogFn = (message: string) => void
+
+export interface FingerprintSnapshot {
+  chromeVer: string
+  ua: string
+  gpuVendor: string
+  gpuModel: string
+  canvasHash: number
+  screen: { width: number; height: number }
+  /** 注册时使用的出口代理 URL（脱敏前缀） */
+  proxyUrl?: string
+}
 
 export interface RegistrationResult {
   status: 'success' | 'failed'
@@ -31,6 +42,8 @@ export interface RegistrationResult {
   region?: string
   provider?: string
   verify?: Record<string, unknown>
+  /** 本次注册使用的指纹摘要（用于审计与后续复用） */
+  fingerprint?: FingerprintSnapshot
 }
 
 type StepFn = () => Promise<void>
@@ -88,7 +101,11 @@ export class Registrar {
 
   /** TLS SessionClient 选项 */
   private get sessionOpts() {
-    const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || getSystemProxy() || undefined
+    // 优先使用调用方在 config.proxy 显式指定的代理（来自代理池轮换），其次环境变量，再次系统代理
+    const proxyUrl = (this.cfg.proxy && this.cfg.proxy.trim())
+      || process.env.HTTPS_PROXY || process.env.https_proxy
+      || process.env.HTTP_PROXY || process.env.http_proxy
+      || getSystemProxy() || undefined
     return {
       tlsClientIdentifier: 'chrome_144' as const,
       timeoutSeconds: 60,
@@ -98,22 +115,40 @@ export class Registrar {
     }
   }
 
-  /** 初始化 TLS 客户端 */
+  /**
+   * 初始化 TLS 客户端
+   *
+   * DLL 存储策略（按优先级，从高到低）：
+   *   1. userData/tls-client/ — 应用用户数据目录（系统不会清理，**永久复用**）
+   *   2. resources/ — 应用安装目录（打包资源，开发版可能不存在）
+   *   3. tmpdir → 自动迁移到 userData（老版本兼容）
+   *   4. GitHub 下载到 userData（最后兜底，仅首次）
+   */
   private async initTlsClient(): Promise<void> {
-    // 确保 tls-client 共享库在临时目录可用（打包后 resources/ 有预置 dll）
-    this.ensureTlsLibInTmpDir()
-    // 不传 customLibraryPath，让 tlsclientwrapper 自动从 tmpdir 找 dll
-    this.moduleClient = new ModuleClient()
-    await this.moduleClient.open()
+    const { existingPath, downloadDir } = this.ensureTlsLib()
+    // 已有具体文件 → customLibraryPath；否则 → customLibraryDownloadPath，让 open() 自动下载
+    const opts = existingPath
+      ? { customLibraryPath: existingPath }
+      : { customLibraryDownloadPath: downloadDir }
+    this.moduleClient = new ModuleClient(opts)
+    await this.moduleClient.open()  // open() 内部会按需 downloadLibrary
     this.log('[TLS] open() completed, pool stats: ' + JSON.stringify(this.moduleClient.getPoolStats()))
     this.session = new SessionClient(this.moduleClient, this.sessionOpts)
   }
 
-  /** 确保 tls-client 共享库在临时目录可用 */
-  private ensureTlsLibInTmpDir(): void {
+  /**
+   * 确保 tls-client 共享库可用
+   * @returns existingPath 已经存在的完整 DLL 文件路径（如有，传 customLibraryPath）
+   *          downloadDir  需要下载到的目录（如未找到，传 customLibraryDownloadPath 让 tlsclientwrapper 自动下载）
+   *
+   * 优先放到 userData，避免被系统临时目录清理工具误删（之前用 tmpdir 会被清理）
+   */
+  private ensureTlsLib(): { existingPath?: string; downloadDir: string } {
     const os = require('os')
     const path = require('path')
     const fs = require('fs')
+    const { app } = require('electron')
+
     const platform = os.platform()
     const arch = os.arch()
     let filename = 'tls-client-xgo-1.14.0-'
@@ -124,20 +159,49 @@ export class Registrar {
     } else {
       filename += (arch === 'arm64' ? 'linux-arm64' : 'linux-amd64') + '.so'
     }
-    const tmpPath = path.join(os.tmpdir(), filename)
-    // 已存在则跳过
-    if (fs.existsSync(tmpPath)) {
-      this.log('[TLS] Library already exists in tmpdir: ' + tmpPath)
-      return
+
+    // 1. userData 永久目录（首选）
+    const userDataDir = app.getPath('userData')
+    const tlsClientDir = path.join(userDataDir, 'tls-client')
+    const finalPath = path.join(tlsClientDir, filename)
+
+    // 确保目录存在
+    try { fs.mkdirSync(tlsClientDir, { recursive: true }) } catch { /* ignore */ }
+
+    // 已存在 → 直接复用
+    if (fs.existsSync(finalPath)) {
+      this.log('[TLS] Library reused from userData (persistent): ' + finalPath)
+      return { existingPath: finalPath, downloadDir: tlsClientDir }
     }
-    // 从 resources/ 复制到临时目录（打包后 process.resourcesPath 指向 resources/）
+
+    // 2. 从打包资源复制（安装包自带）
     const resourcePath = path.join(process.resourcesPath || '', filename)
     if (fs.existsSync(resourcePath)) {
-      this.log('[TLS] Copying library from resources to tmpdir: ' + resourcePath + ' -> ' + tmpPath)
-      fs.copyFileSync(resourcePath, tmpPath)
-      return
+      this.log('[TLS] Copying library from resources to userData (one-time): ' + resourcePath + ' -> ' + finalPath)
+      try {
+        fs.copyFileSync(resourcePath, finalPath)
+        return { existingPath: finalPath, downloadDir: tlsClientDir }
+      } catch (err) {
+        this.log('[TLS] Failed to copy from resources: ' + (err as Error).message)
+      }
     }
-    this.log('[TLS] Library not found in resources, will download from GitHub. Searched: ' + resourcePath)
+
+    // 3. 兼容老版本：检测 tmpdir 副本并迁移到 userData
+    const tmpPath = path.join(os.tmpdir(), filename)
+    if (fs.existsSync(tmpPath)) {
+      this.log('[TLS] Migrating library from tmpdir to userData: ' + tmpPath + ' -> ' + finalPath)
+      try {
+        fs.copyFileSync(tmpPath, finalPath)
+        return { existingPath: finalPath, downloadDir: tlsClientDir }
+      } catch (err) {
+        this.log('[TLS] Migration failed, will use tmpdir as fallback: ' + (err as Error).message)
+        return { existingPath: tmpPath, downloadDir: tlsClientDir }
+      }
+    }
+
+    // 4. 都没有 → 返回 downloadDir，让 tlsclientwrapper open() 自动下载到此目录（永久保存）
+    this.log('[TLS] Library not found, will download from GitHub to userData (one-time): ' + tlsClientDir)
+    return { downloadDir: tlsClientDir }
   }
 
   private async rebuildTlsClient(): Promise<void> {
@@ -157,11 +221,12 @@ export class Registrar {
    * 静态资源不需要 TLS 指纹伪装，直接用 Node/undici fetch 即可。
    */
   private async fetchAppJS(url: string, init?: RequestInit): Promise<Response> {
-    const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy
+    const proxyUrl = (this.cfg.proxy && this.cfg.proxy.trim())
+      || process.env.HTTPS_PROXY || process.env.https_proxy
       || process.env.HTTP_PROXY || process.env.http_proxy
       || getSystemProxy() || undefined
-    if (proxyUrl) {
-      const agent = new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
+    const agent = safeCreateProxyAgent(proxyUrl)
+    if (agent) {
       const resp = await undiciFetch(url, { ...(init as UndiciRequestInit), dispatcher: agent })
       return resp as unknown as Response
     }
@@ -253,13 +318,13 @@ export class Registrar {
     if (!this.session) throw new Error('TLS 客户端未初始化')
     try {
       const resp = await this.session.get(url, { headers })
-      return { body: resp.body || '', status: resp.status, headers: (resp.headers || {}) as Record<string, string | string[]> }
+      return { body: this.decodeBody(resp.body), status: resp.status, headers: (resp.headers || {}) as Record<string, string | string[]> }
     } catch (err: unknown) {
       if (this.isRecoverableTlsClientError(err)) {
         this.log('[TLS] Recoverable GET error, rebuilding TLS client: ' + (err instanceof Error ? err.message : String(err)))
         await this.rebuildTlsClient()
         const resp = await this.session!.get(url, { headers })
-        return { body: resp.body || '', status: resp.status, headers: (resp.headers || {}) as Record<string, string | string[]> }
+        return { body: this.decodeBody(resp.body), status: resp.status, headers: (resp.headers || {}) as Record<string, string | string[]> }
       }
       throw err
     }
@@ -270,20 +335,70 @@ export class Registrar {
     const body = JSON.stringify(payload)
     try {
       const resp = await this.session.post(url, body, { headers })
-      return { body: resp.body || '', status: resp.status, headers: (resp.headers || {}) as Record<string, string | string[]> }
+      return { body: this.decodeBody(resp.body), status: resp.status, headers: (resp.headers || {}) as Record<string, string | string[]> }
     } catch (err: unknown) {
       if (this.isRecoverableTlsClientError(err)) {
         this.log('[TLS] Recoverable POST error, rebuilding TLS client: ' + (err instanceof Error ? err.message : String(err)))
         await this.rebuildTlsClient()
         const resp = await this.session!.post(url, body, { headers })
-        return { body: resp.body || '', status: resp.status, headers: (resp.headers || {}) as Record<string, string | string[]> }
+        return { body: this.decodeBody(resp.body), status: resp.status, headers: (resp.headers || {}) as Record<string, string | string[]> }
       }
       throw err
     }
   }
 
+  /**
+   * tls-client 返回的 body 是字节透传字符串（latin1）；
+   * 如果响应实际是 UTF-8 编码（含中文等多字节），需要二次解码。
+   * 实现：把 string 当作 latin1 字节读回，再用 UTF-8 解码；
+   * 若解码后含 U+FFFD 替换字符比原文多很多，则回退原值（说明原本就是 latin1 / ASCII）。
+   */
+  private decodeBody(body: string | undefined | null): string {
+    if (!body) return ''
+    try {
+      // 快速路径：纯 ASCII 直接返回
+      // eslint-disable-next-line no-control-regex
+      if (/^[\x00-\x7F]*$/.test(body)) return body
+      const buf = Buffer.from(body, 'latin1')
+      const utf8 = buf.toString('utf-8')
+      // 检测 mojibake：原文如果在 latin1 解码 UTF-8 字节，会出现大量字符在 \u00a0-\u00ff 区间
+      // 重解后如果替换字符数量明显多于原文，说明不是 UTF-8，回退原值
+      const replaceInOriginal = (body.match(/\uFFFD/g) || []).length
+      const replaceInUtf8 = (utf8.match(/\uFFFD/g) || []).length
+      if (replaceInUtf8 > replaceInOriginal + 2) return body
+      return utf8
+    } catch {
+      return body
+    }
+  }
+
   private parseBody(body: string): Record<string, unknown> {
     try { return JSON.parse(body) } catch { return {} }
+  }
+
+  /**
+   * 识别 AWS 风控触发的错误响应，返回人类可读的标签
+   * @returns 风控类型标签（如 'AWS-RISK-CONTROL'），不是风控返回 null
+   */
+  private detectRiskControl(body: string, status: number): string | null {
+    if (status !== 400) return null
+    const lower = body.toLowerCase()
+    // 中文消息（已正确解码）
+    if (body.includes('请稍后再试') && body.includes('管理员')) return 'AWS-RISK-CONTROL'
+    if (body.includes('发生意外错误')) return 'AWS-RISK-CONTROL'
+    // 英文消息
+    if (lower.includes('try again later') && lower.includes('administrator')) return 'AWS-RISK-CONTROL'
+    if (lower.includes('unexpected error') && lower.includes('contact')) return 'AWS-RISK-CONTROL'
+    return null
+  }
+
+  /** 把响应错误格式化为更友好的消息（含风控识别） */
+  private formatErrorBody(body: string, status: number): string {
+    const risk = this.detectRiskControl(body, status)
+    if (risk) {
+      return `${risk}（AWS 风控，建议：1) 启用代理池 N:1 分桶；2) 启用限速 + 风控自动暂停；3) 避免同邮箱域名大量注册）`
+    }
+    return `status=${status} body=${body.substring(0, 200)}`
   }
 
   private async fetchD2CToken(origin: string, referer: string): Promise<void> {
@@ -410,7 +525,11 @@ export class Registrar {
       this.log('[3] 使用 Outlook 邮箱')
       const accounts = parseOutlookLines(this.cfg.outlookData)
       if (accounts.length === 0) throw new Error('无可用的 Outlook 账号')
-      const acc = accounts[Math.floor(Math.random() * accounts.length)]
+      // 单行 → 直接用（批量并发时前端已为每个 task 切一行，避免并发抢占）
+      // 多行（单次注册）→ 随机挑一行
+      const acc = accounts.length === 1
+        ? accounts[0]
+        : accounts[Math.floor(Math.random() * accounts.length)]
       this.email = acc.email
       this.log(`email=${this.email}`)
       return
@@ -583,7 +702,7 @@ export class Registrar {
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     let data = this.parseBody(resp.body)
     if (data.workflowStateHandle) this.workflowHandle = data.workflowStateHandle as string
-    if (data.stepId !== 'start') throw new Error(`Signup init 返回意外 stepId: ${data.stepId}, resp status: ${resp.status}, body: ${resp.body.substring(0, 200)}`)
+    if (data.stepId !== 'start') throw new Error(`Signup init 失败: ${this.formatErrorBody(resp.body, resp.status)}`)
 
     fp = this.genFP('signup', 'PageLoad', 0, '')
     rid = newUUID()
@@ -756,7 +875,7 @@ export class Registrar {
 
     const encCtx = getNestedMap(data as Record<string, unknown>, 'workflowResponseData', 'encryptionContextResponse')
     const pubKeyMap = encCtx ? getNestedStringMap(encCtx, 'publicKey') : null
-    if (!pubKeyMap?.n) throw new Error(`未获取到加密公钥: ${resp.body.slice(0, 200)}`)
+    if (!pubKeyMap?.n) throw new Error(`未获取到加密公钥: ${this.formatErrorBody(resp.body, resp.status)}`)
 
     const issuer = (encCtx?.issuer as string) || 'signin'
     const audience = (encCtx?.audience as string) || 'AWSPasswordService'
@@ -813,7 +932,7 @@ export class Registrar {
     }, h)
     saveCookies(this.cookies, resp.headers as Record<string, string | string[] | undefined>)
     const data = this.parseBody(resp.body)
-    if (data.stepId !== 'end-of-workflow-success') throw new Error(`完成工作流失败: ${data.stepId}`)
+    if (data.stepId !== 'end-of-workflow-success') throw new Error(`完成工作流失败: ${data.stepId || 'undefined'} ${this.formatErrorBody(resp.body, resp.status)}`)
 
     const redir = data.redirect as Record<string, unknown> | undefined
     const rurl = redir?.url as string
@@ -1142,10 +1261,37 @@ export class Registrar {
         accessToken: (awsToken.accessToken as string) || '',
         region: 'us-east-1',
         provider: 'BuilderId',
-        verify
+        verify,
+        fingerprint: this.fingerprintSnapshot()
       }
     } finally {
       await this.cleanup()
+    }
+  }
+
+  /**
+   * 返回本次注册实际生效的代理 URL（按 sessionOpts 同样的优先级解析），
+   * 用于在指纹摘要里准确显示是直连还是走代理。
+   */
+  private resolvedProxyUrl(): string | undefined {
+    return (this.cfg.proxy && this.cfg.proxy.trim())
+      || process.env.HTTPS_PROXY || process.env.https_proxy
+      || process.env.HTTP_PROXY || process.env.http_proxy
+      || getSystemProxy() || undefined
+  }
+
+  /** 输出本次注册使用的指纹摘要（用于审计与后续复用） */
+  private fingerprintSnapshot(): FingerprintSnapshot {
+    const resolved = this.resolvedProxyUrl()
+    return {
+      chromeVer: this.identity.chromeVer,
+      ua: this.identity.ua,
+      gpuVendor: this.identity.gpuVendor,
+      gpuModel: this.identity.gpuModel,
+      canvasHash: this.identity.canvasHash,
+      screen: { width: this.identity.screen.width, height: this.identity.screen.height },
+      // 脱敏后保存（隐藏密码部分），同时确保系统/环境变量代理也被捕获
+      proxyUrl: resolved ? resolved.replace(/:([^:@/]+)@/, ':***@') : undefined
     }
   }
 
@@ -1211,7 +1357,8 @@ export class Registrar {
         accessToken: (awsToken.accessToken as string) || '',
         region: 'us-east-1',
         provider: 'BuilderId',
-        verify
+        verify,
+        fingerprint: this.fingerprintSnapshot()
       }
     } catch (err) {
       return { status: 'failed', email: this.email, error: (err as Error).message }

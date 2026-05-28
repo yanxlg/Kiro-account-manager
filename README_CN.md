@@ -272,6 +272,155 @@ npx electron-builder --linux --arm64
 ## 📋 更新日志
 
 
+### v1.7.0 (2026-5-28) — 安全加固 + 全功能扩展大版本
+
+> 本版本包含 70+ 项改进，覆盖反代安全加固、批量注册并发隔离、SOCKS 代理、任务中心、Webhook 通知、报表分析、一键诊断、配置导入导出、性能优化等多个方向。
+
+#### 🛡️ 反代安全加固（21 项）
+
+**P0 紧急安全**
+- **修复**: `readBody` 加入请求体大小上限（默认 10MB），Content-Length 提前拒绝 + 流式累加超限断连，触发 HTTP 413（防 DoS）
+- **修复**: 检测到 host=`0.0.0.0`/`::` 且未配置 API Key 时拒绝启动；UI 显示红色警告，需显式 `allowExternalWithoutApiKey` 才能裸跑
+- **修复**: API Key 比较改用 `crypto.timingSafeEqual`，杜绝时序攻击逐字猜 Key
+- **修复**: 错误响应 500 类只返回通用消息 "Internal server error"；自动脱敏 Bearer/access_token/JWT/系统路径
+- **修复**: `/admin/config` GET 屏蔽 `apiKeys[].key` 明文，仅返回 `xxxx***last4`
+
+**P1 运维与可观测**
+- **新增**: IP 白名单 / 黑名单（支持单 IP + IPv4/IPv6 CIDR）
+- **新增**: 反代关键事件接入 Webhook（封号 / 全员配额耗尽，5 分钟去重）
+- **新增**: `/admin/config` POST 字段白名单校验，禁止远程修改 port/host/apiKeys/tls 等敏感字段
+- **新增**: 按 API Key / IP 的请求频率限制（滑动窗口，每分钟可配）
+- **新增**: 会话粘性（按 conversation_id 路由到同账号，保 prompt cache + 防风控）
+- **新增**: keep-alive / headers 空闲超时（默认 65s/60s 可调）
+- **新增**: TLS 自签证书一键生成（2 年有效期 + SAN 覆盖 localhost/127.0.0.1/::1/用户 host）
+- **新增**: stop() 优雅停止（5 秒优雅期 → activeRequests.abort → socket.destroy）
+- **新增**: 日志 sanitize（移除 Bearer/access_token/JWT/系统路径片段）
+
+**P2 高级特性**
+- **新增**: Prometheus `/metrics` 端点（8 个核心指标：requests/tokens/credits/accounts/uptime）
+- **新增**: 反代审计日志（滚动 200 条 + `/admin/audit` GET + `enableAuditLog` 开关）
+- **新增**: API Key 绑账号白名单（`apiKeyAccountBindings`：apiKey id → 允许的账号 id 数组）
+- **新增**: HTTP + HTTPS 双端口（启用 TLS 时通过 `fallbackPort` 同时监听 HTTP）
+- **新增**: `recentRequests` 上限可配置（默认 100，最多 10000）
+- **新增**: port/host/tls 变更标记需重启 + UI 一键重启按钮
+- **新增**: 流式响应 socket-level backpressure 监控
+
+**新文件**: `src/main/proxy/selfSignedCert.ts`、`ProxySecurityPanel.tsx`
+**新 IPC**: `proxySelfSignedCertInfo` / `proxySelfSignedCertRegenerate` / `proxyNeedsRestart` / `proxyRestart` / `proxyAuditLog` / `onProxyWebhookTrigger`
+
+#### 🌐 多协议代理支持
+
+- **新增**: SOCKS5 / SOCKS5h / SOCKS4 / SOCKS4a 代理支持（基于 `socks` 库 + undici 自定义 Agent + TLS 升级）
+- **新增**: 账号-代理 N:1 绑定（反代分桶，多账号共用 1 个 IP 降低风控关联）
+- **新增**: 账号的所有请求（含 token 刷新、background 检查、Kiro API）统一走绑定代理
+- **新增**: 代理池高级搜索（9 字段全文：host / port / protocol / user / label / email / url / tags / source）
+- **新增**: 代理池多维筛选（协议 / 启用状态 / 延迟范围 / 最后验证时间）+ 匹配数实时显示
+
+#### 🚀 批量注册重大升级
+
+**并发隔离修复**
+- **修复**: Outlook 批量并发邮箱抢占（前端预 shuffle outlookData + 每 task 独占一行；主进程兼容单行/多行）
+- **修复**: Mixed 模式源选择只生效一次（每 task 独立 `buildAutoConfig`，权重轮询真正生效）
+- **修复**: 注册历史"直连"误报（`resolvedProxyUrl()` 含系统/环境变量代理）
+
+**功能扩展**
+- **新增**: 限速器（token bucket）+ 指数退避 + 成功率监控
+- **新增**: 失败重试队列（按错误类型：network / otp_timeout / email_used / rate_limit / auth / risk_control）
+- **新增**: AWS 风控自动识别（"TEMPORARILY_SUSPENDED" / "请稍后再试"）+ 自动暂停批量
+- **新增**: 邮箱预校验黑名单（占用邮箱自动加入，跳过节省时间）
+- **新增**: 混合邮箱源加权轮询（SWRR / nginx 同款算法）
+- **新增**: 每日注册配额 + cron 定时启动
+- **新增**: 注册策略模板（保存/应用/导入/导出）
+- **新增**: 6-8 步动态进度条（根据 `batchAutoImport` 和 `autoFetchProLink` 自动增减）
+- **修复**: 注册过程中文乱码错误（tlsclientwrapper Latin-1 → UTF-8 重解码）
+- **移除**: MoEmail 注册功能（无用）
+
+#### 📊 任务中心 + Webhook 通知
+
+- **新增**: 统一任务中心（`useTaskStore`，标题栏入口 + 抽屉式 UI）
+- **新增**: 任务状态机：running / paused / success / failed / cancelled
+- **新增**: 任务中心持久化（完成的任务保存到 localStorage）
+- **新增**: 全部取消按钮 / 进度条 / 子任务详情
+- **新增**: Webhook 通知（钉钉 / Telegram / Discord / Slack / Generic JSON）
+- **新增**: Webhook 重试（3 次指数退避）+ 限流（20 条/分钟/webhook）
+- **新增**: 反代关键事件 → Webhook（封号 / 全员配额耗尽）
+
+#### 🩺 一键诊断
+
+- **新增**: 诊断页面（网络 / Kiro API / 邮箱服务 / 代理 / 自定义端点连通性）
+- **新增**: 自定义探测 URL（替代 MoEmail，可填任意 HTTP/HTTPS 端点）
+- **新增**: 通过代理执行诊断 + 报告导出（剪贴板）
+- **新增**: 老 MoEmail 配置自动迁移到新探测 URL key
+
+#### 🔧 订阅管理
+
+- **新增**: 批量订阅预检（资格检查 + 报告）
+- **新增**: 订阅取消 / 降级 / 续期入口
+- **新增**: 订阅链接有效期检测（HTTP HEAD 探测 + generatedAt 时间戳）
+- **新增**: 管理订阅 Tab（批量打开门户 + 一键关闭超额计费）
+- **新增**: 订阅账号虚拟列表（@tanstack/react-virtual）
+
+#### 📈 报表分析
+
+- **新增**: 注册结果分析报表（成功/失败圆环 + 24h 平滑曲线 + 7 日趋势）
+- **新增**: 错误分类统计（OTP 超时 / 网络 / 邮箱占用 / 限流 / 风控）
+- **新增**: CSV 导出
+
+#### 📦 配置导入导出
+
+- **新增**: 一键导出全量配置（账号 / 代理池 / Webhook / 策略模板）
+- **新增**: AES-GCM 加密导出（KCFG 格式，PBKDF2-SHA256 派生密钥）
+- **新增**: 跨设备配置同步
+
+#### ⚡ 性能优化（防卡顿）
+
+**I/O 与持久化**
+- **优化**: `saveToStorage` 500ms 防抖 + `flushSaveImmediately` 强制刷新接口
+- **优化**: `createBackup` 5 分钟节流（之前每次保存都备份）
+- **优化**: `ProxyLogStore` 异步 `fs.promises.writeFile` + 30 秒节流 + maxLogs 100 万 → 5 万
+- **优化**: `proxy-account-suspended` IPC 只更新内存快照，延迟落盘
+- **优化**: SSO 账号 `queueMicrotask` 异步加载（不阻塞 loadFromStorage）
+
+**渲染与计算**
+- **优化**: `getFilteredAccounts` / `getStats` / `activeAccount` 模块级 memoization
+- **优化**: `applyBackgroundRefreshResults` / `applyBackgroundCheckResults` 批量合并（120ms buffer）
+- **优化**: `importAccounts` / `importFromExportData` 单 set 调用
+- **优化**: `updateTrayInfo` 400ms 防抖
+- **优化**: `AccountToolbar` 选中状态 `useMemo` + `useCallback`
+- **优化**: 代理池 / 账号 / 订阅列表使用虚拟列表（`@tanstack/react-virtual`，仅渲染可视区域）
+
+#### 🐛 关键 Bug 修复
+
+- **修复**: `Invalid URL protocol`（Windows 注册表 ProxyServer 多协议字符串解析，仅取 HTTP/HTTPS）
+- **修复**: `tls-client-wrapper` DLL 改用 `userData/tls-client/` 永久存储（之前在 `%TEMP%` 会被系统清理）
+- **修复**: 网络请求 Latin-1 字符串响应转 UTF-8（中文错误正确显示）
+- **修复**: `proxyServer.stop()` socket 强制 destroy 太早导致响应截断
+- **修复**: 多个内存泄漏（限流桶 / 会话粘性条目 5 分钟自动清理）
+
+#### 🆕 新页面
+
+- **`ProxyPoolPage`** — 代理池管理 + 高级搜索 + 账号绑定 + 定时验活
+- **`WebhooksPage`** — Webhook 配置 + 测试 + 事件订阅
+- **`DiagnosePage`** — 一键诊断（网络 / API / 邮箱 / 代理 / 自定义）
+- **`ConfigSyncPage`** — 配置导入导出 + AES-GCM 加密
+
+#### 🔧 主题与 UI
+
+- **新增**: 任务中心按钮（标题栏）+ 全局进度展示
+- **新增**: 反代"安全与可观测设置 (v1.8)"卡片（折叠式，统一新配置入口）
+- **优化**: 失败错误码本地化显示
+- **优化**: 危险绑定（0.0.0.0）自动弹红色警告 + 风险确认开关
+
+#### 🔄 ProxyAccount 数据模型扩展
+
+- 新增 `proxyUrl` 字段（账号绑定的出口代理）
+- 新增 `machineId` 字段（账户绑定的设备 ID）
+
+#### 📋 ProxyConfig 新增字段（14 项）
+
+`maxRequestBodyBytes` / `allowedIPs` / `deniedIPs` / `allowExternalWithoutApiKey` / `rateLimitPerKeyPerMinute` / `sessionAffinityEnabled` / `keepAliveTimeoutMs` / `headersTimeoutMs` / `recentRequestsLimit` / `enableMetrics` / `apiKeyAccountBindings` / `fallbackPort` / `enableAuditLog` / `apiKeyGroupBindings`(deprecated)
+
+
 ### v1.6.9 (2026-5-24)
 
 #### UI 全面主题适配

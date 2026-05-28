@@ -1,15 +1,14 @@
 import * as tls from 'tls'
-import { ProxyAgent, fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
-import { getSystemProxy } from '../proxy/systemProxy'
+import { fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
+import { getSystemProxy, safeCreateProxyAgent } from '../proxy/systemProxy'
 
 function getRegistrationProxyUrl(): string | undefined {
   return process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || getSystemProxy() || undefined
 }
 
 async function proxyFetch(url: string, options?: RequestInit): Promise<Response> {
-  const proxyUrl = getRegistrationProxyUrl()
-  if (proxyUrl) {
-    const agent = new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
+  const agent = safeCreateProxyAgent(getRegistrationProxyUrl())
+  if (agent) {
     return await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
   }
   return await fetch(url, options)
@@ -41,8 +40,32 @@ export class MoEmailService implements TempEmailService {
   private address = ''
 
   constructor(baseURL: string, apiKey: string) {
-    this.baseURL = baseURL
+    this.baseURL = MoEmailService.normalizeBaseURL(baseURL)
     this.apiKey = apiKey
+  }
+
+  /**
+   * 归一化用户输入的 baseURL：
+   *   - 去除首尾空白与末尾斜杠
+   *   - 缺少 protocol 时补 `https://`
+   *   - 校验协议仅允许 http / https，否则抛清晰错误
+   * 用于规避 fetch 因协议不合法抛出
+   * "Invalid URL protocol: the URL must start with `http:` or `https:`."
+   */
+  private static normalizeBaseURL(raw: string): string {
+    const trimmed = (raw || '').trim().replace(/\/+$/, '')
+    if (!trimmed) throw new Error('MoEmail BaseURL 未配置')
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
+    let u: URL
+    try {
+      u = new URL(withScheme)
+    } catch {
+      throw new Error(`MoEmail BaseURL 格式无效: ${raw}`)
+    }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+      throw new Error(`MoEmail BaseURL 协议不支持 (仅支持 http/https): ${u.protocol}`)
+    }
+    return withScheme
   }
 
   async create(): Promise<string> {

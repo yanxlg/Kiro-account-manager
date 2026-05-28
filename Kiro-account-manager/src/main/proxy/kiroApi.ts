@@ -1,6 +1,6 @@
 // Kiro API 调用核心模块
 import { v4 as uuidv4 } from 'uuid'
-import { ProxyAgent, fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
+import { fetch as undiciFetch, type RequestInit as UndiciRequestInit, type Dispatcher } from 'undici'
 import type {
   KiroPayload,
   KiroUserInputMessage,
@@ -17,7 +17,7 @@ import type {
 } from './types'
 import { proxyLogger } from './logger'
 import { getKProxyService } from '../kproxy'
-import { getSystemProxy } from './systemProxy'
+import { getSystemProxy, safeCreateProxyAgent } from './systemProxy'
 import {
   countTokens,
   getModelContextLength,
@@ -85,30 +85,49 @@ function estimatePayloadTokens(payload: KiroPayload): number {
   return estimateTokensFromString(JSON.stringify(payload))
 }
 
-// 获取网络代理 agent（优先 K-Proxy，其次用户设置代理，其次系统代理）
-function getNetworkAgent(): ProxyAgent | undefined {
+/**
+ * 获取网络代理 agent
+ * 优先级（从高到低）：
+ *   1. 账号自身绑定的 proxyUrl（实现"N 个号一个 IP"分桶反代）
+ *   2. K-Proxy（如果启用）
+ *   3. 环境变量代理
+ *   4. 系统代理
+ *
+ * 传入 account 让账号级代理覆盖全局；不传则走全局逻辑。
+ */
+function getNetworkAgent(account?: ProxyAccount): Dispatcher | undefined {
+  // 1. 账号专属代理：实现"N 个账号共用 1 个 IP"的分桶反代
+  if (account?.proxyUrl) {
+    const agent = safeCreateProxyAgent(account.proxyUrl)
+    if (agent) {
+      proxyLogger.debug('KiroAPI', `Using account-bound proxy for ${account.email || account.id}`)
+      return agent
+    }
+  }
+  // 2. K-Proxy
   if (useKProxyForApi) {
     const kproxyService = getKProxyService()
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      return new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
+      const agent = safeCreateProxyAgent(proxyUrl)
+      if (agent) return agent
     }
   }
+  // 3. 环境变量
   const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
-  if (envProxy) {
-    return new ProxyAgent({ uri: envProxy, requestTls: { rejectUnauthorized: false } })
-  }
-  const systemProxy = getSystemProxy()
-  if (systemProxy) {
-    return new ProxyAgent({ uri: systemProxy, requestTls: { rejectUnauthorized: false } })
-  }
-  return undefined
+  const envAgent = safeCreateProxyAgent(envProxy)
+  if (envAgent) return envAgent
+  // 4. 系统代理
+  return safeCreateProxyAgent(getSystemProxy())
 }
 
-// 使用代理的 fetch 函数
-async function fetchWithProxy(url: string, options: RequestInit): Promise<Response> {
-  const agent = getNetworkAgent()
+/**
+ * 使用代理的 fetch 函数
+ * 传入 account 时会优先使用账号绑定的代理（账号-代理 N:1 分桶）
+ */
+async function fetchWithProxy(url: string, options: RequestInit, account?: ProxyAccount): Promise<Response> {
+  const agent = getNetworkAgent(account)
   if (agent) {
     proxyLogger.debug('KiroAPI', `Using proxy agent: ${agent.constructor.name}`)
     return await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
@@ -1194,7 +1213,7 @@ export async function callKiroApiStream(
       console.log(`[KiroAPI]   - Agent mode: ${headers['x-amzn-kiro-agent-mode']}`)
       console.log(`[KiroAPI]   - Payload size: ${payloadStr.length} bytes`)
       
-      const agent = getNetworkAgent()
+      const agent = getNetworkAgent(account)
       if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
       const response = agent
         ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
@@ -1924,7 +1943,7 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
 
       const url = `${baseUrl}/ListAvailableModels?${params.toString()}`
       throwIfAborted(signal)
-      const response = await fetchWithProxy(url, { method: 'GET', headers, signal })
+      const response = await fetchWithProxy(url, { method: 'GET', headers, signal }, account)
       throwIfAborted(signal)
       
       if (!response.ok) {
@@ -2003,7 +2022,7 @@ export async function fetchAvailableSubscriptions(account: ProxyAccount): Promis
   })
 
   try {
-    const response = await fetchWithProxy(url, { method: 'POST', headers, body })
+    const response = await fetchWithProxy(url, { method: 'POST', headers, body }, account)
     const responseText = await response.text()
     console.log(`[KiroAPI] ListAvailableSubscriptions → ${response.status}`, JSON.parse(responseText))
     
@@ -2057,7 +2076,7 @@ export async function fetchSubscriptionToken(
   }
 
   try {
-    const response = await fetchWithProxy(url, { method: 'POST', headers, body: JSON.stringify(payload) })
+    const response = await fetchWithProxy(url, { method: 'POST', headers, body: JSON.stringify(payload) }, account)
     
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}))
@@ -2098,7 +2117,7 @@ export async function setUserPreference(
   })
 
   try {
-    const response = await fetchWithProxy(url, { method: 'POST', headers, body })
+    const response = await fetchWithProxy(url, { method: 'POST', headers, body }, account)
     if (!response.ok) {
       const errorText = await response.text().catch(() => '')
       return { success: false, error: `HTTP ${response.status}: ${errorText.substring(0, 200)}` }

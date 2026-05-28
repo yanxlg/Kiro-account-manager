@@ -1,4 +1,4 @@
-import { Home, Users, Settings, Info, ChevronRight, Fingerprint, Sparkles, Server, Shield, UserPlus, CreditCard, ScrollText } from 'lucide-react'
+import { Home, Users, Settings, Info, ChevronRight, Fingerprint, Sparkles, Server, Shield, UserPlus, CreditCard, ScrollText, Network, Bell, Stethoscope, Archive } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { cn } from '@/lib/utils'
 import kiroLogo from '@/assets/kiro-high-resolution-logo-transparent.png'
@@ -6,7 +6,7 @@ import kiroLogoSmall from '@/assets/Kiro Logo.svg'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 
-export type PageType = 'home' | 'accounts' | 'machineId' | 'kiroSettings' | 'proxy' | 'kproxy' | 'register' | 'subscription' | 'logs' | 'settings' | 'about'
+export type PageType = 'home' | 'accounts' | 'machineId' | 'kiroSettings' | 'proxy' | 'kproxy' | 'proxyPool' | 'register' | 'subscription' | 'webhooks' | 'diagnose' | 'configSync' | 'logs' | 'settings' | 'about'
 
 interface SidebarProps {
   currentPage: PageType
@@ -22,8 +22,12 @@ const menuItemsConfig: { id: PageType; labelKey: string; icon: React.ElementType
   { id: 'kiroSettings', labelKey: 'nav.kiroSettings', icon: Sparkles },
   { id: 'proxy', labelKey: 'nav.proxy', icon: Server },
   { id: 'kproxy', labelKey: 'nav.kproxy', icon: Shield },
+  { id: 'proxyPool', labelKey: 'nav.proxyPool', icon: Network },
   { id: 'register', labelKey: 'nav.register', icon: UserPlus },
   { id: 'subscription', labelKey: 'nav.subscription', icon: CreditCard },
+  { id: 'webhooks', labelKey: 'nav.webhooks', icon: Bell },
+  { id: 'diagnose', labelKey: 'nav.diagnose', icon: Stethoscope },
+  { id: 'configSync', labelKey: 'nav.configSync', icon: Archive },
   { id: 'logs', labelKey: 'nav.logs', icon: ScrollText },
   { id: 'settings', labelKey: 'nav.settings', icon: Settings },
   { id: 'about', labelKey: 'nav.about', icon: Info },
