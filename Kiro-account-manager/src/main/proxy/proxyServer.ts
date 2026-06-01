@@ -1151,7 +1151,19 @@ export class ProxyServer {
   // P2-21 apiKeyId：用于过滤 API Key 允许使用的账号子集
   private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string): Promise<ProxyAccount | null> {
     const allowedIds = this.getAllowedAccountIds(apiKeyId)
-    const isAllowed = (acc: ProxyAccount | null): boolean => !acc || !allowedIds || allowedIds.has(acc.id)
+    const groupMode = this.config.multiAccountSelectionMode === 'groups'
+    const allowedGroupIds = groupMode ? new Set(this.config.multiAccountGroupIds || []) : null
+    const isAllowed = (acc: ProxyAccount | null): boolean => {
+      if (!acc) return true
+      // API Key 白名单（apiKeyAccountBindings）
+      if (allowedIds && !allowedIds.has(acc.id)) return false
+      // 分组过滤（双保险：即便前端忘了重新同步账号池，这里也能拦住非选中分组的账号）
+      if (groupMode && allowedGroupIds) {
+        const gid = acc.groupId || '__ungrouped__'
+        if (!allowedGroupIds.has(gid)) return false
+      }
+      return true
+    }
     this.throwIfAborted(signal)
     // 如果 pool 为空，触发懒加载回调尝试同步账号（冷启动场景）
     if (this.accountPool.size === 0 && this.events.onPoolEmpty) {
@@ -1178,13 +1190,11 @@ export class ProxyServer {
     }
 
     let account: ProxyAccount | null
-    
-    // 检查是否启用多账号轮询
+
     if (this.config.enableMultiAccount) {
       account = this.accountPool.getNextAccount()
-      // P2-21 过滤：必须在白名单内
       if (account && !isAllowed(account)) {
-        // 尝试找一个允许的账号
+        // 尝试找一个允许的账号（白名单 + 分组都已合并进 isAllowed）
         const allAccounts = this.accountPool.getAllAccounts()
         const exclude = new Set<string>()
         for (const a of allAccounts) {
@@ -1288,6 +1298,18 @@ export class ProxyServer {
     let lastError: Error | null = null
     let currentAccount = account
     let endpointIndex = 0
+    // 本次请求累计已尝试的账号 ID，避免重试时循环命中已经失败过的账号
+    const triedIds = new Set<string>([account.id])
+    /** 切到下一个可用账号；多账号模式带 triedIds 排除，单账号场景退化为旧逻辑 */
+    const switchToNextAccount = (): ProxyAccount | null => {
+      if (this.config.enableMultiAccount) {
+        return this.accountPool.getNextAccount(triedIds)
+      }
+      if (this.config.autoSwitchOnQuotaExhausted) {
+        return this.accountPool.getNextAvailableAccount(triedIds)
+      }
+      return null
+    }
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       this.throwIfAborted(signal)
@@ -1332,19 +1354,16 @@ export class ProxyServer {
             })
           }
           console.warn(`[ProxyServer] Account ${currentAccount.email || currentAccount.id} suspended (${suspendInfo.reason}), switching to next available account`)
-          // 切到下个可用账号（跳过被 suspended 的）
-          if (this.config.enableMultiAccount || this.config.autoSwitchOnQuotaExhausted) {
-            const nextAccount = this.config.enableMultiAccount
-              ? this.accountPool.getNextAccount()
-              : this.accountPool.getNextAvailableAccount(currentAccount.id)
-            if (nextAccount && nextAccount.id !== currentAccount.id) {
-              currentAccount = nextAccount
-              if (!this.config.enableMultiAccount) {
-                this.config.selectedAccountIds = [nextAccount.id]
-                this.events.onAccountUpdate?.(nextAccount)
-              }
-              continue
+          // 切到下个可用账号（跳过被 suspended 的 + 本请求已试过的）
+          const nextAccount = switchToNextAccount()
+          if (nextAccount && !triedIds.has(nextAccount.id)) {
+            currentAccount = nextAccount
+            triedIds.add(nextAccount.id)
+            if (!this.config.enableMultiAccount) {
+              this.config.selectedAccountIds = [nextAccount.id]
+              this.events.onAccountUpdate?.(nextAccount)
             }
+            continue
           }
           // 无可切换的账号 → 直接抛出错误给客户端
           break
@@ -1358,13 +1377,12 @@ export class ProxyServer {
             currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
             continue
           }
-          // 刷新失败，只在启用多账号时切换账号
-          if (this.config.enableMultiAccount) {
-            const nextAccount = this.accountPool.getNextAccount()
-            if (nextAccount && nextAccount.id !== currentAccount.id) {
-              currentAccount = nextAccount
-              continue
-            }
+          // 刷新失败 → 切到没试过的下个账号
+          const nextAccount = switchToNextAccount()
+          if (nextAccount && !triedIds.has(nextAccount.id)) {
+            currentAccount = nextAccount
+            triedIds.add(nextAccount.id)
+            continue
           }
         }
 
@@ -1374,20 +1392,13 @@ export class ProxyServer {
           this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
           endpointIndex = (endpointIndex + 1) % 2 // 切换端点
           if (endpointIndex === 0) {
-            // 已尝试所有端点，检查是否需要切换账号
-            if (this.config.enableMultiAccount) {
-              // 多账号模式：切换到下一个账号
-              const nextAccount = this.accountPool.getNextAccount()
-              if (nextAccount && nextAccount.id !== currentAccount.id) {
-                currentAccount = nextAccount
-              }
-            } else if (this.config.autoSwitchOnQuotaExhausted) {
-              // 单账号模式 + 启用自动切换：切换到下一个可用账号
-              const nextAccount = this.accountPool.getNextAvailableAccount(currentAccount.id)
-              if (nextAccount && nextAccount.id !== currentAccount.id) {
-                console.log(`[ProxyServer] Auto-switching from ${currentAccount.id} to ${nextAccount.id} due to quota exhausted`)
-                currentAccount = nextAccount
-                // 更新配置中的选定账号
+            // 已尝试所有端点，切换到没试过的下个账号
+            const nextAccount = switchToNextAccount()
+            if (nextAccount && !triedIds.has(nextAccount.id)) {
+              console.log(`[ProxyServer] Auto-switching to ${nextAccount.email || nextAccount.id.slice(0, 8)} due to quota exhausted`)
+              currentAccount = nextAccount
+              triedIds.add(nextAccount.id)
+              if (!this.config.enableMultiAccount) {
                 this.config.selectedAccountIds = [nextAccount.id]
                 this.events.onAccountUpdate?.(nextAccount)
               }
@@ -1396,9 +1407,19 @@ export class ProxyServer {
           continue
         }
 
-        // 5xx: 重试
+        // 5xx: 同账号短退避重试一次；再次 5xx 直接 fallback 到没试过的账号（瞬时故障跨账号绕过）
         if (errMsg.includes('500') || errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('504')) {
           console.log('[ProxyServer] Server error, retrying')
+          // 第二次及以后的 5xx → 切换账号（旧逻辑会同账号撞死）
+          if (attempt > 0) {
+            const nextAccount = switchToNextAccount()
+            if (nextAccount && !triedIds.has(nextAccount.id)) {
+              console.log(`[ProxyServer] Persistent 5xx on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`)
+              currentAccount = nextAccount
+              triedIds.add(nextAccount.id)
+              continue
+            }
+          }
           await this.waitForRetry(retryDelay * (attempt + 1), signal)
           continue
         }
