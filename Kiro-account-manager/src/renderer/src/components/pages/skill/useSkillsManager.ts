@@ -212,28 +212,69 @@ export function useSkillsManager(isEn: boolean) {
   const runDelete = useCallback(
     async (allAgents = false, names = selected) => {
       if (!currentAgent || names.length === 0) return
-      const confirmed = await modal.confirm({
-        title: isEn ? 'Delete skills?' : '确认删除 skills？',
-        content: isEn
-          ? `Delete ${names.length} skill(s)? Related auto-update settings will be removed.`
-          : `确定删除 ${names.length} 个 skill 吗？相关自动更新配置会被清理。`
-      })
-      if (!confirmed) return
 
-      setBusy('delete')
-      const result = await window.api.skillsDelete({
-        agent: currentAgent.id,
-        skillNames: names,
-        allAgents
-      })
-      setBusy(null)
-      if (result.success) {
-        message.success(isEn ? 'Deleted' : '已删除')
-        setSelected([])
-        await load()
-        return
+      // 找到要删除的 skill 对象
+      const skillsToDelete = (currentAgent.skills || []).filter((s) => names.includes(s.name))
+
+      for (const skill of skillsToDelete) {
+        if (skill.installType === 'plugin') {
+          // Plugin skill：获取 plugin 信息，确认删除整个 plugin
+          const info = await window.api.skillsGetPluginDeleteInfo({
+            skillName: skill.name,
+            pluginName: skill.pluginName || '',
+            marketplace: skill.source || ''
+          })
+          if (!info) {
+            message.error(isEn ? 'Failed to get plugin info' : '获取插件信息失败')
+            continue
+          }
+          const confirmed = await modal.confirm({
+            title: isEn ? 'Delete plugin?' : '删除插件？',
+            okText: isEn ? 'Delete' : '删除',
+            cancelText: isEn ? 'Cancel' : '取消',
+            content: info.skillNames.length <= 1
+              ? (isEn
+                ? `Delete plugin "${info.pluginName}" (v${info.version})?`
+                : `确定删除插件「${info.pluginName}」(v${info.version})？`)
+              : (isEn
+                ? `Deleting plugin "${info.pluginName}" (v${info.version}) will also remove: ${info.skillNames.join(', ')}`
+                : `删除插件「${info.pluginName}」(v${info.version}) 会同时移除以下技能：${info.skillNames.join('、')}`)
+          })
+          if (!confirmed) continue
+
+          setBusy('delete')
+          const result = await window.api.skillsDeletePlugin(info)
+          setBusy(null)
+          if (!result.success) {
+            message.error(result.error || (isEn ? 'Delete failed' : '删除失败'))
+          } else {
+            message.success(isEn ? 'Plugin deleted' : '插件已删除')
+          }
+        } else {
+          // 非 plugin skill：确认从所有 agent 删除
+          const confirmed = await modal.confirm({
+            title: isEn ? 'Delete skill?' : '删除技能？',
+            okText: isEn ? 'Delete' : '删除',
+            cancelText: isEn ? 'Cancel' : '取消',
+            content: isEn
+              ? `This will delete "${skill.name}" from all agents (excluding plugin-installed copies). Auto-update settings will be removed.`
+              : `将从所有 Agent 中删除「${skill.name}」（不包括插件中的副本）。相关自动更新配置会被清理。`
+          })
+          if (!confirmed) continue
+
+          setBusy('delete')
+          const result = await window.api.skillsDeleteSkill({ skillName: skill.name })
+          setBusy(null)
+          if (!result.success) {
+            message.error(result.error || (isEn ? 'Delete failed' : '删除失败'))
+          } else {
+            message.success(isEn ? 'Deleted' : '已删除')
+          }
+        }
       }
-      message.error(result.error || (isEn ? 'Delete failed' : '删除失败'))
+
+      setSelected([])
+      await load()
     },
     [currentAgent, isEn, load, message, modal, selected]
   )
@@ -241,6 +282,17 @@ export function useSkillsManager(isEn: boolean) {
   const runSync = useCallback(
     async (skillNames = selected, targetAgents = effectiveSyncTargets) => {
       if (!currentAgent || skillNames.length === 0 || targetAgents.length === 0) return
+
+      const confirmed = await modal.confirm({
+        title: isEn ? 'Sync skills?' : '同步技能？',
+        okText: isEn ? 'Sync' : '同步',
+        cancelText: isEn ? 'Cancel' : '取消',
+        content: isEn
+          ? `Sync "${skillNames.join(', ')}" to ${targetAgents.length} agent(s)?`
+          : `将「${skillNames.join('、')}」同步到 ${targetAgents.length} 个 Agent？`
+      })
+      if (!confirmed) return
+
       setBusy('sync')
       const result = await window.api.skillsSync({
         sourceAgent: currentAgent.id,
@@ -256,7 +308,7 @@ export function useSkillsManager(isEn: boolean) {
       }
       message.error(result.error || (isEn ? 'Sync failed' : '同步失败'))
     },
-    [currentAgent, effectiveSyncTargets, isEn, load, message, selected]
+    [currentAgent, effectiveSyncTargets, isEn, load, message, modal, selected]
   )
 
   const runSyncFromAgent = useCallback(
@@ -286,17 +338,66 @@ export function useSkillsManager(isEn: boolean) {
   const runUpdate = useCallback(
     async (skillNames = selected) => {
       if (!currentAgent || skillNames.length === 0) return
-      setBusy('update')
-      const result = await window.api.skillsUpdate({ agent: currentAgent.id, skillNames })
-      setBusy(null)
-      if (result.success) {
-        message.success(isEn ? 'Update complete' : '更新完成')
-        await load()
-        return
+
+      const skillsToUpdate = (currentAgent.skills || []).filter((s) => skillNames.includes(s.name))
+      const hasPlugin = skillsToUpdate.some((s) => s.installType === 'plugin')
+      const hasNonPlugin = skillsToUpdate.some((s) => s.installType !== 'plugin')
+
+      // 确认弹窗
+      let confirmMsg = ''
+      if (hasPlugin && hasNonPlugin) {
+        confirmMsg = isEn
+          ? `Update ${skillNames.length} skill(s)? Plugin skills will pull marketplace first.`
+          : `确定更新 ${skillNames.length} 个技能？插件技能会先拉取市场最新版本。`
+      } else if (hasPlugin) {
+        confirmMsg = isEn
+          ? `Update plugin? This will pull marketplace and reinstall.`
+          : `确定更新插件？会先拉取市场最新版本再重新安装。`
+      } else {
+        confirmMsg = isEn
+          ? `Update "${skillNames.join(', ')}" across all agents?`
+          : `所有 Agent 中的「${skillNames.join('、')}」技能会一起更新。`
       }
-      message.error(result.error || (isEn ? 'Update failed' : '更新失败'))
+
+      const confirmed = await modal.confirm({
+        title: isEn ? 'Update skills?' : '更新技能？',
+        okText: isEn ? 'Update' : '更新',
+        cancelText: isEn ? 'Cancel' : '取消',
+        content: confirmMsg
+      })
+      if (!confirmed) return
+
+      setBusy('update')
+      let allSuccess = true
+
+      for (const name of skillNames) {
+        const skill = skillsToUpdate.find((s) => s.name === name)
+
+        if (skill?.installType === 'plugin') {
+          const result = await window.api.skillsUpdatePlugin({
+            pluginName: skill.pluginName || '',
+            marketplace: skill.source || ''
+          })
+          if (!result.success) {
+            message.error(`${name}: ${result.error || (isEn ? 'Update failed' : '更新失败')}`)
+            allSuccess = false
+          }
+        } else {
+          const result = await window.api.skillsUpdateSkill({ skillName: name })
+          if (!result.success) {
+            message.error(`${name}: ${result.error || (isEn ? 'Update failed' : '更新失败')}`)
+            allSuccess = false
+          }
+        }
+      }
+
+      setBusy(null)
+      if (allSuccess) {
+        message.success(isEn ? 'Update complete' : '更新完成')
+      }
+      await load()
     },
-    [currentAgent, isEn, load, message, selected]
+    [currentAgent, isEn, load, message, modal, selected]
   )
 
   const runCheck = useCallback(

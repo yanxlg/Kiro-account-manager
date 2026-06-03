@@ -44,7 +44,7 @@ export function InstallModal(props: InstallModalProps): React.ReactNode {
       width={720}
       destroyOnHidden
     >
-      <Space direction="vertical" size={16} className="w-full">
+      <Space orientation="vertical" size={16} className="w-full">
         <div>
           <Typography.Text strong>{isEn ? 'Source' : '来源'}</Typography.Text>
           <Input

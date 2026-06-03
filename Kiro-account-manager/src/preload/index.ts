@@ -1339,6 +1339,26 @@ const api = {
     return ipcRenderer.invoke('skills:get-last-batch-result')
   },
 
+  skillsDeleteSkill: (input: { skillName: string }): Promise<unknown> => {
+    return ipcRenderer.invoke('skills:delete-skill', input)
+  },
+
+  skillsGetPluginDeleteInfo: (input: { skillName: string; pluginName: string; marketplace: string }): Promise<unknown> => {
+    return ipcRenderer.invoke('skills:get-plugin-delete-info', input)
+  },
+
+  skillsDeletePlugin: (input: { pluginKey: string; pluginName: string; marketplace: string; installPath: string; skillNames: string[] }): Promise<unknown> => {
+    return ipcRenderer.invoke('skills:delete-plugin', input)
+  },
+
+  skillsUpdateSkill: (input: { skillName: string }): Promise<unknown> => {
+    return ipcRenderer.invoke('skills:update-skill', input)
+  },
+
+  skillsUpdatePlugin: (input: { pluginName: string; marketplace: string }): Promise<unknown> => {
+    return ipcRenderer.invoke('skills:update-plugin', input)
+  },
+
   // Skills Auto-Update Push Event Listeners
   onSkillsUpdateStatusChanged: (callback: (event: { agent: string; skillName: string; status: string; reason?: string }) => void): (() => void) => {
     const handler = (_event: Electron.IpcRendererEvent, data: { agent: string; skillName: string; status: string; reason?: string }): void => {

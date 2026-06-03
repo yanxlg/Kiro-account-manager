@@ -1,4 +1,4 @@
-import { cp, lstat, mkdir, readFile, realpath, rm, stat, symlink } from 'fs/promises'
+import { cp, lstat, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from 'fs/promises'
 import { basename, dirname, join, relative, resolve } from 'path'
 import {
   agentDefinitions,
@@ -19,7 +19,7 @@ import {
   normalizeSkillsManagerConfig
 } from './config'
 import { isPathSafe, pathExists, readSkillDirs } from './filesystem'
-import { getGitHubTree, lockForSkill, readGlobalLock, removeGlobalLockEntry } from './lock'
+import { getGitHubTree, lockForSkill, readGlobalLock, removeGlobalLockEntry, addGlobalLockEntry } from './lock'
 import type {
   SkillUpdateStatus,
   SkillsAgentView,
@@ -282,12 +282,84 @@ async function findSkillSourceDir(sourceAgentId: string, skillName: string): Pro
     )
     if (match) return match.dir
   }
+
+  // For Claude Code, also search plugin cache directories
+  if (sourceAgentId === 'claude-code') {
+    const pluginsJsonPath = join(claudeHome, 'plugins', 'installed_plugins.json')
+    try {
+      const raw = await readFile(pluginsJsonPath, 'utf-8')
+      const data = JSON.parse(raw) as {
+        plugins?: Record<string, Array<{ installPath?: string }>>
+      }
+      if (data.plugins) {
+        for (const installations of Object.values(data.plugins)) {
+          const install = installations[0]
+          if (!install?.installPath) continue
+          const skillsDir = join(install.installPath, 'skills')
+          const entries = await readSkillDirs(skillsDir).catch(() => [])
+          const match = entries.find(
+            (skill) =>
+              normalizeSkillName(skill.name) === normalized ||
+              normalizeSkillName(basename(skill.dir)) === normalized
+          )
+          if (match) return match.dir
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   return null
 }
 
 async function listCanonicalSkillNames(): Promise<string[]> {
   const skills = await readSkillDirs(canonicalGlobalSkillsDir)
   return skills.map((skill) => skill.name)
+}
+
+/**
+ * 为从 plugin cache 同步过来的 skill 构建 lock entry。
+ * 从 known_marketplaces.json 和 installed_plugins.json 推断 source 信息。
+ */
+async function ensurePluginSkillLockEntry(skillName: string, sourceDir: string): Promise<void> {
+  try {
+    // 从 sourceDir 路径解析 marketplace 和 plugin 信息
+    // 路径格式: ~/.claude/plugins/cache/{marketplace}/{pluginName}/{version}/skills/{skillName}
+    const cacheIndex = sourceDir.indexOf('/plugins/cache/')
+    if (cacheIndex === -1) return
+    const afterCache = sourceDir.slice(cacheIndex + '/plugins/cache/'.length)
+    const parts = afterCache.split('/')
+    if (parts.length < 2) return
+    const marketplace = parts[0]
+    const pluginName = parts[1]
+
+    // 读取 marketplace 配置获取 git url 和 ref
+    const knownPath = join(claudeHome, 'plugins', 'known_marketplaces.json')
+    const knownRaw = await readFile(knownPath, 'utf-8')
+    const known = JSON.parse(knownRaw) as Record<string, { source?: { url?: string; ref?: string } }>
+    const marketplaceInfo = known[marketplace]
+    if (!marketplaceInfo?.source?.url) return
+
+    const gitUrl = marketplaceInfo.source.url
+    const ref = marketplaceInfo.source.ref || ''
+
+    // 构建 skillPath（在 marketplace 仓库中的路径）
+    // 先试 {pluginName}/skills/{skillName}/SKILL.md，再试 plugins/{pluginName}/skills/{skillName}/SKILL.md
+    const skillPath = `${pluginName}/skills/${skillName}/SKILL.md`
+
+    await addGlobalLockEntry(skillName, {
+      source: gitUrl,
+      sourceType: 'git',
+      sourceUrl: gitUrl,
+      ref: ref || undefined,
+      skillPath,
+      installedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    })
+  } catch {
+    // 构建 lock entry 失败不影响同步操作
+  }
 }
 
 async function refreshExistingSkillProjections(
@@ -334,6 +406,13 @@ export async function syncSkills(
       continue
     }
     await ensureCanonicalSkillDir(skillName, sourceDir, input.overwrite)
+
+    // If source is from plugin cache, ensure a lock entry exists for version tracking
+    const existingLock = await readGlobalLock()
+    if (!lockForSkill(existingLock, skillName) && sourceDir.includes('/plugins/cache/')) {
+      await ensurePluginSkillLockEntry(skillName, sourceDir)
+    }
+
     for (const targetAgentId of input.targetAgents) {
       const targetAgent = getAgentById(targetAgentId)
       if (!targetAgent) {
@@ -354,6 +433,8 @@ export async function syncSkills(
             agent: targetAgentId,
             skillName,
             autoUpdate: config.defaultAutoUpdate,
+            lastCheckStatus: 'latest',
+            lastCheckedAt: new Date().toISOString(),
             createdAt: now,
             updatedAt: now
           }
@@ -411,6 +492,160 @@ export async function deleteSkills(
 
   saveConfig(config)
   return { success: true, results }
+}
+
+/**
+ * 删除非 plugin 的 skill：从所有 agent 目录中删除同名 skill（含 canonical 和软链）。
+ * 不删除 plugin 中的 skill。
+ */
+export async function deleteSkillFromAllAgents(
+  input: { skillName: string },
+  configValue: unknown,
+  saveConfig: (config: SkillsManagerConfig) => void
+): Promise<SkillsOperationResult> {
+  const config = normalizeSkillsManagerConfig(configValue)
+  const normalized = normalizeSkillName(input.skillName)
+  const results: NonNullable<SkillsOperationResult['results']> = []
+
+  // 删除所有已安装 agent 目录中的同名 skill
+  const agents = getInstalledAgentDefinitions()
+  for (const agent of agents) {
+    for (const baseDir of getAgentSkillDirs(agent)) {
+      const target = join(baseDir, normalized)
+      if (!isPathSafe(baseDir, target)) continue
+      if (await pathExists(target)) {
+        await rm(target, { recursive: true, force: true }).catch(() => undefined)
+        results.push({ skillName: input.skillName, agent: agent.id, success: true })
+      }
+    }
+    // 清理该 agent 的 skill config
+    delete config.skillConfigs[getSkillConfigKey(agent.id, input.skillName)]
+  }
+
+  // 删除 canonical 目录
+  await rm(join(canonicalGlobalSkillsDir, normalized), { recursive: true, force: true }).catch(() => undefined)
+
+  // 删除 lock 记录
+  await removeGlobalLockEntry(input.skillName)
+
+  // 清理所有相关 config
+  for (const key of Object.keys(config.skillConfigs)) {
+    if (key.endsWith(`:${normalized}`)) delete config.skillConfigs[key]
+  }
+
+  saveConfig(config)
+  return { success: true, results }
+}
+
+export interface PluginDeleteInfo {
+  pluginKey: string        // e.g. "sh_announcement_skill@shuhe-claude-plugins"
+  pluginName: string       // e.g. "sh_announcement_skill"
+  marketplace: string      // e.g. "shuhe-claude-plugins"
+  version: string
+  skillNames: string[]     // 该 plugin 下的所有 skill 名称
+  installPath: string
+}
+
+/**
+ * 获取某个 plugin skill 所属 plugin 的完整信息（用于确认弹窗）。
+ */
+export async function getPluginDeleteInfo(
+  input: { skillName: string; pluginName: string; marketplace: string }
+): Promise<PluginDeleteInfo | null> {
+  const pluginsJsonPath = join(claudeHome, 'plugins', 'installed_plugins.json')
+  try {
+    const raw = await readFile(pluginsJsonPath, 'utf-8')
+    const data = JSON.parse(raw) as {
+      plugins?: Record<string, Array<{ installPath?: string; version?: string }>>
+    }
+    if (!data.plugins) return null
+
+    const pluginKey = `${input.pluginName}@${input.marketplace}`
+    console.log(`[Skills] getPluginDeleteInfo: looking for key="${pluginKey}"`)
+    console.log(`[Skills] Available keys:`, Object.keys(data.plugins).join(', '))
+    const installations = data.plugins[pluginKey]
+    if (!installations || installations.length === 0) {
+      console.log(`[Skills] Plugin key not found in installed_plugins.json`)
+      return null
+    }
+
+    const install = installations[0]
+    if (!install.installPath) return null
+
+    // 扫描该 plugin 的 skills 目录获取所有 skill 名称
+    const skillsDir = join(install.installPath, 'skills')
+    const skills = await readSkillDirs(skillsDir).catch(() => [])
+
+    return {
+      pluginKey,
+      pluginName: input.pluginName,
+      marketplace: input.marketplace,
+      version: install.version || '',
+      skillNames: skills.map((s) => s.name),
+      installPath: install.installPath
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 删除 plugin：从 installed_plugins.json 移除条目，删除 cache 目录，清理 config。
+ */
+export async function deletePlugin(
+  input: { pluginKey: string; pluginName: string; marketplace: string; installPath: string; skillNames: string[] },
+  configValue: unknown,
+  saveConfig: (config: SkillsManagerConfig) => void
+): Promise<SkillsOperationResult> {
+  const config = normalizeSkillsManagerConfig(configValue)
+
+  // 1. 从 installed_plugins.json 移除该 plugin 条目
+  const pluginsJsonPath = join(claudeHome, 'plugins', 'installed_plugins.json')
+  try {
+    const raw = await readFile(pluginsJsonPath, 'utf-8')
+    const data = JSON.parse(raw) as { version?: number; plugins?: Record<string, unknown> }
+    if (data.plugins && data.plugins[input.pluginKey]) {
+      delete data.plugins[input.pluginKey]
+      await writeFile(pluginsJsonPath, JSON.stringify(data, null, 2), 'utf-8')
+    }
+  } catch (err) {
+    console.error('[Skills] Failed to update installed_plugins.json:', err)
+    // 继续清理其他部分
+  }
+
+  // 2. 删除 cache 下该插件的目录
+  // installPath 格式: ~/.claude/plugins/cache/{marketplace}/{pluginName}/{version}
+  // 删除 pluginName 级目录（包含所有版本）
+  const pluginCacheDir = dirname(input.installPath) // 去掉 version 层
+  if (await pathExists(pluginCacheDir)) {
+    await rm(pluginCacheDir, { recursive: true, force: true }).catch(() => undefined)
+  }
+
+  // 3. 删除 ~/.claude/skills/ 下该 plugin 的所有 skill 目录
+  const claudeSkillsDir = join(claudeHome, 'skills')
+  for (const skillName of input.skillNames) {
+    const normalized = normalizeSkillName(skillName)
+    const skillDir = join(claudeSkillsDir, normalized)
+    if (await pathExists(skillDir)) {
+      await rm(skillDir, { recursive: true, force: true }).catch(() => undefined)
+    }
+    // 也尝试原始名称（未 normalize 的）
+    const rawSkillDir = join(claudeSkillsDir, skillName)
+    if (rawSkillDir !== skillDir && (await pathExists(rawSkillDir))) {
+      await rm(rawSkillDir, { recursive: true, force: true }).catch(() => undefined)
+    }
+  }
+
+  // 4. 清理 config 中该 plugin 下所有 skill 的配置
+  for (const skillName of input.skillNames) {
+    const normalized = normalizeSkillName(skillName)
+    for (const key of Object.keys(config.skillConfigs)) {
+      if (key.endsWith(`:${normalized}`)) delete config.skillConfigs[key]
+    }
+  }
+
+  saveConfig(config)
+  return { success: true }
 }
 
 export async function setSkillAutoUpdate(
@@ -542,21 +777,144 @@ export async function installSkills(
       : input.agents
     if (installedSkillNames.length > 0) {
       await projectSkillsToAgents(installedSkillNames, targetAgentIds, config.defaultInstallMode)
+      // 标记新安装的 skill 为 latest（刚装的肯定是最新的）
+      const now = Date.now()
+      for (const skillName of installedSkillNames) {
+        for (const agentId of targetAgentIds) {
+          const key = getSkillConfigKey(agentId, skillName)
+          config.skillConfigs[key] = {
+            ...config.skillConfigs[key],
+            agent: agentId,
+            skillName,
+            autoUpdate: config.skillConfigs[key]?.autoUpdate ?? config.defaultAutoUpdate,
+            lastCheckStatus: 'latest',
+            lastCheckedAt: new Date().toISOString(),
+            createdAt: config.skillConfigs[key]?.createdAt || now,
+            updatedAt: now
+          }
+        }
+      }
     }
     saveConfig(config)
   }
   return result
 }
 
-export async function updateSkills(input: {
-  agent: string
-  skillNames: string[]
-}, configValue?: unknown): Promise<SkillsOperationResult> {
-  const args = ['update', '-g', '-y', ...input.skillNames]
+/**
+ * 更新非 plugin 的 skill：使用 npx skills add 重新安装指定 skill 到 canonical 目录，然后刷新所有 agent 投射。
+ * 只下载一次，symlink 不需额外操作，copy 重新复制。
+ */
+export async function updateSkillV2(
+  input: { skillName: string },
+  configValue: unknown,
+  saveConfig: (config: SkillsManagerConfig) => void
+): Promise<SkillsOperationResult> {
+  const config = normalizeSkillsManagerConfig(configValue)
+
+  // 从 lock 获取 source 信息，用 add -s 精确更新单个 skill
+  const lock = await readGlobalLock()
+  const entry = lockForSkill(lock, input.skillName)
+  const source = entry?.source || entry?.sourceUrl || ''
+
+  let args: string[]
+  if (source) {
+    // 用 add + -s 精确安装单个 skill（不影响同仓库其他 skill）
+    args = ['add', source, '-g', '-y', '-s', input.skillName]
+  } else {
+    // fallback：用 update（可能会更新同仓库其他 skill）
+    args = ['update', '-g', '-y', input.skillName]
+  }
+
   const result = await runNpxSkills(args)
   if (result.success) {
-    const config = normalizeSkillsManagerConfig(configValue)
-    await refreshExistingSkillProjections(input.skillNames, config.defaultInstallMode)
+    // 刷新所有 agent 的投射（只有 copy 模式需要重新复制）
+    await refreshExistingSkillProjections([input.skillName], config.defaultInstallMode)
+    // 标记为 latest
+    const now = Date.now()
+    const agents = getInstalledAgentDefinitions()
+    for (const agent of agents) {
+      const key = getSkillConfigKey(agent.id, input.skillName)
+      if (config.skillConfigs[key]) {
+        config.skillConfigs[key].lastCheckStatus = 'latest'
+        config.skillConfigs[key].lastCheckReason = undefined
+        config.skillConfigs[key].lastCheckedAt = new Date().toISOString()
+        config.skillConfigs[key].updatedAt = now
+      }
+    }
+    saveConfig(config)
   }
   return result
+}
+
+/**
+ * 更新 plugin：先 pull marketplace，再 claude plugin install 覆盖安装。
+ */
+export async function updatePlugin(
+  input: { pluginName: string; marketplace: string },
+  configValue: unknown,
+  saveConfig: (config: SkillsManagerConfig) => void
+): Promise<SkillsOperationResult> {
+  // 读取 marketplace 配置获取本地目录
+  const knownPath = join(claudeHome, 'plugins', 'known_marketplaces.json')
+  let marketplaceDir: string
+  try {
+    const raw = await readFile(knownPath, 'utf-8')
+    const data = JSON.parse(raw) as Record<string, { installLocation?: string }>
+    const entry = data[input.marketplace]
+    if (!entry?.installLocation) {
+      return { success: false, error: `未找到 marketplace: ${input.marketplace}` }
+    }
+    marketplaceDir = entry.installLocation
+  } catch {
+    return { success: false, error: '无法读取 marketplace 配置' }
+  }
+
+  // 1. git pull marketplace 目录
+  const { spawn } = await import('child_process')
+  const pullResult = await new Promise<{ success: boolean; error?: string }>((resolve) => {
+    const child = spawn('git', ['pull'], { cwd: marketplaceDir })
+    let output = ''
+    child.stdout?.on('data', (d) => { output += String(d) })
+    child.stderr?.on('data', (d) => { output += String(d) })
+    child.on('error', (e) => resolve({ success: false, error: e.message }))
+    child.on('close', (code) => resolve({ success: code === 0, error: code !== 0 ? output : undefined }))
+  })
+
+  if (!pullResult.success) {
+    return { success: false, error: `git pull 失败: ${pullResult.error}` }
+  }
+
+  // 2. claude plugin install <pluginName>@<marketplace>
+  const installResult = await new Promise<{ success: boolean; message?: string; error?: string }>((resolve) => {
+    const pluginArg = `${input.pluginName}@${input.marketplace}`
+    const child = spawn('claude', ['plugin', 'install', pluginArg], {
+      cwd: marketplaceDir,
+      env: { ...process.env }
+    })
+    let output = ''
+    child.stdout?.on('data', (d) => { output += String(d) })
+    child.stderr?.on('data', (d) => { output += String(d) })
+    child.on('error', (e) => resolve({ success: false, error: e.message }))
+    child.on('close', (code) => resolve({
+      success: code === 0,
+      message: output.trim(),
+      error: code !== 0 ? output.trim() || `claude plugin install exited with ${code}` : undefined
+    }))
+  })
+
+  if (installResult.success) {
+    // 标记为 latest
+    const config = normalizeSkillsManagerConfig(configValue)
+    const now = Date.now()
+    const key = getSkillConfigKey('claude-code', input.pluginName)
+    if (config.skillConfigs[key]) {
+      config.skillConfigs[key].lastCheckStatus = 'latest'
+      config.skillConfigs[key].lastCheckReason = undefined
+      config.skillConfigs[key].lastCheckedAt = new Date().toISOString()
+      config.skillConfigs[key].updatedAt = now
+    }
+    saveConfig(config)
+  }
+
+  return installResult
 }

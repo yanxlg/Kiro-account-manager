@@ -121,6 +121,7 @@ export function SettingsModal(props: SettingsModalProps): React.ReactNode {
           </div>
           <div className="mt-3">
             <Input.Password
+              variant="filled"
               placeholder={isEn ? 'GitLab Personal Access Token' : 'GitLab 个人访问令牌'}
               value={draftGitlabToken}
               onChange={(e) => setDraftGitlabToken(e.target.value)}
@@ -137,6 +138,7 @@ export function SettingsModal(props: SettingsModalProps): React.ReactNode {
           </div>
           <div className="mt-3">
             <Input.Password
+              variant="filled"
               placeholder={isEn ? 'GitHub Personal Access Token' : 'GitHub 个人访问令牌'}
               value={draftGithubToken}
               onChange={(e) => setDraftGithubToken(e.target.value)}
@@ -153,6 +155,7 @@ export function SettingsModal(props: SettingsModalProps): React.ReactNode {
           </div>
           <div className="mt-3 flex items-center gap-2">
             <InputNumber
+              variant="filled"
               min={30}
               max={1440}
               value={draftCheckInterval}

@@ -570,13 +570,14 @@
 }
 
 /* ==================== 表单控件全局兜底（深色边框，玻璃背景上可见） ==================== */
-input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]),
-textarea,
+/* 排除 antd filled variant 的输入框（它们有 ant-input-filled 类名，不需要边框） */
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not(.ant-input-filled):not(.ant-input-number-input),
+textarea:not(.ant-input-filled),
 select {
   border-color: rgba(15, 23, 42, 0.15);
 }
-.dark input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]),
-.dark textarea,
+.dark input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not(.ant-input-filled):not(.ant-input-number-input),
+.dark textarea:not(.ant-input-filled),
 .dark select {
   border-color: rgba(255, 255, 255, 0.15);
 }

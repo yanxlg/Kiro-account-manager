@@ -14,6 +14,7 @@ import {
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import {
+  ArrowUpToLine,
   Copy,
   PackagePlus,
   Radar,
@@ -234,14 +235,15 @@ export function SkillsPage(): React.ReactNode {
                   <Button size="small" type="text" icon={<Radar className="h-3.5 w-3.5" />} onClick={() => void runCheck(skill.name)} />
                 </Tooltip>
                 <Tooltip title={isEn ? 'Update' : '更新'}>
-                  <Button size="small" type="text" icon={<RotateCw className="h-3.5 w-3.5" />} onClick={() => void runUpdate([skill.name])} />
+                  <Button size="small" type="text" loading={busy === 'update'} icon={<ArrowUpToLine className="h-3.5 w-3.5" />} disabled={updateStatuses[`${skill.agent}:${skill.name}`]?.status !== 'available'} onClick={() => void runUpdate([skill.name])} />
                 </Tooltip>
               </>
             ) : null}
-            <Tooltip title={isEn ? 'Sync to all' : '同步到全部'}>
+            <Tooltip title={isEn ? 'Sync to all agents' : '同步到所有 Agent'}>
               <Button
                 size="small"
                 type="text"
+                loading={busy === 'sync'}
                 icon={<Copy className="h-3.5 w-3.5" />}
                 onClick={() => void runSync([skill.name], otherAgents.map((agent) => agent.id))}
               />
@@ -370,7 +372,7 @@ export function SkillsPage(): React.ReactNode {
           title={() => (
             <div className="flex flex-wrap items-center gap-2">
               <Tag color="blue">{isEn ? 'Selected' : '已选'} {selected.length}</Tag>
-              <Button icon={<RotateCw className="h-4 w-4" />} disabled={selected.length === 0} onClick={() => void runUpdate()}>
+              <Button icon={<ArrowUpToLine className="h-4 w-4" />} disabled={selected.length === 0} onClick={() => void runUpdate()}>
                 {isEn ? 'Batch update' : '批量更新'}
               </Button>
               <Button danger icon={<Trash2 className="h-4 w-4" />} disabled={selected.length === 0} onClick={() => void runDelete(false)}>

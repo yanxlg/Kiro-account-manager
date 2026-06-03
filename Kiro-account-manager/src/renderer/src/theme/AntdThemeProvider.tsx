@@ -1,5 +1,6 @@
 import { type PropsWithChildren, useEffect, useMemo, useState } from 'react'
 import { App as AntdApp, ConfigProvider, theme as antdTheme } from 'antd'
+import zhCN from 'antd/locale/zh_CN'
 
 function readCssVar(name: string, fallback: string): string {
   if (typeof window === 'undefined') return fallback
@@ -120,7 +121,7 @@ export function AntdThemeProvider({ children }: PropsWithChildren): React.ReactN
   }, [themeVersion])
 
   return (
-    <ConfigProvider theme={themeConfig}>
+    <ConfigProvider theme={themeConfig} locale={zhCN}>
       <AntdApp>{children}</AntdApp>
     </ConfigProvider>
   )

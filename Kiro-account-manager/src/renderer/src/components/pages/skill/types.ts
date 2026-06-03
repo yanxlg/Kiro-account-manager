@@ -30,6 +30,7 @@ export interface SkillsSkillView {
   sourceUrl?: string
   ref?: string
   path: string
+  pluginName?: string
   autoUpdate: boolean
   updateStatus?: SkillUpdateStatus
   updateReason?: string

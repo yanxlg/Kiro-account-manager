@@ -42,6 +42,12 @@ export async function removeGlobalLockEntry(skillName: string): Promise<void> {
   }
 }
 
+export async function addGlobalLockEntry(skillName: string, entry: LockEntry): Promise<void> {
+  const lock = await readGlobalLock()
+  lock[skillName] = entry
+  await writeGlobalLockSkills(lock)
+}
+
 export function lockForSkill(
   lock: Record<string, LockEntry>,
   skillName: string

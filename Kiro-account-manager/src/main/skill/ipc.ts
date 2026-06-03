@@ -2,14 +2,18 @@ import { ipcMain } from 'electron'
 import {
   checkSkillUpdate,
   defaultSkillsManagerConfig,
+  deletePlugin,
+  deleteSkillFromAllAgents,
   deleteSkills,
+  getPluginDeleteInfo,
   installSkills,
   listSkillsState,
   normalizeSkillsManagerConfig,
   saveSkillsConfigPatch,
   setSkillAutoUpdate,
   syncSkills,
-  updateSkills,
+  updatePlugin,
+  updateSkillV2,
   type SkillsManagerConfig
 } from './service'
 import { validateCheckInterval, batchSetAutoUpdate } from './config'
@@ -75,18 +79,22 @@ export function registerSkillsManagerIpcHandlers(
   })
 
   ipcMain.handle('skills:check-update', async (_event, input: { agent: string; skillName: string }) => {
+    const scheduler = getScheduler?.()
+    if (scheduler) {
+      try {
+        const results = await scheduler.triggerCheck(input.agent, input.skillName)
+        const result = results[0]
+        if (result) return { success: true, status: result.status, reason: result.reason }
+        return { success: true, status: 'unknown' }
+      } catch (error) {
+        return { success: false, status: 'failed', reason: error instanceof Error ? error.message : String(error) }
+      }
+    }
+    // Fallback to old logic if scheduler not available
     try {
       return await checkSkillUpdate(input, readConfig())
     } catch (error) {
       return { success: false, status: 'failed', reason: error instanceof Error ? error.message : String(error) }
-    }
-  })
-
-  ipcMain.handle('skills:update', async (_event, input: { agent: string; skillNames: string[] }) => {
-    try {
-      return await updateSkills(input, readConfig())
-    } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : String(error) }
     }
   })
 
@@ -186,5 +194,48 @@ export function registerSkillsManagerIpcHandlers(
       return null
     }
     return scheduler.getLastBatchResult()
+  })
+
+  // --- Delete V2 Handlers ---
+
+  ipcMain.handle('skills:delete-skill', async (_event, input: { skillName: string }) => {
+    try {
+      return await deleteSkillFromAllAgents(input, readConfig(), saveConfig)
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('skills:get-plugin-delete-info', async (_event, input: { skillName: string; pluginName: string; marketplace: string }) => {
+    try {
+      return await getPluginDeleteInfo(input)
+    } catch (error) {
+      return null
+    }
+  })
+
+  ipcMain.handle('skills:delete-plugin', async (_event, input: { pluginKey: string; pluginName: string; marketplace: string; installPath: string; skillNames: string[] }) => {
+    console.log('[Skills] deletePlugin called with:', JSON.stringify(input))
+    try {
+      return await deletePlugin(input, readConfig(), saveConfig)
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('skills:update-skill', async (_event, input: { skillName: string }) => {
+    try {
+      return await updateSkillV2(input, readConfig(), saveConfig)
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('skills:update-plugin', async (_event, input: { pluginName: string; marketplace: string }) => {
+    try {
+      return await updatePlugin(input, readConfig(), saveConfig)
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
   })
 }
