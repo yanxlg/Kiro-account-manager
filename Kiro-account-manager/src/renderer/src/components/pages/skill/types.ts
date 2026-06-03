@@ -6,6 +6,8 @@ export interface SkillsManagerConfig {
   defaultAutoUpdate: boolean
   defaultInstallMode: SkillInstallMode
   gitlabToken?: string
+  githubToken?: string
+  checkIntervalMinutes?: number
   skillConfigs: Record<
     string,
     {
@@ -26,8 +28,13 @@ export interface SkillsSkillView {
   source?: string
   sourceType?: string
   sourceUrl?: string
+  ref?: string
   path: string
   autoUpdate: boolean
+  updateStatus?: SkillUpdateStatus
+  updateReason?: string
+  version?: string
+  installType?: 'skills' | 'plugin'
 }
 
 export interface SkillsAgentView {

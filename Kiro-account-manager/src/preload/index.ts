@@ -431,7 +431,7 @@ const api = {
   },
 
   // ============ 自动更新 ============
-  
+
   // 检查更新 (electron-updater)
   checkForUpdates: (): Promise<{
     hasUpdate: boolean
@@ -898,7 +898,7 @@ const api = {
   },
 
   // ============ API Key 管理 ============
-  
+
   // 获取所有 API Keys
   proxyGetApiKeys: (): Promise<{ success: boolean; apiKeys: Array<{ id: string; name: string; key: string; enabled: boolean; createdAt: number; lastUsedAt?: number; usage: { totalRequests: number; totalCredits: number; totalInputTokens: number; totalOutputTokens: number; daily: Record<string, { requests: number; credits: number; inputTokens: number; outputTokens: number }> } }>; error?: string }> => {
     return ipcRenderer.invoke('proxy-get-api-keys')
@@ -1014,7 +1014,7 @@ const api = {
   getShowWindowShortcut: (): Promise<string> => ipcRenderer.invoke('get-show-window-shortcut'),
 
   // 设置显示主窗口快捷键
-  setShowWindowShortcut: (shortcut: string): Promise<{ success: boolean; error?: string }> => 
+  setShowWindowShortcut: (shortcut: string): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke('set-show-window-shortcut', shortcut),
 
   // 获取托盘设置
@@ -1309,6 +1309,65 @@ const api = {
 
   skillsSync: (input: { sourceAgent: string; skillNames: string[]; targetAgents: string[]; overwrite?: boolean }): Promise<unknown> => {
     return ipcRenderer.invoke('skills:sync', input)
+  },
+
+  skillsCheckUpdateBatch: (input: { agent?: string }): Promise<unknown> => {
+    return ipcRenderer.invoke('skills:check-update-batch', input)
+  },
+
+  skillsSetCheckInterval: (input: { minutes: number }): Promise<unknown> => {
+    return ipcRenderer.invoke('skills:set-check-interval', input)
+  },
+
+  skillsBatchSetAutoUpdate: (input: { skillKeys: string[]; enabled: boolean }): Promise<unknown> => {
+    return ipcRenderer.invoke('skills:batch-set-auto-update', input)
+  },
+
+  skillsNormalize: (): Promise<unknown> => {
+    return ipcRenderer.invoke('skills:normalize')
+  },
+
+  skillsConvertToSymlink: (input: { agentId: string }): Promise<unknown> => {
+    return ipcRenderer.invoke('skills:convert-symlink', input)
+  },
+
+  skillsGetUpdateHistory: (input: { skillName: string }): Promise<unknown> => {
+    return ipcRenderer.invoke('skills:get-update-history', input)
+  },
+
+  skillsGetLastBatchResult: (): Promise<unknown> => {
+    return ipcRenderer.invoke('skills:get-last-batch-result')
+  },
+
+  // Skills Auto-Update Push Event Listeners
+  onSkillsUpdateStatusChanged: (callback: (event: { agent: string; skillName: string; status: string; reason?: string }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: { agent: string; skillName: string; status: string; reason?: string }): void => {
+      callback(data)
+    }
+    ipcRenderer.on('skills:update-status-changed', handler)
+    return () => {
+      ipcRenderer.removeListener('skills:update-status-changed', handler)
+    }
+  },
+
+  onSkillsBatchUpdateCompleted: (callback: (event: { successes: Array<{ agent: string; skillName: string; previousHash: string; newHash: string }>; failures: Array<{ agent: string; skillName: string; reason: string }>; timestamp: string }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: { successes: Array<{ agent: string; skillName: string; previousHash: string; newHash: string }>; failures: Array<{ agent: string; skillName: string; reason: string }>; timestamp: string }): void => {
+      callback(data)
+    }
+    ipcRenderer.on('skills:batch-update-completed', handler)
+    return () => {
+      ipcRenderer.removeListener('skills:batch-update-completed', handler)
+    }
+  },
+
+  onSkillsCheckProgress: (callback: (event: { agent: string; skillName: string; checking: boolean }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: { agent: string; skillName: string; checking: boolean }): void => {
+      callback(data)
+    }
+    ipcRenderer.on('skills:check-progress', handler)
+    return () => {
+      ipcRenderer.removeListener('skills:check-progress', handler)
+    }
   },
 
   // 监听注册日志

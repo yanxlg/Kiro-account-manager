@@ -1,8 +1,9 @@
-import { cp, lstat, mkdir, realpath, rm, stat, symlink } from 'fs/promises'
+import { cp, lstat, mkdir, readFile, realpath, rm, stat, symlink } from 'fs/promises'
 import { basename, dirname, join, relative, resolve } from 'path'
 import {
   agentDefinitions,
   canonicalGlobalSkillsDir,
+  claudeHome,
   detectAgent,
   getAgentById,
   getAgentSkillDirs,
@@ -56,6 +57,66 @@ export type {
   SkillsSkillView
 }
 
+/**
+ * Read Claude Code installed plugins from ~/.claude/plugins/installed_plugins.json
+ * and scan their skill directories.
+ */
+async function readClaudePluginSkills(config: SkillsManagerConfig): Promise<SkillsSkillView[]> {
+  const pluginsJsonPath = join(claudeHome, 'plugins', 'installed_plugins.json')
+  const results: SkillsSkillView[] = []
+
+  try {
+    const raw = await readFile(pluginsJsonPath, 'utf-8')
+    const data = JSON.parse(raw) as {
+      version?: number
+      plugins?: Record<string, Array<{
+        scope?: string
+        installPath?: string
+        version?: string
+        installedAt?: string
+        lastUpdated?: string
+        gitCommitSha?: string
+      }>>
+    }
+
+    if (!data.plugins) return results
+
+    for (const [pluginKey, installations] of Object.entries(data.plugins)) {
+      // Use the latest installation (first in array)
+      const install = installations[0]
+      if (!install?.installPath) continue
+
+      // Scan skills/ subdirectory within the plugin install path
+      const skillsDir = join(install.installPath, 'skills')
+      const skills = await readSkillDirs(skillsDir).catch(() => [])
+
+      for (const skill of skills) {
+        const cfg = config.skillConfigs[getSkillConfigKey('claude-code', skill.name)]
+        results.push({
+          name: skill.name,
+          description: skill.description,
+          agent: 'claude-code',
+          source: pluginKey.split('@')[1] || pluginKey, // marketplace name
+          sourceType: 'plugin',
+          path: skill.dir,
+          installedAt: install.installedAt,
+          updatedAt: install.lastUpdated,
+          pluginName: pluginKey.split('@')[0],
+          version: install.version,
+          installType: 'plugin',
+          autoUpdate: cfg?.autoUpdate ?? false,
+          updateStatus: cfg?.lastCheckStatus || 'unknown',
+          updateReason: cfg?.lastCheckReason
+        })
+      }
+    }
+  } catch {
+    // installed_plugins.json doesn't exist or is malformed
+  }
+
+  return results
+}
+
 export async function listSkillsState(configValue: unknown): Promise<SkillsAgentsResult> {
   const config = normalizeSkillsManagerConfig(configValue)
   const lock = await readGlobalLock()
@@ -87,11 +148,26 @@ export async function listSkillsState(configValue: unknown): Promise<SkillsAgent
             installedAt: lockEntry?.installedAt,
             updatedAt: lockEntry?.updatedAt,
             pluginName: lockEntry?.pluginName,
+            installType: 'skills',
             autoUpdate: cfg?.autoUpdate ?? false,
-            updateStatus: 'unknown'
+            updateStatus: cfg?.lastCheckStatus || 'unknown',
+            updateReason: cfg?.lastCheckReason
           })
         }
       }
+
+      // For Claude Code, also read installed plugins
+      if (agent.id === 'claude-code') {
+        console.log(`[Skills] Claude Code skills dir has ${byName.size} skills before plugin scan`)
+        const pluginSkills = await readClaudePluginSkills(config)
+        for (const ps of pluginSkills) {
+          const key = normalizeSkillName(ps.name)
+          if (byName.has(key)) continue
+          byName.set(key, { ...ps, agent: agent.id })
+        }
+        console.log(`[Skills] Claude Code total after plugin scan: ${byName.size}`)
+      }
+
       const skills = Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name))
       return {
         id: agent.id,

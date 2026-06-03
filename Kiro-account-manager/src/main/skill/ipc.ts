@@ -12,6 +12,12 @@ import {
   updateSkills,
   type SkillsManagerConfig
 } from './service'
+import { validateCheckInterval, batchSetAutoUpdate } from './config'
+import { normalizeSkills } from './normalizer'
+import { convertAgentToSymlink } from './converter'
+import { createHistoryStore } from './history'
+import type { AutoUpdateScheduler } from './scheduler'
+import type { CheckResult } from './detector'
 
 interface StoreLike {
   get: (key: string, defaultValue?: unknown) => unknown
@@ -20,7 +26,10 @@ interface StoreLike {
 
 const STORE_KEY = 'skillsManagerConfig'
 
-export function registerSkillsManagerIpcHandlers(getStore: () => StoreLike | null): void {
+export function registerSkillsManagerIpcHandlers(
+  getStore: () => StoreLike | null,
+  getScheduler?: () => AutoUpdateScheduler | null
+): void {
   const readConfig = (): SkillsManagerConfig => {
     const store = getStore()
     return normalizeSkillsManagerConfig(store?.get(STORE_KEY, defaultSkillsManagerConfig()))
@@ -95,5 +104,87 @@ export function registerSkillsManagerIpcHandlers(getStore: () => StoreLike | nul
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : String(error) }
     }
+  })
+
+  // --- Auto-Update IPC Handlers ---
+
+  ipcMain.handle('skills:check-update-batch', async (_event, input: { agent?: string }): Promise<CheckResult[]> => {
+    const scheduler = getScheduler?.()
+    if (!scheduler) {
+      return []
+    }
+    try {
+      return await scheduler.triggerCheck(input.agent)
+    } catch (error) {
+      return []
+    }
+  })
+
+  ipcMain.handle('skills:set-check-interval', async (_event, input: { minutes: number }) => {
+    const validation = validateCheckInterval(input.minutes)
+    if (!validation.valid) {
+      return { success: false, error: validation.error }
+    }
+
+    try {
+      const config = readConfig()
+      const updatedConfig = { ...config, checkIntervalMinutes: input.minutes }
+      saveConfig(updatedConfig)
+
+      const scheduler = getScheduler?.()
+      if (scheduler) {
+        scheduler.reschedule(input.minutes)
+      }
+
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('skills:batch-set-auto-update', async (_event, input: { skillKeys: string[]; enabled: boolean }) => {
+    try {
+      const config = readConfig()
+      const updatedConfig = batchSetAutoUpdate(input.skillKeys, input.enabled, config)
+      saveConfig(updatedConfig)
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('skills:normalize', async () => {
+    try {
+      const config = readConfig()
+      return await normalizeSkills(config)
+    } catch (error) {
+      return { normalized: [], conflicts: [], errors: [{ skillName: '*', agent: '*', reason: error instanceof Error ? error.message : String(error) }] }
+    }
+  })
+
+  ipcMain.handle('skills:convert-symlink', async (_event, input: { agentId: string }) => {
+    try {
+      const config = readConfig()
+      return await convertAgentToSymlink(input.agentId, config)
+    } catch (error) {
+      return { converted: [], skipped: [], errors: [{ skillName: '*', reason: error instanceof Error ? error.message : String(error) }] }
+    }
+  })
+
+  ipcMain.handle('skills:get-update-history', async (_event, input: { skillName: string }) => {
+    try {
+      const historyStore = createHistoryStore(readConfig, saveConfig)
+      return historyStore.query(input.skillName)
+    } catch (error) {
+      return []
+    }
+  })
+
+  ipcMain.handle('skills:get-last-batch-result', async () => {
+    const scheduler = getScheduler?.()
+    if (!scheduler) {
+      return null
+    }
+    return scheduler.getLastBatchResult()
   })
 }

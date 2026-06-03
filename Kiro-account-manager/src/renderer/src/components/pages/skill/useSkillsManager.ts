@@ -45,6 +45,21 @@ export function useSkillsManager(isEn: boolean) {
       const result = await window.api.skillsList()
       setAgents(result.agents)
       setConfig(result.config)
+      // 从后端返回的缓存状态初始化 updateStatuses
+      const cachedStatuses: Record<string, { status: SkillUpdateStatus; reason?: string }> = {}
+      for (const agent of result.agents) {
+        for (const skill of agent.skills) {
+          if (skill.updateStatus && skill.updateStatus !== 'unknown') {
+            cachedStatuses[`${agent.id}:${skill.name}`] = {
+              status: skill.updateStatus as SkillUpdateStatus,
+              reason: skill.updateReason
+            }
+          }
+        }
+      }
+      if (Object.keys(cachedStatuses).length > 0) {
+        setUpdateStatuses((prev) => ({ ...prev, ...cachedStatuses }))
+      }
       const nextActive = result.config.lastSelectedAgent || activeAgent || result.agents[0]?.id || ''
       const resolvedActive = result.agents.some((agent) => agent.id === nextActive)
         ? nextActive
@@ -313,22 +328,11 @@ export function useSkillsManager(isEn: boolean) {
     async () => {
       if (!currentAgent) return
       setBusy('check')
-      const skills = filteredSkills.filter((s) => !!s.sourceType)
-      const nextStatuses: Record<string, { status: string; reason?: string }> = {}
-      for (const skill of skills) {
-        const result = await window.api.skillsCheckUpdate({
-          agent: currentAgent.id,
-          skillName: skill.name
-        })
-        nextStatuses[`${currentAgent.id}:${skill.name}`] = {
-          status: result.status,
-          reason: result.reason
-        }
-      }
-      setUpdateStatuses((prev) => ({ ...prev, ...nextStatuses }))
+      // 委托给后端并发池检测，结果通过 push 事件实时更新
+      await window.api.skillsCheckUpdateBatch({ agent: currentAgent.id })
       setBusy(null)
     },
-    [currentAgent, filteredSkills, isEn, message]
+    [currentAgent]
   )
 
   useEffect(() => {
@@ -338,6 +342,58 @@ export function useSkillsManager(isEn: boolean) {
       void runCheckAll()
     }
   }, [busy, currentAgent, filteredSkills.length, initialCheckDone, runCheckAll])
+
+  // Task 13.2: Listen for push events to reactively update skill statuses
+  useEffect(() => {
+    const unsubStatus = window.api.onSkillsUpdateStatusChanged?.((event) => {
+      setUpdateStatuses((prev) => ({
+        ...prev,
+        [`${event.agent}:${event.skillName}`]: { status: event.status as SkillUpdateStatus, reason: event.reason }
+      }))
+    })
+    return () => { unsubStatus?.() }
+  }, [])
+
+  // Task 13.3: Listen for batch update completed events and show notification
+  useEffect(() => {
+    const unsubBatch = window.api.onSkillsBatchUpdateCompleted?.((event) => {
+      const successCount = event.successes.length
+      const failCount = event.failures.length
+      if (successCount > 0 || failCount > 0) {
+        message.info(
+          isEn
+            ? `${successCount} skill(s) updated, ${failCount} failed`
+            : `${successCount} 个 skill 已更新，${failCount} 个失败`,
+          5
+        )
+        // Refresh list to reflect updated skills
+        void load()
+      }
+    })
+    return () => { unsubBatch?.() }
+  }, [isEn, load, message])
+
+  // Task 13.5: Batch set auto-update for selected skills
+  const runBatchSetAutoUpdate = useCallback(
+    async (enabled: boolean) => {
+      if (!currentAgent || selected.length === 0) return
+      const skillKeys = selected.map((name) => `${currentAgent.id}:${name}`)
+      setBusy('update')
+      await window.api.skillsBatchSetAutoUpdate({ skillKeys, enabled })
+      setBusy(null)
+      await load()
+    },
+    [currentAgent, load, selected]
+  )
+
+  // Task 13.6: Get update history for a skill
+  const getUpdateHistory = useCallback(
+    async (skillName: string) => {
+      const result = await window.api.skillsGetUpdateHistory({ skillName })
+      return result
+    },
+    []
+  )
 
   return {
     activeAgent,
@@ -389,6 +445,8 @@ export function useSkillsManager(isEn: boolean) {
     setSyncSource,
     setSyncTargets,
     updateSkillAutoUpdate,
-    saveConfigPatch
+    saveConfigPatch,
+    runBatchSetAutoUpdate,
+    getUpdateHistory
   }
 }

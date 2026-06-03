@@ -28,7 +28,7 @@ import {
 import { useTranslation } from '@/hooks/useTranslation'
 import { BatchSyncModal } from './BatchSyncModal'
 import { FullSyncModal } from './FullSyncModal'
-import { SourceIcon, StatusIcon } from './icons'
+import { SourceIcon, StatusIcon, getSourceDisplayName, getSourceUrl } from './icons'
 import { InstallModal } from './InstallModal'
 import { statusLabelEn, statusLabelZh } from './labels'
 import { MarketManagementModal } from './MarketManagementModal'
@@ -130,7 +130,19 @@ export function SkillsPage(): React.ReactNode {
       width: 320,
       render: (_value, skill) => (
         <div className="min-w-0">
-          <div className="font-medium text-foreground">{skill.name}</div>
+          <div className="flex items-center gap-1.5">
+            <span className="font-medium text-foreground">{skill.name}</span>
+            {skill.version && (
+              <span className="inline-flex items-center rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                v{skill.version}
+              </span>
+            )}
+            {skill.installType === 'plugin' && (
+              <span className="inline-flex items-center rounded bg-orange-500/10 px-1.5 py-0.5 text-[10px] font-medium text-orange-600">
+                plugin
+              </span>
+            )}
+          </div>
           <div className="line-clamp-2 text-xs text-muted-foreground">{skill.description}</div>
           <div className="truncate font-mono text-[10px] text-muted-foreground/80">{skill.path}</div>
         </div>
@@ -140,12 +152,32 @@ export function SkillsPage(): React.ReactNode {
       title: isEn ? 'Source' : '来源',
       key: 'source',
       width: 180,
-      render: (_value, skill) => (
-        <div className="flex min-w-0 items-center gap-2">
-          <SourceIcon skill={skill} />
-          <span className="truncate">{skill.source || (isEn ? 'Local' : '本地')}</span>
-        </div>
-      )
+      render: (_value, skill) => {
+        const displayName = getSourceDisplayName(skill)
+        const url = getSourceUrl(skill)
+        if (displayName === 'Local' || (!skill.sourceType && !skill.source)) {
+          return <span className="text-muted-foreground">-</span>
+        }
+        return (
+          <div className="flex min-w-0 items-center gap-2">
+            <SourceIcon skill={skill} />
+            {url ? (
+              <a
+                className="truncate text-foreground hover:text-primary hover:underline cursor-pointer"
+                title={url}
+                onClick={(e) => {
+                  e.preventDefault()
+                  window.api.openExternal(url)
+                }}
+              >
+                {displayName}
+              </a>
+            ) : (
+              <span className="truncate">{displayName}</span>
+            )}
+          </div>
+        )
+      }
     },
     {
       title: isEn ? 'Status' : '状态',
@@ -432,6 +464,8 @@ export function SkillsPage(): React.ReactNode {
         defaultAutoUpdate={config?.defaultAutoUpdate === true}
         defaultInstallMode={config?.defaultInstallMode || 'symlink'}
         gitlabToken={config?.gitlabToken}
+        githubToken={config?.githubToken}
+        checkIntervalMinutes={config?.checkIntervalMinutes}
         agents={agents}
         onCancel={() => setShowSettingsDialog(false)}
         onSubmit={async (values) => {

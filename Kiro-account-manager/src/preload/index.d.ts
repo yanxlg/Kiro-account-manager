@@ -153,7 +153,7 @@ interface StatusResult {
     userStatus?: string // 用户状态：Active 等
     featureFlags?: string[] // 特性开关
     subscriptionTitle?: string
-    usage?: { 
+    usage?: {
       current: number
       limit: number
       percentUsed: number
@@ -167,7 +167,7 @@ interface StatusResult {
       nextResetDate?: string
       resourceDetail?: ResourceDetail
     }
-    subscription?: { 
+    subscription?: {
       type: string
       title?: string
       rawType?: string
@@ -197,7 +197,7 @@ interface KiroApi {
   saveAccounts: (data: AccountData) => Promise<void>
   refreshAccountToken: (account: unknown) => Promise<RefreshResult>
   checkAccountStatus: (account: unknown) => Promise<StatusResult>
-  
+
   // 后台批量刷新（主进程执行，不阻塞 UI）
   backgroundBatchRefresh: (accounts: Array<{
     id: string
@@ -217,7 +217,7 @@ interface KiroApi {
   }>, concurrency?: number, syncInfo?: boolean) => Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }>
   onBackgroundRefreshProgress: (callback: (data: { completed: number; total: number; success: number; failed: number }) => void) => () => void
   onBackgroundRefreshResult: (callback: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void) => () => void
-  
+
   // 后台批量检查账号状态（不刷新 Token）
   backgroundBatchCheck: (accounts: Array<{
     id: string
@@ -235,7 +235,7 @@ interface KiroApi {
   }>, concurrency?: number) => Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }>
   onBackgroundCheckProgress: (callback: (data: { completed: number; total: number; success: number; failed: number }) => void) => () => void
   onBackgroundCheckResult: (callback: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void) => () => void
-  
+
   // 切换账号 - 写入凭证到本地 SSO 缓存
   switchAccount: (credentials: {
     accessToken: string
@@ -292,7 +292,7 @@ interface KiroApi {
         upgradeCapability?: string
         overageCapability?: string
       }
-      usage: { 
+      usage: {
         current: number
         limit: number
         baseLimit?: number
@@ -767,7 +767,7 @@ interface KiroApi {
   kproxyCheckCaCertInstalled: () => Promise<{ success: boolean; installed: boolean; error?: string }>
 
   // ============ API Key 管理 ============
-  
+
   // 获取所有 API Keys
   proxyGetApiKeys: () => Promise<{ success: boolean; apiKeys: Array<{ id: string; name: string; key: string; enabled: boolean; createdAt: number; lastUsedAt?: number; usage: { totalRequests: number; totalCredits: number; totalInputTokens: number; totalOutputTokens: number; daily: Record<string, { requests: number; credits: number; inputTokens: number; outputTokens: number }> } }>; error?: string }>
 
@@ -930,6 +930,20 @@ interface KiroApi {
   skillsUpdate: (input: { agent: string; skillNames: string[] }) => Promise<SkillsOperationResult>
   skillsDelete: (input: { agent: string; skillNames: string[]; allAgents?: boolean }) => Promise<SkillsOperationResult>
   skillsSync: (input: { sourceAgent: string; skillNames: string[]; targetAgents: string[]; overwrite?: boolean }) => Promise<SkillsOperationResult>
+
+  // Skills Auto-Update
+  skillsCheckUpdateBatch: (input: { agent?: string }) => Promise<{ success: boolean; results?: Array<{ agent: string; skillName: string; status: SkillUpdateStatus; reason?: string }>; error?: string }>
+  skillsSetCheckInterval: (input: { minutes: number }) => Promise<{ success: boolean; error?: string }>
+  skillsBatchSetAutoUpdate: (input: { skillKeys: string[]; enabled: boolean }) => Promise<{ success: boolean; error?: string }>
+  skillsNormalize: () => Promise<{ success: boolean; normalized?: Array<{ skillName: string; agents: string[] }>; conflicts?: Array<{ skillName: string; reason: string }>; errors?: Array<{ skillName: string; agent: string; reason: string }>; error?: string }>
+  skillsConvertToSymlink: (input: { agentId: string }) => Promise<{ success: boolean; converted?: Array<{ skillName: string }>; skipped?: Array<{ skillName: string; reason: string }>; errors?: Array<{ skillName: string; reason: string }>; error?: string }>
+  skillsGetUpdateHistory: (input: { skillName: string }) => Promise<{ success: boolean; history?: Array<{ skillName: string; agent: string; timestamp: string; previousHash: string; newHash: string; success: boolean }>; error?: string }>
+  skillsGetLastBatchResult: () => Promise<{ success: boolean; result?: { successes: Array<{ agent: string; skillName: string; previousHash: string; newHash: string }>; failures: Array<{ agent: string; skillName: string; reason: string }>; timestamp: string } | null; error?: string }>
+
+  // Skills Auto-Update Push Event Listeners
+  onSkillsUpdateStatusChanged: (callback: (event: { agent: string; skillName: string; status: string; reason?: string }) => void) => () => void
+  onSkillsBatchUpdateCompleted: (callback: (event: { successes: Array<{ agent: string; skillName: string; previousHash: string; newHash: string }>; failures: Array<{ agent: string; skillName: string; reason: string }>; timestamp: string }) => void) => () => void
+  onSkillsCheckProgress: (callback: (event: { agent: string; skillName: string; checking: boolean }) => void) => () => void
 
   // 代理池验活
   proxyPoolValidate: (params: {

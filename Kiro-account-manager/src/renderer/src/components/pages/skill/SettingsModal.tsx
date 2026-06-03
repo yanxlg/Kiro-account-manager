@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Input, Modal, Radio, Space, Switch, Typography } from 'antd'
+import { Input, InputNumber, Modal, Radio, Space, Switch, Typography } from 'antd'
 import type { SkillInstallMode, SkillsAgentView } from './types'
 
 interface SettingsModalProps {
@@ -9,27 +9,35 @@ interface SettingsModalProps {
   defaultAutoUpdate: boolean
   defaultInstallMode: SkillInstallMode
   gitlabToken?: string
+  githubToken?: string
+  checkIntervalMinutes?: number
   agents: SkillsAgentView[]
   onCancel: () => void
   onSubmit: (values: {
     defaultAutoUpdate: boolean
     defaultInstallMode: SkillInstallMode
     gitlabToken?: string
+    githubToken?: string
+    checkIntervalMinutes?: number
   }) => void | Promise<void>
 }
 
 export function SettingsModal(props: SettingsModalProps): React.ReactNode {
-  const { busy, isEn, open, defaultAutoUpdate, defaultInstallMode, gitlabToken, agents, onCancel, onSubmit } = props
+  const { busy, isEn, open, defaultAutoUpdate, defaultInstallMode, gitlabToken, githubToken, checkIntervalMinutes, agents, onCancel, onSubmit } = props
   const [draftAutoUpdate, setDraftAutoUpdate] = useState(defaultAutoUpdate)
   const [draftInstallMode, setDraftInstallMode] = useState<SkillInstallMode>(defaultInstallMode)
   const [draftGitlabToken, setDraftGitlabToken] = useState(gitlabToken || '')
+  const [draftGithubToken, setDraftGithubToken] = useState(githubToken || '')
+  const [draftCheckInterval, setDraftCheckInterval] = useState<number>(checkIntervalMinutes ?? 240)
 
   useEffect(() => {
     if (!open) return
     setDraftAutoUpdate(defaultAutoUpdate)
     setDraftInstallMode(defaultInstallMode)
     setDraftGitlabToken(gitlabToken || '')
-  }, [defaultAutoUpdate, defaultInstallMode, gitlabToken, open])
+    setDraftGithubToken(githubToken || '')
+    setDraftCheckInterval(checkIntervalMinutes ?? 240)
+  }, [defaultAutoUpdate, defaultInstallMode, gitlabToken, githubToken, checkIntervalMinutes, open])
 
   const unsupportedSymlinkAgents = agents.filter(
     (agent) => !agent.universal && agent.supportsSymlinkProjection === false
@@ -44,7 +52,9 @@ export function SettingsModal(props: SettingsModalProps): React.ReactNode {
         onSubmit({
           defaultAutoUpdate: draftAutoUpdate,
           defaultInstallMode: draftInstallMode,
-          gitlabToken: draftGitlabToken.trim() || undefined
+          gitlabToken: draftGitlabToken.trim() || undefined,
+          githubToken: draftGithubToken.trim() || undefined,
+          checkIntervalMinutes: draftCheckInterval
         })
       }
       okText={isEn ? 'Save' : '保存'}
@@ -115,6 +125,41 @@ export function SettingsModal(props: SettingsModalProps): React.ReactNode {
               value={draftGitlabToken}
               onChange={(e) => setDraftGitlabToken(e.target.value)}
             />
+          </div>
+        </div>
+
+        <div>
+          <Typography.Text strong>{isEn ? 'GitHub Token' : 'GitHub Token'}</Typography.Text>
+          <div className="mt-1 text-xs text-muted-foreground">
+            {isEn
+              ? 'Optional. Increases API rate limit from 60 to 5000 requests/hour. Needs no special scopes for public repos.'
+              : '可选。将 API 速率限制从 60 次/小时提升至 5000 次/小时。公开仓库无需特殊权限。'}
+          </div>
+          <div className="mt-3">
+            <Input.Password
+              placeholder={isEn ? 'GitHub Personal Access Token' : 'GitHub 个人访问令牌'}
+              value={draftGithubToken}
+              onChange={(e) => setDraftGithubToken(e.target.value)}
+            />
+          </div>
+        </div>
+
+        <div>
+          <Typography.Text strong>{isEn ? 'Check interval' : '检测间隔'}</Typography.Text>
+          <div className="mt-1 text-xs text-muted-foreground">
+            {isEn
+              ? 'How often to check for skill updates in the background (30–1440 minutes).'
+              : '后台自动检测更新的间隔时间（30–1440 分钟）。'}
+          </div>
+          <div className="mt-3 flex items-center gap-2">
+            <InputNumber
+              min={30}
+              max={1440}
+              value={draftCheckInterval}
+              onChange={(value) => setDraftCheckInterval(value ?? 240)}
+              style={{ width: 120 }}
+            />
+            <span className="text-xs text-muted-foreground">{isEn ? 'minutes' : '分钟'}</span>
           </div>
         </div>
       </Space>

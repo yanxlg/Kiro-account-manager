@@ -11,7 +11,7 @@ const localAppDataHome = process.env.LOCALAPPDATA || join(home, 'AppData', 'Loca
 const programFiles = process.env.ProgramFiles || 'C:\\Program Files'
 const programFilesX86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)'
 const codexHome = process.env.CODEX_HOME?.trim() || join(home, '.codex')
-const claudeHome = process.env.CLAUDE_CONFIG_DIR?.trim() || join(home, '.claude')
+export const claudeHome = process.env.CLAUDE_CONFIG_DIR?.trim() || join(home, '.claude')
 
 export const canonicalGlobalSkillsDir = join(home, '.agents', 'skills')
 
