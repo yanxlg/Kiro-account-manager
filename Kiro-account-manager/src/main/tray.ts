@@ -44,13 +44,13 @@ const ICON_FILE_MAP: Record<string, string> = {
 function loadIconFromFile(iconKey: string): NativeImage {
   const cached = menuIcons.get(iconKey)
   if (cached) return cached
-  
+
   const fileName = ICON_FILE_MAP[iconKey]
   if (!fileName) {
     console.warn(`[Tray] Unknown icon key: ${iconKey}`)
     return nativeImage.createEmpty()
   }
-  
+
   const iconPath = join(getTrayIconDir(), fileName)
   try {
     const icon = nativeImage.createFromPath(iconPath)
@@ -120,11 +120,11 @@ function getTrayIconPath(): string {
     }
     return join(__dirname, '../../resources/icon.ico')
   } else if (process.platform === 'darwin') {
-    // macOS 使用 Template 图标（自动适应深色/浅色模式）
+    // macOS 使用蓝色 K 图标（透明背景，44x44 @2x）
     if (app.isPackaged) {
-      return join(process.resourcesPath, 'app.asar.unpacked', 'resources', 'icon.png')
+      return join(process.resourcesPath, 'app.asar.unpacked', 'resources', 'tray-icon-mac.png')
     }
-    return join(__dirname, '../../resources/icon.png')
+    return join(__dirname, '../../resources/tray-icon-mac.png')
   } else {
     // Linux 使用 png 文件
     if (app.isPackaged) {
@@ -139,7 +139,7 @@ function buildTrayMenu(): Menu {
   const menuTemplate: MenuItemConstructorOptions[] = []
 
   const isEn = currentLanguage === 'en'
-  
+
   // 应用标题
   menuTemplate.push({
     label: `Kiro ${isEn ? 'Account Manager' : '账号管理器'} v${app.getVersion()}`,
@@ -152,8 +152,8 @@ function buildTrayMenu(): Menu {
   if (callbacks) {
     const proxyStatus = callbacks.getProxyStatus()
     menuTemplate.push({
-      label: proxyStatus.running 
-        ? (isEn ? `Proxy Running (Port ${proxyStatus.port})` : `代理服务运行中 (端口 ${proxyStatus.port})`) 
+      label: proxyStatus.running
+        ? (isEn ? `Proxy Running (Port ${proxyStatus.port})` : `代理服务运行中 (端口 ${proxyStatus.port})`)
         : (isEn ? 'Proxy Stopped' : '代理服务已停止'),
       icon: getStatusIcon(proxyStatus.running),
       enabled: false
@@ -182,16 +182,16 @@ function buildTrayMenu(): Menu {
       enabled: false
     })
     menuTemplate.push({
-      label: isEn 
+      label: isEn
         ? `   Identity: ${account.idp} | ${account.subscription || 'Unknown'} | ${account.status === 'active' ? 'Active' : account.status}`
         : `   身份: ${account.idp} | ${account.subscription || '未知'} | ${account.status === 'active' ? '活跃' : account.status}`,
       icon: getMenuIcon(account.status === 'active' ? 'check' : 'warning'),
       enabled: false
     })
-    
+
     if (account.usage) {
       menuTemplate.push({
-        label: isEn 
+        label: isEn
           ? `   Usage: ${account.usage.usedCredits} / ${account.usage.totalCredits} Credits`
           : `   用量: ${account.usage.usedCredits} / ${account.usage.totalCredits} Credits`,
         icon: getMenuIcon('usage'),
@@ -202,14 +202,14 @@ function buildTrayMenu(): Menu {
     const proxyStats = callbacks?.getProxyStats() || { totalRequests: 0, successRequests: 0, failedRequests: 0 }
     const sessionStats = callbacks?.getSessionStats() || { totalRequests: 0, successRequests: 0, failedRequests: 0, startTime: 0 }
     menuTemplate.push({
-      label: isEn 
+      label: isEn
         ? `   Total: ${proxyStats.totalRequests} (✓${proxyStats.successRequests} ✗${proxyStats.failedRequests})`
         : `   总计: ${proxyStats.totalRequests} (成功${proxyStats.successRequests} 失败${proxyStats.failedRequests})`,
       icon: getMenuIcon('requests'),
       enabled: false
     })
     menuTemplate.push({
-      label: isEn 
+      label: isEn
         ? `   Session: ${sessionStats.totalRequests} (✓${sessionStats.successRequests} ✗${sessionStats.failedRequests})`
         : `   本次: ${sessionStats.totalRequests} (成功${sessionStats.successRequests} 失败${sessionStats.failedRequests})`,
       icon: getMenuIcon('requests'),
@@ -329,11 +329,13 @@ export function createTray(cbs: TrayCallbacks): Tray | null {
   try {
     const iconPath = getTrayIconPath()
     let icon = nativeImage.createFromPath(iconPath)
-    
+
     // macOS 需要设置为 Template 图标
     if (process.platform === 'darwin') {
-      icon = icon.resize({ width: 16, height: 16 })
-      icon.setTemplateImage(true)
+      // Resize to 22x22 (with @2x Retina this shows as 11pt in menu bar)
+      icon = icon.resize({ width: 22, height: 22 })
+      // 注意：不使用 setTemplateImage(true)，因为当前 icon 是彩色的
+      // 如果需要 Template 模式（自动适应深色/浅色），需要一个纯黑+透明的 PNG
     } else if (process.platform === 'win32') {
       // Windows 图标大小调整
       icon = icon.resize({ width: 16, height: 16 })
