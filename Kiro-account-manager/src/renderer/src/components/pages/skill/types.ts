@@ -31,6 +31,7 @@ export interface SkillsSkillView {
   ref?: string
   path: string
   pluginName?: string
+  installedAt?: string
   autoUpdate: boolean
   updateStatus?: SkillUpdateStatus
   updateReason?: string
@@ -51,3 +52,30 @@ export interface SkillsAgentView {
 }
 
 export type OperationBusy = 'load' | 'install' | 'delete' | 'sync' | 'update' | 'check' | null
+
+// --- Marketplace Management Types ---
+
+/** 市场来源类型 */
+export type MarketplaceSourceType = 'claude-plugin' | 'github-skills' | 'custom'
+
+/** 市场信息记录 */
+export interface MarketplaceInfo {
+  id: string
+  name: string
+  gitUrl: string
+  sourceType: MarketplaceSourceType
+  owner?: string
+  repo?: string
+  ref?: string
+  host?: string
+  projectPath?: string
+  createdAt?: string
+  installedSkillCount?: number
+}
+
+/** 可用 skill（远端仓库中检测到的） */
+export interface AvailableSkill {
+  name: string
+  path: string
+  installed: boolean
+}

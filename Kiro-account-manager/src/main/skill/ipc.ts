@@ -20,8 +20,10 @@ import { validateCheckInterval, batchSetAutoUpdate } from './config'
 import { normalizeSkills } from './normalizer'
 import { convertAgentToSymlink } from './converter'
 import { createHistoryStore } from './history'
+import { MarketplaceDetector, MarketplaceManager } from './marketplace'
 import type { AutoUpdateScheduler } from './scheduler'
 import type { CheckResult } from './detector'
+import type { MarketplaceInfo, SkillsSkillView } from './types'
 
 interface StoreLike {
   get: (key: string, defaultValue?: unknown) => unknown
@@ -234,6 +236,111 @@ export function registerSkillsManagerIpcHandlers(
   ipcMain.handle('skills:update-plugin', async (_event, input: { pluginName: string; marketplace: string }) => {
     try {
       return await updatePlugin(input, readConfig(), saveConfig)
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  // --- Marketplace Management IPC Handlers ---
+
+  const detector = new MarketplaceDetector(getStore())
+  const manager = new MarketplaceManager(getStore())
+
+  /** 获取所有已安装 skill 的扁平列表（用于计算 installedSkillCount） */
+  const getAllInstalledSkills = async (): Promise<SkillsSkillView[]> => {
+    try {
+      const result = await listSkillsState(readConfig())
+      const skills: SkillsSkillView[] = []
+      for (const agent of result.agents) {
+        skills.push(...agent.skills)
+      }
+      return skills
+    } catch {
+      return []
+    }
+  }
+
+  ipcMain.handle('marketplace:detect', async () => {
+    try {
+      return await detector.detect()
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('marketplace:list', async () => {
+    try {
+      const markets = await detector.detect()
+      const allSkills = await getAllInstalledSkills()
+
+      // Enrich each marketplace with installedSkillCount (deduplicated by skill name)
+      const enriched: MarketplaceInfo[] = markets.map((market) => {
+        const skills = manager.getInstalledSkillsForMarketplace(market, allSkills)
+        const uniqueNames = new Set(skills.map((s) => s.name))
+        return {
+          ...market,
+          installedSkillCount: uniqueNames.size
+        }
+      })
+
+      return enriched
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('marketplace:listRemoteSkills', async (_event, marketplace: MarketplaceInfo) => {
+    try {
+      return await manager.listRemoteSkills(marketplace)
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('marketplace:add', async (_event, input: { gitUrl: string; name?: string }) => {
+    try {
+      return await manager.addCustomMarketplace(input)
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('marketplace:remove', async (_event, id: string) => {
+    try {
+      return await manager.removeCustomMarketplace(id)
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('marketplace:refresh', async () => {
+    try {
+      // Clear manager cache to force fresh API queries
+      manager.clearCache()
+      // Re-run detection
+      const markets = await detector.detect()
+      const allSkills = await getAllInstalledSkills()
+
+      // Enrich with installedSkillCount (deduplicated by skill name)
+      const enriched: MarketplaceInfo[] = markets.map((market) => {
+        const skills = manager.getInstalledSkillsForMarketplace(market, allSkills)
+        const uniqueNames = new Set(skills.map((s) => s.name))
+        return {
+          ...market,
+          installedSkillCount: uniqueNames.size
+        }
+      })
+
+      return enriched
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('marketplace:getInstalledSkills', async (_event, marketplace: MarketplaceInfo) => {
+    try {
+      const allSkills = await getAllInstalledSkills()
+      return manager.getInstalledSkillsForMarketplace(marketplace, allSkills)
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : String(error) }
     }

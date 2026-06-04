@@ -79,6 +79,31 @@ interface ResourceDetail {
 type SkillUpdateStatus = 'unknown' | 'latest' | 'available' | 'unsupported' | 'failed'
 type SkillInstallMode = 'symlink' | 'copy'
 
+/** 市场来源类型 */
+type MarketplaceSourceType = 'claude-plugin' | 'github-skills' | 'custom'
+
+/** 市场信息记录 */
+interface MarketplaceInfo {
+  id: string
+  name: string
+  gitUrl: string
+  sourceType: MarketplaceSourceType
+  owner?: string
+  repo?: string
+  ref?: string
+  host?: string
+  projectPath?: string
+  createdAt?: string
+  installedSkillCount?: number
+}
+
+/** 可用 skill（远端仓库中检测到的） */
+interface AvailableSkill {
+  name: string
+  path: string
+  installed: boolean
+}
+
 interface SkillsManagerConfig {
   version: 1
   defaultAutoUpdate: boolean
@@ -939,6 +964,29 @@ interface KiroApi {
   skillsConvertToSymlink: (input: { agentId: string }) => Promise<{ success: boolean; converted?: Array<{ skillName: string }>; skipped?: Array<{ skillName: string; reason: string }>; errors?: Array<{ skillName: string; reason: string }>; error?: string }>
   skillsGetUpdateHistory: (input: { skillName: string }) => Promise<{ success: boolean; history?: Array<{ skillName: string; agent: string; timestamp: string; previousHash: string; newHash: string; success: boolean }>; error?: string }>
   skillsGetLastBatchResult: () => Promise<{ success: boolean; result?: { successes: Array<{ agent: string; skillName: string; previousHash: string; newHash: string }>; failures: Array<{ agent: string; skillName: string; reason: string }>; timestamp: string } | null; error?: string }>
+
+  // ============ Marketplace 市场管理 ============
+
+  // 执行市场检测
+  marketplaceDetect: () => Promise<MarketplaceInfo[]>
+
+  // 获取市场列表（含已安装 skill 计数）
+  marketplaceList: () => Promise<MarketplaceInfo[]>
+
+  // 查询远端仓库的 skill 列表
+  marketplaceListRemoteSkills: (marketplace: MarketplaceInfo) => Promise<AvailableSkill[]>
+
+  // 新增自定义市场
+  marketplaceAdd: (input: { gitUrl: string; name?: string }) => Promise<MarketplaceInfo>
+
+  // 删除自定义市场
+  marketplaceRemove: (id: string) => Promise<{ success: boolean; error?: string }>
+
+  // 刷新市场列表
+  marketplaceRefresh: () => Promise<MarketplaceInfo[]>
+
+  // 获取指定市场下的已安装 skill 列表
+  marketplaceGetInstalledSkills: (marketplace: MarketplaceInfo) => Promise<SkillsSkillView[]>
 
   // Skills Auto-Update Push Event Listeners
   onSkillsUpdateStatusChanged: (callback: (event: { agent: string; skillName: string; status: string; reason?: string }) => void) => () => void

@@ -132,6 +132,10 @@ export async function listSkillsState(configValue: unknown): Promise<SkillsAgent
           if (byName.has(key)) continue
           const lockEntry = lockForSkill(lock, skill.name)
           const cfg = config.skillConfigs[getSkillConfigKey(agent.id, skill.name)]
+          // Fallback: check if any other agent has autoUpdate set for the same skill
+          const resolvedAutoUpdate = cfg?.autoUpdate ?? Object.values(config.skillConfigs).find(
+            (c) => c.skillName === skill.name && c.autoUpdate !== undefined
+          )?.autoUpdate ?? false
           byName.set(key, {
             name: skill.name,
             description: skill.description,
@@ -149,7 +153,7 @@ export async function listSkillsState(configValue: unknown): Promise<SkillsAgent
             updatedAt: lockEntry?.updatedAt,
             pluginName: lockEntry?.pluginName,
             installType: 'skills',
-            autoUpdate: cfg?.autoUpdate ?? false,
+            autoUpdate: resolvedAutoUpdate,
             updateStatus: cfg?.lastCheckStatus || 'unknown',
             updateReason: cfg?.lastCheckReason
           })
@@ -654,15 +658,33 @@ export async function setSkillAutoUpdate(
   saveConfig: (config: SkillsManagerConfig) => void
 ): Promise<SkillsOperationResult> {
   const config = normalizeSkillsManagerConfig(configValue)
-  const key = getSkillConfigKey(input.agent, input.skillName)
   const now = Date.now()
-  config.skillConfigs[key] = {
-    agent: input.agent,
-    skillName: input.skillName,
-    autoUpdate: input.enabled,
-    createdAt: config.skillConfigs[key]?.createdAt || now,
-    updatedAt: now
+
+  // Sync autoUpdate across ALL agents for the same skill name
+  // Find all existing keys for this skillName
+  const matchingKeys = Object.keys(config.skillConfigs).filter((k) => {
+    const cfg = config.skillConfigs[k]
+    return cfg.skillName === input.skillName
+  })
+
+  // Update all existing entries
+  for (const key of matchingKeys) {
+    config.skillConfigs[key].autoUpdate = input.enabled
+    config.skillConfigs[key].updatedAt = now
   }
+
+  // Ensure the current agent's key also exists
+  const primaryKey = getSkillConfigKey(input.agent, input.skillName)
+  if (!config.skillConfigs[primaryKey]) {
+    config.skillConfigs[primaryKey] = {
+      agent: input.agent,
+      skillName: input.skillName,
+      autoUpdate: input.enabled,
+      createdAt: now,
+      updatedAt: now
+    }
+  }
+
   saveConfig(config)
   return { success: true }
 }

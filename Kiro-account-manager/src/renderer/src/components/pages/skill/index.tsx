@@ -17,6 +17,7 @@ import {
   ArrowUpToLine,
   Copy,
   PackagePlus,
+  Puzzle,
   Radar,
   Repeat2,
   RefreshCw,
@@ -267,7 +268,7 @@ export function SkillsPage(): React.ReactNode {
     <div className="flex h-full flex-col gap-3 overflow-hidden p-4">
       <div className="flex items-center gap-3">
         <div className="bg-primary/10 p-2">
-          <Settings2 className="h-5 w-5 text-primary" />
+          <Puzzle className="h-5 w-5 text-primary" />
         </div>
         <div className="min-w-0 flex-1">
           <Typography.Title level={4} style={{ margin: 0 }}>
@@ -370,20 +371,19 @@ export function SkillsPage(): React.ReactNode {
             root: { borderRadius: 8, overflow: 'hidden' }
           }}
           title={() => (
-            <div className="flex flex-wrap items-center gap-2">
-              <Tag color="blue">{isEn ? 'Selected' : '已选'} {selected.length}</Tag>
+            <div className="flex flex-wrap items-center gap-2" style={{ paddingLeft: 14 }}>
               <Button icon={<ArrowUpToLine className="h-4 w-4" />} disabled={selected.length === 0} onClick={() => void runUpdate()}>
                 {isEn ? 'Batch update' : '批量更新'}
               </Button>
-              <Button danger icon={<Trash2 className="h-4 w-4" />} disabled={selected.length === 0} onClick={() => void runDelete(false)}>
+              <Button danger icon={<Trash2 className="h-4 w-4" />} disabled={selected.length === 0} onClick={() => void runDelete(true)}>
                 {isEn ? 'Batch delete' : '批量删除'}
-              </Button>
-              <Button icon={<Trash2 className="h-4 w-4" />} disabled={selected.length === 0} onClick={() => void runDelete(true)}>
-                {isEn ? 'Delete all agents' : '从所有 Agents 删除'}
               </Button>
               <Button icon={<Copy className="h-4 w-4" />} disabled={selected.length === 0 || otherAgents.length === 0} onClick={() => setShowSyncDialog(true)}>
                 {isEn ? 'Batch sync' : '批量同步'}
               </Button>
+              {selected.length > 0 && (
+                <Tag color="blue">{isEn ? 'Selected' : '已选'} {selected.length}</Tag>
+              )}
               <Input
                 allowClear
                 variant="filled"

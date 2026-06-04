@@ -1359,6 +1359,43 @@ const api = {
     return ipcRenderer.invoke('skills:update-plugin', input)
   },
 
+  // ============ Marketplace 市场管理 ============
+
+  // 执行市场检测
+  marketplaceDetect: (): Promise<unknown> => {
+    return ipcRenderer.invoke('marketplace:detect')
+  },
+
+  // 获取市场列表（含已安装 skill 计数）
+  marketplaceList: (): Promise<unknown> => {
+    return ipcRenderer.invoke('marketplace:list')
+  },
+
+  // 查询远端仓库的 skill 列表
+  marketplaceListRemoteSkills: (marketplace: unknown): Promise<unknown> => {
+    return ipcRenderer.invoke('marketplace:listRemoteSkills', marketplace)
+  },
+
+  // 新增自定义市场
+  marketplaceAdd: (input: { gitUrl: string; name?: string }): Promise<unknown> => {
+    return ipcRenderer.invoke('marketplace:add', input)
+  },
+
+  // 删除自定义市场
+  marketplaceRemove: (id: string): Promise<unknown> => {
+    return ipcRenderer.invoke('marketplace:remove', id)
+  },
+
+  // 刷新市场列表
+  marketplaceRefresh: (): Promise<unknown> => {
+    return ipcRenderer.invoke('marketplace:refresh')
+  },
+
+  // 获取指定市场下的已安装 skill 列表
+  marketplaceGetInstalledSkills: (marketplace: unknown): Promise<unknown> => {
+    return ipcRenderer.invoke('marketplace:getInstalledSkills', marketplace)
+  },
+
   // Skills Auto-Update Push Event Listeners
   onSkillsUpdateStatusChanged: (callback: (event: { agent: string; skillName: string; status: string; reason?: string }) => void): (() => void) => {
     const handler = (_event: Electron.IpcRendererEvent, data: { agent: string; skillName: string; status: string; reason?: string }): void => {

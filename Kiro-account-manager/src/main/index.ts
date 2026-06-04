@@ -25,6 +25,7 @@ import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import { registerSkillsManagerIpcHandlers } from './skill/ipc'
 import { AutoUpdateScheduler } from './skill/scheduler'
 import { normalizeSkillsManagerConfig } from './skill/config'
+import { MarketplaceDetector } from './skill/marketplace'
 import {
   createTray,
   destroyTray,
@@ -1947,6 +1948,14 @@ app.whenReady().then(async () => {
     getWindow: () => mainWindow
   })
   skillsScheduler.start()
+
+  // Pre-warm marketplace detection (non-blocking)
+  const marketplaceDetector = new MarketplaceDetector(store)
+  marketplaceDetector.detect().then((markets) => {
+    console.log(`[Marketplace] Pre-warm detection complete: ${markets.length} marketplace(s) found`)
+  }).catch((err) => {
+    console.warn('[Marketplace] Pre-warm detection failed:', err instanceof Error ? err.message : err)
+  })
 
   // ============ 托盘相关 IPC ============
 

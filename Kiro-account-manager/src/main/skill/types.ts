@@ -159,3 +159,53 @@ export interface CheckProgressEvent {
   skillName: string
   checking: boolean
 }
+
+// --- Marketplace Management Types ---
+
+/** 市场来源类型 */
+export type MarketplaceSourceType = 'claude-plugin' | 'github-skills' | 'custom'
+
+/** 市场信息记录 */
+export interface MarketplaceInfo {
+  id: string                        // 唯一标识（UUID 或 derived key）
+  name: string                      // 显示名称
+  gitUrl: string                    // 仓库地址（HTTPS/SSH/shorthand）
+  sourceType: MarketplaceSourceType // 来源类型
+  owner?: string                    // 仓库 owner（解析自 URL）
+  repo?: string                     // 仓库 repo name（解析自 URL）
+  ref?: string                      // 分支/tag
+  host?: string                     // GitLab host（仅 GitLab 类型）
+  projectPath?: string              // GitLab projectPath（仅 GitLab 类型）
+  createdAt?: string                // 添加时间（ISO 8601）
+  installedSkillCount?: number      // 该市场下已安装 skill 数
+}
+
+/** 可用 skill（远端仓库中检测到的） */
+export interface AvailableSkill {
+  name: string                      // skill 名称（目录名）
+  path: string                      // 在仓库中的相对路径
+  installed: boolean                // 是否已安装到本地
+}
+
+/** 自定义市场持久化记录 */
+export interface CustomMarketplaceRecord {
+  id: string
+  name: string
+  gitUrl: string
+  sourceType: 'custom'
+  owner?: string
+  repo?: string
+  ref?: string
+  host?: string
+  projectPath?: string
+  createdAt: string
+}
+
+/** 解析后的 Git URL 信息 */
+export interface ParsedGitUrl {
+  owner: string
+  repo: string
+  host: string            // 'github.com' | gitlab host
+  platform: 'github' | 'gitlab' | 'unknown'
+  normalizedUrl: string   // 用于去重比较的规范化 URL
+}
