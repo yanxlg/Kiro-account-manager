@@ -45,15 +45,16 @@ function App(): React.JSX.Element {
     activeAccountId,
     setActiveAccount,
     checkAndRefreshExpiringTokens,
-    updateAccountStatus
+    updateAccountStatus,
+    updateAccount
   } = useAccountsStore()
 
   // 切换到下一个可用账户
   const switchToNextAccount = useCallback(() => {
-    const activeAccounts = Array.from(accounts.values()).filter((acc) => acc.status === 'active')
+    const activeAccounts = Array.from(accounts.values()).filter(acc => acc.status === 'active')
     if (activeAccounts.length <= 1) return
 
-    const currentIndex = activeAccounts.findIndex((acc) => acc.id === activeAccountId)
+    const currentIndex = activeAccounts.findIndex(acc => acc.id === activeAccountId)
     const nextIndex = (currentIndex + 1) % activeAccounts.length
     setActiveAccount(activeAccounts[nextIndex].id)
   }, [accounts, activeAccountId, setActiveAccount])
@@ -68,7 +69,7 @@ function App(): React.JSX.Element {
       const currentAccounts = currentState.accounts
       const currentActiveId = currentState.activeAccountId
 
-      const accountList = Array.from(currentAccounts.values()).map((acc) => ({
+      const accountList = Array.from(currentAccounts.values()).map(acc => ({
         id: acc.id,
         email: acc.email || 'Unknown',
         idp: acc.idp || 'Unknown',
@@ -85,15 +86,13 @@ function App(): React.JSX.Element {
             idp: activeAccount.idp || 'Unknown',
             status: activeAccount.status,
             subscription: activeAccount.subscription?.title || undefined,
-            usage: activeAccount.usage
-              ? {
-                  usedCredits: activeAccount.usage.current || 0,
-                  totalCredits: activeAccount.usage.limit || 0,
-                  totalRequests: 0,
-                  successRequests: 0,
-                  failedRequests: 0
-                }
-              : undefined
+            usage: activeAccount.usage ? {
+              usedCredits: activeAccount.usage.current || 0,
+              totalCredits: activeAccount.usage.limit || 0,
+              totalRequests: 0,
+              successRequests: 0,
+              failedRequests: 0
+            } : undefined
           })
         } else {
           window.api.updateTrayAccount(null)
@@ -109,6 +108,8 @@ function App(): React.JSX.Element {
     loadFromStorage().then(() => {
       startAutoTokenRefresh()
     })
+    // 同步主动续期开关（持久化在 main 进程的 electron-store）
+    useAccountsStore.getState().loadProactiveRenewalEnabled()
     // 加载 Webhook 配置
     useWebhookStore.getState().loadFromStorage()
 
@@ -116,6 +117,18 @@ function App(): React.JSX.Element {
       stopAutoTokenRefresh()
     }
   }, [loadFromStorage, startAutoTokenRefresh, stopAutoTokenRefresh])
+
+  // 订阅 Kiro IDE 自己 refresh token 后反代检测到的事件
+  // 触发时间点：Kiro IDE 在后台 refresh loop 把磁盘 token 写新了，反代 watcher 反向同步到 store
+  // 这里收到事件后从磁盘重新加载账号数据，让 UI 立刻显示最新 expiresAt / accessToken
+  useEffect(() => {
+    if (typeof window.api.onKiroIdeTokenChanged !== 'function') return
+    const unsubscribe = window.api.onKiroIdeTokenChanged((data) => {
+      console.log(`[App] Kiro IDE refreshed token for account ${data.accountId} (${data.reason}), reloading accounts...`)
+      loadFromStorage().catch((e) => console.warn('[App] reload after IDE token change failed:', e))
+    })
+    return unsubscribe
+  }, [loadFromStorage])
 
   // 反代关键事件 → 触发 webhook（v1.8 新增）
   // 由 main/proxyServer 内置的 webhookTrigger 通过 IPC 推送过来，统一在 renderer 调 useWebhookStore
@@ -132,13 +145,10 @@ function App(): React.JSX.Element {
         // 规范化 level（main 用 'error'/'info' 等字符串字面量，需要映射到 store 接受的类型）
         const rawLevel = (payload as { level?: string })?.level
         const level: 'info' | 'warn' | 'error' | 'success' =
-          rawLevel === 'error'
-            ? 'error'
-            : rawLevel === 'info'
-              ? 'info'
-              : rawLevel === 'success'
-                ? 'success'
-                : 'warn'
+          rawLevel === 'error' ? 'error'
+          : rawLevel === 'info' ? 'info'
+          : rawLevel === 'success' ? 'success'
+          : 'warn'
         void store.triggerEvent(targetEvent, {
           title: String((payload as Record<string, unknown>).title ?? '反代告警'),
           message: String((payload as Record<string, unknown>).message ?? ''),
@@ -149,9 +159,7 @@ function App(): React.JSX.Element {
         console.error('[App] Proxy webhook trigger failed:', err)
       }
     })
-    return () => {
-      unsubscribe?.()
-    }
+    return () => { unsubscribe?.() }
   }, [])
 
   // 应用内页面跳转（轻量 CustomEvent，供深层组件无需 prop 钻取即可切页）
@@ -166,9 +174,7 @@ function App(): React.JSX.Element {
 
   // 关闭/刷新前强制 flush 防抖中的待保存数据，防止数据丢失
   useEffect(() => {
-    const handleBeforeUnload = (): void => {
-      void flushSaveImmediately()
-    }
+    const handleBeforeUnload = (): void => { void flushSaveImmediately() }
     window.addEventListener('beforeunload', handleBeforeUnload)
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnload)
@@ -204,8 +210,7 @@ function App(): React.JSX.Element {
 
   // 监听后台刷新结果：缓冲 + 批量化 flush，N 条结果合并为一次 set，消除 Map 复制风暴
   useEffect(() => {
-    const refreshBuffer: Array<{ id: string; success: boolean; data?: unknown; error?: string }> =
-      []
+    const refreshBuffer: Array<{ id: string; success: boolean; data?: unknown; error?: string }> = []
     let flushTimer: ReturnType<typeof setTimeout> | null = null
 
     const flush = (): void => {
@@ -270,7 +275,24 @@ function App(): React.JSX.Element {
     }
   }, [updateAccountStatus])
 
-  const renderPage = (): React.ReactNode => {
+  // 监听反代账号更新事件（Enterprise profileArn 自愈），持久化到 store + 磁盘
+  useEffect(() => {
+    const unsubscribe = window.api.onProxyAccountUpdate((info) => {
+      if (!info.profileArn) return
+      const account = useAccountsStore.getState().accounts.get(info.id)
+      if (!account || account.credentials?.profileArn === info.profileArn) return
+      updateAccount(info.id, {
+        profileArn: info.profileArn,
+        credentials: { ...account.credentials, profileArn: info.profileArn }
+      })
+      console.log(`[App] Persisted Enterprise profileArn for ${info.id}`)
+    })
+    return () => {
+      unsubscribe()
+    }
+  }, [updateAccount])
+
+  const renderPage = () => {
     switch (currentPage) {
       case 'home':
         return <HomePage />

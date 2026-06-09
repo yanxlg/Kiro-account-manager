@@ -25,6 +25,7 @@ import {
   openaiToKiro,
   claudeToKiro,
   kiroToOpenaiResponse,
+  type ThinkingConfig,
   kiroToClaudeResponse,
   createOpenaiStreamChunk,
   createClaudeStreamEvent,
@@ -33,6 +34,7 @@ import {
 } from './translator'
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
+import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument } from './steeringLoader'
 
 
 export interface ProxyServerEvents {
@@ -90,6 +92,7 @@ type ClientModel = {
   rateUnit?: string
   supportsThinking?: boolean
   thinkingEfforts?: string[]
+  thinkingSchemaPath?: 'output_config' | 'reasoning'
   supportsPromptCaching?: boolean
   modelProvider?: string
   permission: unknown[]
@@ -148,18 +151,25 @@ function modelCapabilityMap(modalities: ModelModality[]): Record<ModelModality, 
   }
 }
 
-function extractThinkingEfforts(schema?: Record<string, unknown> | null): string[] | undefined {
+function extractThinkingSchema(schema?: Record<string, unknown> | null): { efforts?: string[]; schemaPath?: 'output_config' | 'reasoning' } | undefined {
   if (!schema) return undefined
   const props = schema.properties as Record<string, unknown> | undefined
-  if (!props?.thinking) return undefined
-  const thinking = props.thinking as Record<string, unknown>
-  const thinkingProps = thinking.properties as Record<string, unknown> | undefined
-  const typeField = thinkingProps?.type as Record<string, unknown> | undefined
-  const enumValues = typeField?.enum as string[] | undefined
-  if (enumValues?.includes('adaptive') || enumValues?.includes('disabled')) {
-    const effortField = (props.output_config as Record<string, unknown> | undefined)?.properties as Record<string, unknown> | undefined
+  if (!props) return undefined
+  // output_config 路径（Claude 4.6+ 新模型）
+  if (props.output_config) {
+    const effortField = (props.output_config as Record<string, unknown>)?.properties as Record<string, unknown> | undefined
     const effortEnum = (effortField?.effort as Record<string, unknown> | undefined)?.enum as string[] | undefined
-    return effortEnum || undefined
+    if (effortEnum && effortEnum.length > 0) {
+      return { efforts: effortEnum, schemaPath: 'output_config' }
+    }
+  }
+  // reasoning 路径（备用）
+  if (props.reasoning) {
+    const reasoningProps = (props.reasoning as Record<string, unknown>)?.properties as Record<string, unknown> | undefined
+    const effortEnum = (reasoningProps?.effort as Record<string, unknown> | undefined)?.enum as string[] | undefined
+    if (effortEnum && effortEnum.length > 0) {
+      return { efforts: effortEnum, schemaPath: 'reasoning' }
+    }
   }
   return undefined
 }
@@ -184,8 +194,9 @@ function buildClientModel(input: {
   const outputModalities: ModelModality[] = ['text']
   const output = modelOutputLimit(input.id, input.maxOutputTokens)
   const context = typeof input.maxInputTokens === 'number' && input.maxInputTokens > 0 ? input.maxInputTokens : 200000
-  const reasoning = false
-  const interleaved = false
+  const hasThinking = !!(input.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.thinking || !!(input.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.output_config
+  const reasoning = hasThinking
+  const interleaved = hasThinking ? { field: 'reasoning_content' as const } : false
 
   return {
     id: input.id,
@@ -225,8 +236,9 @@ function buildClientModel(input: {
     inputTypes: input.supportedInputTypes,
     rateMultiplier: input.rateMultiplier,
     rateUnit: input.rateUnit,
-    supportsThinking: !!(input.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.thinking,
-    thinkingEfforts: extractThinkingEfforts(input.additionalModelRequestFieldsSchema),
+    supportsThinking: !!(input.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.thinking || !!(input.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.output_config,
+    thinkingEfforts: extractThinkingSchema(input.additionalModelRequestFieldsSchema)?.efforts,
+    thinkingSchemaPath: extractThinkingSchema(input.additionalModelRequestFieldsSchema)?.schemaPath,
     supportsPromptCaching: input.promptCaching?.supportsPromptCaching || false,
     modelProvider: input.modelProvider || undefined,
     permission: [],
@@ -1005,6 +1017,17 @@ export class ProxyServer {
     console.log('[ProxyServer] Model cache cleared')
   }
 
+  // 从模型缓存查找指定模型的 thinking 配置
+  private getThinkingConfig(modelId: string): ThinkingConfig | undefined {
+    if (!this.modelCache) return undefined
+    const lower = modelId.toLowerCase()
+    const model = this.modelCache.models.find(m => m.modelId.toLowerCase() === lower)
+    if (!model) return undefined
+    const schema = extractThinkingSchema(model.additionalModelRequestFieldsSchema)
+    if (!schema?.schemaPath || !schema.efforts?.length) return undefined
+    return { schemaPath: schema.schemaPath, efforts: schema.efforts }
+  }
+
   // 获取可用模型列表
   private static mapKiroModelToApi(m: KiroModel) {
     return {
@@ -1016,8 +1039,9 @@ export class ProxyServer {
       maxOutputTokens: m.tokenLimits?.maxOutputTokens,
       rateMultiplier: m.rateMultiplier,
       rateUnit: m.rateUnit,
-      supportsThinking: !!(m.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.thinking,
-      thinkingEfforts: extractThinkingEfforts(m.additionalModelRequestFieldsSchema),
+      supportsThinking: !!(m.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.thinking || !!(m.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.output_config,
+      thinkingEfforts: extractThinkingSchema(m.additionalModelRequestFieldsSchema)?.efforts,
+      thinkingSchemaPath: extractThinkingSchema(m.additionalModelRequestFieldsSchema)?.schemaPath,
       supportsPromptCaching: m.promptCaching?.supportsPromptCaching || false,
       modelProvider: m.modelProvider || undefined
     }
@@ -2185,7 +2209,7 @@ export class ProxyServer {
 
     try {
       const toolNameRegistry = new ToolNameRegistry()
-      const kiroPayload = openaiToKiro(openaiRequest, account.profileArn, toolNameRegistry)
+      const kiroPayload = openaiToKiro(openaiRequest, account.profileArn, toolNameRegistry, this.getThinkingConfig(openaiRequest.model))
 
       if (isStream) {
         // SSE 流式
@@ -2258,6 +2282,56 @@ export class ProxyServer {
   // 模型列表缓存
   private modelCache: { models: KiroModel[]; timestamp: number } | null = null
   private readonly MODEL_CACHE_TTL = 5 * 60 * 1000 // 5 分钟缓存
+
+  // Steering 文件缓存（从 config.workspacePath 加载）
+  private steeringDocs: SteeringDocument[] = []
+  private steeringPrompt: string = ''
+
+  /** 加载/刷新 steering 文件缓存。config.workspacePath 变化时调用。 */
+  loadSteering(): void {
+    if (!this.config.workspacePath) {
+      this.steeringDocs = []
+      this.steeringPrompt = ''
+      return
+    }
+    this.steeringDocs = loadSteeringDocuments(this.config.workspacePath)
+    this.steeringPrompt = formatSteeringForPrompt(this.steeringDocs)
+    if (this.steeringPrompt) {
+      console.log(`[ProxyServer] Loaded ${this.steeringDocs.filter(d => d.inclusion === 'always').length} steering files from ${this.config.workspacePath}`)
+    }
+  }
+
+  /** 获取格式化后的 steering prompt（注入到 system message 前面） */
+  getSteeringPrompt(): string {
+    return this.steeringPrompt
+  }
+
+  /** 注入 steering 到 OpenAI 格式请求的 messages（prepend 到 system 消息前面或新增 system 消息） */
+  private injectSteeringOpenAI(messages: OpenAIMessage[]): OpenAIMessage[] {
+    if (!this.steeringPrompt) return messages
+    // 找到第一个 system 消息并 prepend
+    const sysIdx = messages.findIndex(m => m.role === 'system')
+    if (sysIdx >= 0) {
+      const sys = messages[sysIdx]
+      const existingContent = typeof sys.content === 'string' ? sys.content : JSON.stringify(sys.content)
+      return [
+        ...messages.slice(0, sysIdx),
+        { ...sys, content: `${this.steeringPrompt}\n\n${existingContent}` },
+        ...messages.slice(sysIdx + 1)
+      ]
+    }
+    // 没有 system 消息，在最前面加一个
+    return [{ role: 'system', content: this.steeringPrompt }, ...messages]
+  }
+
+  /** 注入 steering 到 Claude 格式请求的 system 字段 */
+  private injectSteeringClaude(system?: string | ClaudeContentBlock[]): string | ClaudeContentBlock[] | undefined {
+    if (!this.steeringPrompt) return system
+    if (!system) return this.steeringPrompt
+    if (typeof system === 'string') return `${this.steeringPrompt}\n\n${system}`
+    // system 是 content block 数组，prepend 一个 text block
+    return [{ type: 'text', text: this.steeringPrompt } as ClaudeContentBlock, ...system]
+  }
 
   // 模型列表
   private async handleModels(res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
@@ -2427,8 +2501,14 @@ export class ProxyServer {
     try {
       const toolNameRegistry = new ToolNameRegistry()
 
+      // 注入 steering 到 system message
+      if (this.steeringPrompt) {
+        processedRequest.messages = this.injectSteeringOpenAI(processedRequest.messages)
+      }
+
       // 转换为 Kiro 格式
-      const kiroPayload = openaiToKiro(processedRequest, account.profileArn, toolNameRegistry)
+      const thinkingConfig = this.getThinkingConfig(processedRequest.model)
+      const kiroPayload = openaiToKiro(processedRequest, account.profileArn, toolNameRegistry, thinkingConfig)
 
       // 记录请求详情到日志
       if (this.config.logRequests) {
@@ -2457,7 +2537,7 @@ export class ProxyServer {
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
-            const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry)
+            const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, thinkingConfig)
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/chat/completions',
@@ -2551,7 +2631,7 @@ export class ProxyServer {
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
-            const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry)
+            const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(processedRequest.model))
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/responses',
@@ -2603,7 +2683,7 @@ export class ProxyServer {
       const { result, account: usedAccount } = await this.callWithRetry(
         account,
         async (acc) => {
-          const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry)
+          const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(processedRequest.model))
           return callKiroApi(acc, retryPayload, signal)
         },
         '/v1/responses',
@@ -2844,7 +2924,13 @@ export class ProxyServer {
     try {
       const toolNameRegistry = new ToolNameRegistry()
 
-      const kiroPayload = claudeToKiro(processedRequest, account.profileArn, toolNameRegistry)
+      // 注入 steering 到 Claude system
+      if (this.steeringPrompt) {
+        processedRequest.system = this.injectSteeringClaude(processedRequest.system) as string | undefined
+      }
+
+      const claudeThinkingConfig = this.getThinkingConfig(processedRequest.model)
+      const kiroPayload = claudeToKiro(processedRequest, account.profileArn, toolNameRegistry, claudeThinkingConfig)
 
       // 构建 prompt cache profile（用于模拟缓存 usage）
       const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(kiroPayload).length * 0.3))
@@ -2889,7 +2975,7 @@ export class ProxyServer {
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
-            const retryPayload = claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry)
+            const retryPayload = claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry, claudeThinkingConfig)
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/messages',

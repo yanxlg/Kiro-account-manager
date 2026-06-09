@@ -35,14 +35,22 @@ export function setUseKProxyForApiInProxy(enabled: boolean): void {
   useKProxyForApi = enabled
 }
 
+// profileArn 自愈持久化回调：当 Enterprise 账号在运行时首次解析出真实 profileArn 时，
+// 通过该回调通知主进程回写到 renderer store + 磁盘，避免每次请求都重新获取。
+type ProfileArnPersistCallback = (accountId: string, profileArn: string) => void
+let profileArnPersistCallback: ProfileArnPersistCallback | undefined
+export function setProfileArnPersistCallback(cb: ProfileArnPersistCallback | undefined): void {
+  profileArnPersistCallback = cb
+}
+
 export function setLogStreamEvents(enabled: boolean): void {
   logStreamEvents = enabled
 }
 
 // Payload 大小限制（KB），用户可在高级设置中调整
-let payloadSizeLimitKB = 1536 // 默认 1.5MB
+let payloadSizeLimitKB = 153600 // 默认 150MB（支持大图片）
 export function setPayloadSizeLimitKB(limitKB: number): void {
-  payloadSizeLimitKB = Math.max(256, Math.min(10240, limitKB))
+  payloadSizeLimitKB = Math.max(256, Math.min(204800, limitKB))
 }
 
 // Token buffer reserve 开关（默认 false = 完全跳过 trimHistoryByTokens）
@@ -178,22 +186,55 @@ function getKiroAmzUserAgent(machineId?: string): string {
   return `aws-sdk-js/${AWS_SDK_VERSION} ${suffix}`
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const KIRO_CLI_OS = OS_PLATFORM === 'win32' ? 'windows' : OS_PLATFORM === 'macos' ? 'macos' : 'linux'
-const KIRO_CLI_USER_AGENT = `aws-sdk-rust/1.3.9 os/${KIRO_CLI_OS} lang/rust/1.87.0`
-const KIRO_CLI_AMZ_USER_AGENT = `aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/${KIRO_CLI_OS} lang/rust/1.87.0 m/E app/AmazonQ-For-CLI`
+void KIRO_CLI_OS // reserved for future kiro-cli UA
 
-// Agent 模式
-const AGENT_MODE_SPEC = 'spec' // IDE 模式
-const AGENT_MODE_VIBE = 'vibe' // CLI 模式
-
-const KIRO_BUILDER_ID_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX'
-const KIRO_SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK'
-
-function resolveProfileArn(account: ProxyAccount): string {
-  if (account.profileArn) return account.profileArn
-  if (account.provider === 'Github' || account.provider === 'Google') return KIRO_SOCIAL_PROFILE_ARN
-  return KIRO_BUILDER_ID_PROFILE_ARN
+// Agent 模式（可通过 setAgentMode 配置切换）
+let configuredAgentMode: 'vibe' | 'spec' = 'vibe'
+export function setAgentMode(mode: 'vibe' | 'spec'): void {
+  configuredAgentMode = mode
 }
+export function getAgentMode(): 'vibe' | 'spec' {
+  return configuredAgentMode
+}
+
+// profileArn 决策中心已迁移到 ../kiroAuthSync，反代和账号管理器主进程共用同一份定义，
+// 防止多处常量漂移。注意 KIRO_BUILDER_ID_PLACEHOLDER_ARN 仍以本模块为出口 re-export，
+// 这样 main/index.ts 等老 import 路径不需要改。
+import {
+  KIRO_BUILDER_ID_PLACEHOLDER_ARN as _KIRO_BUILDER_ID_PLACEHOLDER_ARN,
+  KIRO_SOCIAL_PROFILE_ARN,
+  isPlaceholderProfileArn as _isPlaceholderProfileArn,
+  getEnterpriseFallbackArn
+} from '../kiroAuthSync'
+
+export const KIRO_BUILDER_ID_PLACEHOLDER_ARN = _KIRO_BUILDER_ID_PLACEHOLDER_ARN
+export const isPlaceholderProfileArn = _isPlaceholderProfileArn
+
+/**
+ * 反代调 Kiro API 时使用的 profileArn 决策。
+ * 优先级：真实 ARN（自动获取） > 备用固定 ARN（按账号类型）
+ * - 已有真实 ARN（非占位符） → 直接用
+ * - Enterprise/IdC → 区域化备用 ARN（自动获取失败时兜底）
+ * - Social（Github/Google） → 固定 social ARN
+ * - BuilderId → 占位符 ARN
+ */
+function resolveProfileArn(account: ProxyAccount): string | undefined {
+  if (account.profileArn && !isPlaceholderProfileArn(account.profileArn)) {
+    return account.profileArn
+  }
+  if (account.provider === 'Enterprise' || account.authMethod === 'external_idp') {
+    return getEnterpriseFallbackArn(account.region)
+  }
+  if (account.authMethod === 'social' || account.provider === 'Github' || account.provider === 'Google') {
+    return KIRO_SOCIAL_PROFILE_ARN
+  }
+  return KIRO_BUILDER_ID_PLACEHOLDER_ARN
+}
+
+// 兼容 SDK 部分调用仍想知道社交 ARN 的场景（极少；保留 export 不破坏外部 import）
+export { KIRO_SOCIAL_PROFILE_ARN }
 
 // Agentic 模式系统提示 - 防止大文件写入超时
 const AGENTIC_SYSTEM_PROMPT = `# CRITICAL: CHUNKED WRITE PROTOCOL (MANDATORY)
@@ -327,7 +368,7 @@ function isCodeWhispererModelId(modelId: string): boolean {
 }
 
 function getModelCacheKey(account: ProxyAccount): string {
-  return `${account.id}:${account.region || 'us-east-1'}:${resolveProfileArn(account)}`
+  return `${account.id}:${account.region || 'us-east-1'}:${resolveProfileArn(account) ?? 'no-arn'}`
 }
 
 async function getCachedCodeWhispererModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
@@ -1138,19 +1179,25 @@ function getAccountMachineId(accountId: string, accountMachineId?: string): stri
 
 // 获取认证方式对应的请求头
 function getAuthHeaders(account: ProxyAccount, _endpoint: typeof KIRO_ENDPOINTS[0]): Record<string, string> {
-  const isIDC = account.authMethod?.toLowerCase() === 'idc'
   const machineId = getAccountMachineId(account.id, account.machineId)
-  const agentMode = isIDC ? AGENT_MODE_VIBE : AGENT_MODE_SPEC
+  // 按配置的 agent 模式（vibe 或 spec）设置 header
+  const agentMode = configuredAgentMode
   
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     'x-amzn-kiro-agent-mode': agentMode,
-    'x-amz-user-agent': isIDC ? KIRO_CLI_AMZ_USER_AGENT : getKiroAmzUserAgent(machineId),
-    'user-agent': isIDC ? KIRO_CLI_USER_AGENT : getKiroUserAgent(machineId),
+    'x-amz-user-agent': getKiroAmzUserAgent(machineId),
+    'user-agent': getKiroUserAgent(machineId),
     'amz-sdk-invocation-id': uuidv4(),
     'amz-sdk-request': 'attempt=1; max=3',
     'Authorization': `Bearer ${account.accessToken}`
   }
+
+  // Enterprise External IdP 需要额外的 TokenType header（官方 addExternalIdpTokenTypeMiddleware）
+  if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') {
+    headers['TokenType'] = 'EXTERNAL_IDP'
+  }
+
   return headers
 }
 
@@ -1195,14 +1242,31 @@ export async function callKiroApiStream(
   signal?: AbortSignal,
   preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
 ): Promise<void> {
+  const isEnterprise = account.provider === 'Enterprise' || account.authMethod === 'external_idp'
+  // 所有账号类型均走正常端点优先级（含 fallback），不再强制 Enterprise 走 CodeWhisperer
   const endpoints = getSortedEndpoints(preferredEndpoint)
+
+  // Enterprise 缺 profileArn 时调 API 获取；BuilderId/Social 不需要（resolveProfileArn 会兜底，流式端点自动不传占位符）
+  if (!account.profileArn && isEnterprise) {
+    const fetchedArn = await fetchEnterpriseProfileArn(account)
+    if (fetchedArn) {
+      account.profileArn = fetchedArn
+      if (account.id) profileArnPersistCallback?.(account.id, fetchedArn)
+    }
+  }
+
   let lastError: Error | null = null
 
   for (const endpoint of endpoints) {
     try {
       throwIfAborted(signal)
       const requestPayload = clonePayload(payload)
-      requestPayload.profileArn = resolveProfileArn(account)
+      // profileArn 决策：后端所有端点均强制要求 profileArn（400 "profileArn is required"）
+      // resolveProfileArn 按账号类型返回：BuilderId→占位符 / Social→固定 / Enterprise→真实ARN
+      const resolvedArn = resolveProfileArn(account)
+      if (resolvedArn) {
+        requestPayload.profileArn = resolvedArn
+      }
       const requestedModelId = getPayloadModelId(requestPayload)
       if (endpoint.name === 'CodeWhisperer') {
         applyPayloadModelId(requestPayload, await resolveCodeWhispererModelId(account, requestedModelId, signal))
@@ -1276,6 +1340,50 @@ export async function callKiroApiStream(
       if ((error as Error).message.includes('Auth error')) {
         onError(error as Error)
         return
+      }
+
+      // THINKING_SIGNATURE_INVALID: 剥离 history 中 reasoningContent 后重试一次（官方 IDE 同策略）
+      const errMsg = (error as Error).message || ''
+      if (errMsg.includes('THINKING_SIGNATURE_INVALID')) {
+        console.log(`[KiroAPI] THINKING_SIGNATURE_INVALID on ${endpoint.name}, retrying with reasoningContent stripped`)
+        try {
+          throwIfAborted(signal)
+          const retryPayload = clonePayload(payload)
+          // 剥离 history 中所有 assistantResponseMessage.reasoningContent
+          if (retryPayload.conversationState.history) {
+            for (const msg of retryPayload.conversationState.history) {
+              if (msg.assistantResponseMessage?.reasoningContent !== undefined) {
+                delete (msg.assistantResponseMessage as unknown as Record<string, unknown>).reasoningContent
+              }
+            }
+          }
+          // 复用同一端点的配置（与主流程 profileArn 逻辑一致）
+          const resolvedArn2 = resolveProfileArn(account)
+          if (resolvedArn2 && (!isPlaceholderProfileArn(resolvedArn2) || isEnterprise)) {
+            retryPayload.profileArn = resolvedArn2
+          } else {
+            delete retryPayload.profileArn
+          }
+          if (endpoint.name === 'CodeWhisperer') {
+            applyPayloadModelId(retryPayload, await resolveCodeWhispererModelId(account, getPayloadModelId(retryPayload), signal))
+          }
+          applyPayloadOrigin(retryPayload, endpoint.origin)
+          const retryStr = JSON.stringify(retryPayload)
+          const retryHeaders = getAuthHeaders(account, endpoint)
+          const retryAgent = getNetworkAgent(account)
+          const retryResponse = retryAgent
+            ? await undiciFetch(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal, dispatcher: retryAgent } as UndiciRequestInit) as unknown as Response
+            : await fetch(endpoint.url, { method: 'POST', headers: retryHeaders, body: retryStr, signal })
+          if (retryResponse.ok) {
+            await parseEventStream(retryResponse.body!, onChunk, onComplete, onError, retryStr.length, signal, getPayloadModelId(retryPayload), retryStr)
+            return
+          }
+          const retryBody = await retryResponse.text()
+          console.error(`[KiroAPI] THINKING_SIGNATURE_INVALID retry also failed: ${retryResponse.status} ${retryBody.slice(0, 200)}`)
+        } catch (retryErr) {
+          if (signal?.aborted) { onError(getAbortError(signal)); return }
+          console.error(`[KiroAPI] THINKING_SIGNATURE_INVALID retry error:`, retryErr)
+        }
       }
     }
   }
@@ -1356,7 +1464,7 @@ async function parseEventStream(
     reader.cancel(getAbortError(signal)).catch(() => undefined)
   }
   let buffer = new Uint8Array(0)
-  let usage = { 
+  let usage: KiroUsage = { 
     inputTokens: 0, 
     outputTokens: 0, 
     credits: 0,
@@ -1388,6 +1496,135 @@ async function parseEventStream(
   // Tool use 状态跟踪 - 用于累积输入片段
   let currentToolUse: ToolUseState | null = null
   const processedIds = new Set<string>()
+
+  // ===== 工具调用 XML 泄漏修复（跨帧解析 + 流结束去重）=====
+  // 背景：Kiro 后端偶尔把模型的工具调用 XML（<function_calls>/<invoke>/<parameter>，
+  //       <function_calls> 有时被损坏成纯文本 "count"）当普通文本，混在
+  //       assistantResponseEvent / codeEvent 里【流式分帧】发出。原先的逐帧
+  //       `content.replace(/<tool_use.../)` 只覆盖 <tool_use> 且无法匹配跨帧分片的标签，
+  //       导致：原始 XML 泄漏成可见文本，且客户端解析不到工具调用 → 工具不执行、任务中断。
+  // 方案：用有状态的跨帧过滤器分离「正常文本」与「泄漏的工具调用」；正常文本照常输出，
+  //       泄漏工具解析为结构化 tool_use 暂存；流结束时与已见的结构化 toolUseEvent 去重
+  //       （同名同参丢弃，避免重复执行）后注入救回。
+  // 开关：环境变量 KIRO_TOOL_LEAK_FIX=off 可回退到原逐帧 <tool_use> 过滤。
+  const toolLeakFixEnabled = (process.env.KIRO_TOOL_LEAK_FIX || 'on').toLowerCase().trim() !== 'off'
+  const toolLeakDebug = process.env.KIRO_TOOL_LEAK_DEBUG === '1'
+  let leakCarry = ''
+  const leakedTools: Array<{ name: string; input: Record<string, unknown> }> = []
+  const seenToolSigs = new Set<string>()
+  let leakIdCounter = 0
+  const toolSig = (name: string, input: Record<string, unknown>): string => {
+    const sortedKeys = Object.keys(input).sort()
+    const norm: Record<string, unknown> = {}
+    for (const k of sortedKeys) norm[k] = input[k]
+    return name + '|' + JSON.stringify(norm)
+  }
+  const parseInvokeBody = (name: string, body: string): { name: string; input: Record<string, unknown> } => {
+    const input: Record<string, unknown> = {}
+    const re = /<parameter name="([^"]+)">([\s\S]*?)<\/parameter>/g
+    let m: RegExpExecArray | null
+    while ((m = re.exec(body)) !== null) {
+      const key = m[1]
+      const raw = m[2]
+      const t = raw.trim()
+      // 类型还原：布尔/数字/null 转换，其余保留原字符串（保留内部空白，如 command/old_string）
+      if (t === 'true') input[key] = true
+      else if (t === 'false') input[key] = false
+      else if (t === 'null') input[key] = null
+      else if (/^-?\d+$/.test(t)) input[key] = parseInt(t, 10)
+      else if (/^-?\d*\.\d+$/.test(t)) input[key] = parseFloat(t)
+      else input[key] = raw
+    }
+    return { name, input }
+  }
+  const stripToolPrefix = (pre: string): string => {
+    const fc = pre.match(/<function_calls>\s*$/)
+    if (fc) return pre.slice(0, pre.length - fc[0].length)
+    const ct = pre.match(/count\s*$/)
+    if (ct) return pre.slice(0, pre.length - ct[0].length)
+    return pre
+  }
+  const hasOpenInvoke = (s: string): boolean => {
+    const i = s.lastIndexOf('<invoke name=')
+    if (i === -1) return false
+    return !s.slice(i).includes('</invoke>')
+  }
+  const pendingToolTail = (s: string): number => {
+    const markers = ['<function_calls>', '<invoke name=', '</invoke>', '</function_calls>', '<parameter name=', '</parameter>', 'count']
+    let hold = 0
+    for (const tag of markers) {
+      for (let k = Math.min(s.length, tag.length - 1); k >= 1; k--) {
+        if (s.slice(s.length - k) === tag.slice(0, k)) {
+          if (k > hold) hold = k
+          break
+        }
+      }
+    }
+    const cm = s.match(/count\s*$/)
+    if (cm && cm[0].length > hold) hold = cm[0].length
+    const cm2 = s.match(/count\s*<[\s\S]*$/)
+    if (cm2 && cm2[0].length > hold) hold = cm2[0].length
+    return hold
+  }
+  // 处理 leakCarry：正常文本经 onChunk 输出，泄漏工具暂存 leakedTools。isFlush 时吐出残留。
+  const filterToolLeak = (isFlush: boolean): void => {
+    const emit = (s: string): void => {
+      if (!s) return
+      onChunk(s)
+      totalOutputChars += s.length
+      collectedOutputText += s
+    }
+    // 提取所有已闭合的 invoke
+    for (;;) {
+      const fi = leakCarry.indexOf('<invoke name=')
+      if (fi === -1) break
+      const ci = leakCarry.indexOf('</invoke>', fi)
+      if (ci === -1) break // 未闭合，等更多帧
+      emit(stripToolPrefix(leakCarry.slice(0, fi)))
+      const localRe = /<invoke name="([^"]+)">([\s\S]*?)<\/invoke>/g
+      localRe.lastIndex = fi
+      let m: RegExpExecArray | null
+      let consumedEnd = ci + '</invoke>'.length
+      while ((m = localRe.exec(leakCarry)) !== null) {
+        if (m.index > consumedEnd + 30) break
+        const tool = parseInvokeBody(m[1], m[2])
+        leakedTools.push(tool)
+        if (toolLeakDebug) {
+          try {
+            console.log('[tool-leak-fix] parsed leaked tool:', tool.name, JSON.stringify(tool.input).slice(0, 120))
+          } catch {
+            /* ignore */
+          }
+        }
+        consumedEnd = m.index + m[0].length
+      }
+      const fcClose = leakCarry.slice(consumedEnd).match(/^\s*<\/function_calls>/)
+      if (fcClose) consumedEnd += fcClose[0].length
+      leakCarry = leakCarry.slice(consumedEnd)
+    }
+    if (hasOpenInvoke(leakCarry)) {
+      if (isFlush) {
+        // 流结束仍未闭合 = 损坏的工具调用，原样当文本输出（不丢字符）
+        emit(leakCarry)
+        leakCarry = ''
+        return
+      }
+      const oi = leakCarry.indexOf('<invoke name=')
+      const safe = stripToolPrefix(leakCarry.slice(0, oi))
+      emit(safe)
+      leakCarry = leakCarry.slice(safe.length)
+      return
+    }
+    if (isFlush) {
+      emit(leakCarry)
+      leakCarry = ''
+      return
+    }
+    const hold = pendingToolTail(leakCarry)
+    emit(leakCarry.slice(0, leakCarry.length - hold))
+    leakCarry = leakCarry.slice(leakCarry.length - hold)
+  }
+  // ===== 工具调用 XML 泄漏修复 end =====
 
   try {
     throwIfAborted(signal)
@@ -1444,13 +1681,21 @@ async function parseEventStream(
             // 根据 event type 处理不同类型的事件
             if (eventType === 'assistantResponseEvent' || event.assistantResponseEvent) {
               const assistantResp = event.assistantResponseEvent || event
-              const content = assistantResp.content
+              const content = assistantResp.content as string | undefined
               if (content) {
-                onChunk(content)
-                // 累积输出字符长度（兜底估算用）
-                totalOutputChars += content.length
-                // 累积输出文本（tiktoken 精确计算用）
-                collectedOutputText += content
+                if (toolLeakFixEnabled) {
+                  // 跨帧过滤：分离正常文本与泄漏的工具调用 XML
+                  leakCarry += content
+                  filterToolLeak(false)
+                } else {
+                  // 回退：原逐帧 <tool_use> 过滤
+                  const stripped = content.replace(/<tool_use\b[^>]*>[\s\S]*?<\/tool_use>/g, '').trim()
+                  if (stripped) {
+                    onChunk(stripped)
+                    totalOutputChars += stripped.length
+                    collectedOutputText += stripped
+                  }
+                }
               }
             }
 
@@ -1459,11 +1704,19 @@ async function parseEventStream(
             // CodeWhisperer/AmazonQ 端点用 AssistantResponseEvent 包代码，CLI 端点单独用 CodeEvent
             if (eventType === 'codeEvent' || event.codeEvent) {
               const codeResp = event.codeEvent || event
-              const content = codeResp.content
+              const content = codeResp.content as string | undefined
               if (content) {
-                onChunk(content)
-                totalOutputChars += content.length
-                collectedOutputText += content
+                if (toolLeakFixEnabled) {
+                  leakCarry += content
+                  filterToolLeak(false)
+                } else {
+                  const stripped = content.replace(/<tool_use\b[^>]*>[\s\S]*?<\/tool_use>/g, '').trim()
+                  if (stripped) {
+                    onChunk(stripped)
+                    totalOutputChars += stripped.length
+                    collectedOutputText += stripped
+                  }
+                }
               }
             }
             
@@ -1498,6 +1751,9 @@ async function parseEventStream(
                       name: currentToolUse.name,
                       input: finalInput
                     })
+                    if (toolLeakFixEnabled) {
+                      try { seenToolSigs.add(toolSig(currentToolUse.name, finalInput)) } catch { /* ignore */ }
+                    }
                     totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
                     processedIds.add(currentToolUse.toolUseId)
                   }
@@ -1554,8 +1810,11 @@ async function parseEventStream(
                   name: currentToolUse.name,
                   input: finalInput
                 })
+                if (toolLeakFixEnabled && !parseError) {
+                  try { seenToolSigs.add(toolSig(currentToolUse.name, finalInput)) } catch { /* ignore */ }
+                }
                 totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
-                
+
                 // 如果解析失败，额外发送一条文本消息告知用户
                 if (parseError) {
                   onChunk(`\n\n⚠️ Tool "${currentToolUse.name}" input was truncated by Kiro API. The output may be incomplete due to token limits.`)
@@ -1666,11 +1925,20 @@ async function parseEventStream(
               proxyLogger.debug('Kiro', 'supplementaryWebLinksEvent', JSON.stringify(webLinksEvent).slice(0, 300))
             }
             
-            // 处理 contextUsageEvent - 上下文使用百分比（反推真实 inputTokens）
+            // 处理 contextUsageEvent - 上下文使用百分比 + breakdown（Conversation/MCP tools/Steering files）
             if (eventType === 'contextUsageEvent' || event.contextUsageEvent) {
               const contextEvent = event.contextUsageEvent || event
               if (contextEvent.contextUsagePercentage !== undefined) {
                 const percentage = contextEvent.contextUsagePercentage
+                // 捕获 breakdown 并存入 usage.contextUsage
+                usage.contextUsage = {
+                  percentage,
+                  breakdown: contextEvent.breakdown ? {
+                    conversation: contextEvent.breakdown.conversation,
+                    mcpTools: contextEvent.breakdown.mcpTools,
+                    steeringFiles: contextEvent.breakdown.steeringFiles
+                  } : undefined
+                }
                 // 若已拿到真实 tokenUsage，仅记录百分比，不覆盖 inputTokens
                 if (hasRealTokenUsage) {
                   proxyLogger.info('Kiro', `contextUsageEvent - Context usage: ${percentage.toFixed(2)}% (real tokenUsage already received)`)
@@ -1684,6 +1952,9 @@ async function parseEventStream(
                   } else {
                     proxyLogger.info('Kiro', `contextUsageEvent - Context usage: ${percentage.toFixed(2)}%`)
                   }
+                }
+                if (usage.contextUsage.breakdown) {
+                  proxyLogger.info('Kiro', `contextUsage breakdown: conversation=${usage.contextUsage.breakdown.conversation || 0}% mcpTools=${usage.contextUsage.breakdown.mcpTools || 0}% steering=${usage.contextUsage.breakdown.steeringFiles || 0}%`)
                 }
                 // 如果上下文使用率超过 80%，发送警告
                 if (percentage > 80) {
@@ -1700,7 +1971,7 @@ async function parseEventStream(
                 proxyLogger.info('Kiro', `Received reasoning content (isThinking=true): ${reasoning.text.slice(0, 50)}...`)
                 onChunk(reasoning.text, undefined, true, reasoning.signature, undefined)
                 totalOutputChars += reasoning.text.length
-                usage.reasoningTokens += Math.max(1, Math.round(reasoning.text.length * 0.4))
+                usage.reasoningTokens = (usage.reasoningTokens || 0) + Math.max(1, Math.round(reasoning.text.length * 0.4))
               } else if (reasoning.signature && !reasoning.redactedContent) {
                 onChunk('', undefined, true, reasoning.signature, undefined)
               }
@@ -1810,7 +2081,12 @@ async function parseEventStream(
         buffer = buffer.slice(totalLength)
       }
     }
-    
+
+    // 工具调用 XML 泄漏修复：flush 过滤器残留文本
+    if (toolLeakFixEnabled) {
+      try { filterToolLeak(true) } catch { /* ignore */ }
+    }
+
     // 完成任何未完成的 tool use
     if (currentToolUse && !processedIds.has(currentToolUse.toolUseId)) {
       let finalInput: Record<string, unknown> = {}
@@ -1824,9 +2100,35 @@ async function parseEventStream(
         name: currentToolUse.name,
         input: finalInput
       })
+      if (toolLeakFixEnabled) {
+        try { seenToolSigs.add(toolSig(currentToolUse.name, finalInput)) } catch { /* ignore */ }
+      }
       totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
     }
-    
+
+    // 工具调用 XML 泄漏修复：流结束统一去重后注入救回的工具
+    // 与已见的结构化 toolUseEvent 同名同参的丢弃（避免重复执行），其余注入为结构化 tool_use
+    if (toolLeakFixEnabled && leakedTools.length > 0) {
+      let rescued = 0
+      let deduped = 0
+      for (const lt of leakedTools) {
+        let sig: string
+        try { sig = toolSig(lt.name, lt.input) } catch { sig = lt.name + '|?' }
+        if (seenToolSigs.has(sig)) {
+          deduped++
+          continue
+        }
+        seenToolSigs.add(sig)
+        leakIdCounter++
+        const rescuedId = `toolleakfix_${Date.now().toString(36)}_${leakIdCounter.toString(36)}`
+        onChunk('', { toolUseId: rescuedId, name: lt.name, input: lt.input })
+        rescued++
+      }
+      if (rescued > 0 || toolLeakDebug) {
+        proxyLogger.info('Kiro', `Tool-leak-fix: leaked=${leakedTools.length} rescued=${rescued} deduped=${deduped}`)
+      }
+    }
+
     // 如果 API 没有返回 token 信息，优先用 tiktoken 精确计算，兜底字符系数
     if (usage.outputTokens === 0 && totalOutputChars > 0) {
       if (collectedOutputText) {
@@ -1938,6 +2240,70 @@ function getQServiceEndpoint(region?: string): string {
   return 'https://q.us-east-1.amazonaws.com'
 }
 
+// 根据账号区域获取 CodeWhisperer Runtime 端点
+function getCodeWhispererEndpoint(region?: string): string {
+  if (region?.startsWith('eu-')) return 'https://codewhisperer.eu-central-1.amazonaws.com'
+  return 'https://codewhisperer.us-east-1.amazonaws.com'
+}
+
+/**
+ * Enterprise 账号获取 profileArn（通过 CodeWhisperer Runtime 的 /ListAvailableProfiles）
+ * 官方 IDE 在认证后通过此 API 获取可用 profiles，用户选择后存储 ARN。
+ * 反代自动取第一个 profile。
+ */
+export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<string | undefined> {
+  const baseUrl = getCodeWhispererEndpoint(account.region)
+  const url = `${baseUrl}/ListAvailableProfiles`
+  const machineId = getAccountMachineId(account.id, account.machineId)
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${account.accessToken}`,
+    'x-amz-user-agent': getKiroAmzUserAgent(machineId),
+    'user-agent': getKiroUserAgent(machineId),
+    'amz-sdk-invocation-id': uuidv4(),
+    'amz-sdk-request': 'attempt=1; max=1'
+  }
+
+  // 获取该账号类型对应的备用 ARN（403 时兜底，避免每次请求都重复尝试）
+  const fallbackArn = resolveProfileArn(account)
+
+  try {
+    const response = await fetchWithProxy(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({})
+    }, account)
+
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => '')
+      console.error(`[KiroAPI] ListAvailableProfiles failed: ${response.status}`, errBody.slice(0, 200))
+      // 403 = 无权限（BuilderId/Social 账号不支持此 API）→ 返回备用 ARN 作为缓存，不再重复尝试
+      if (response.status === 403 && fallbackArn) {
+        console.log(`[KiroAPI] Using fallback profileArn for ${account.provider || 'unknown'}: ${fallbackArn}`)
+        return fallbackArn
+      }
+      return undefined
+    }
+
+    const data = await response.json() as { profiles?: Array<{ arn?: string; profileName?: string }> }
+    const profiles = data.profiles || []
+    if (profiles.length === 0) {
+      console.warn('[KiroAPI] ListAvailableProfiles: no profiles returned')
+      return undefined
+    }
+
+    const arn = profiles[0].arn
+    if (arn) {
+      console.log(`[KiroAPI] Enterprise profileArn resolved: ${arn}`)
+    }
+    return arn || undefined
+  } catch (error) {
+    console.error('[KiroAPI] fetchEnterpriseProfileArn error:', error)
+    return undefined
+  }
+}
+
 // 获取 Kiro 官方模型列表（支持分页，与官方插件一致传递 profileArn）
 export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
   const baseUrl = getQServiceEndpoint(account.region)
@@ -1955,10 +2321,25 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
   const allModels: KiroModel[] = []
   let nextToken: string | undefined
 
+  // Enterprise 缺 profileArn 时调 API 获取；BuilderId/Social 不需要（resolveProfileArn 会兜底）
+  const isEnterprise = account.provider === 'Enterprise' || account.authMethod === 'external_idp'
+  if (!account.profileArn && isEnterprise) {
+    const fetchedArn = await fetchEnterpriseProfileArn(account)
+    if (fetchedArn) {
+      account.profileArn = fetchedArn
+      if (account.id) profileArnPersistCallback?.(account.id, fetchedArn)
+    }
+  }
+
   try {
     do {
       const params = new URLSearchParams({ origin: 'AI_EDITOR', maxResults: '50' })
-      params.set('profileArn', resolveProfileArn(account))
+      const arnForModels = resolveProfileArn(account)
+      // profileArn 决策由 resolveProfileArn 统一处理：
+      //   - BuilderId → 占位符 ARN（ListAvailableModels 需要，有效）
+      //   - Github/Google → social ARN（有效）
+      //   - Enterprise → 真实 ARN（上方已自愈获取）
+      if (arnForModels) params.set('profileArn', arnForModels)
       if (nextToken) params.set('nextToken', nextToken)
 
       const url = `${baseUrl}/ListAvailableModels?${params.toString()}`
@@ -1967,7 +2348,8 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
       throwIfAborted(signal)
       
       if (!response.ok) {
-        console.error('[KiroAPI] ListAvailableModels failed:', response.status)
+        const errBody = await response.text().catch(() => '')
+        console.error(`[KiroAPI] ListAvailableModels failed: ${response.status}`, errBody.slice(0, 300))
         break
       }
 
@@ -2035,10 +2417,11 @@ export async function fetchAvailableSubscriptions(account: ProxyAccount): Promis
   }
 
   const profileArn = resolveProfileArn(account)
-  const body = JSON.stringify({ profileArn })
+  const body = JSON.stringify(profileArn ? { profileArn } : {})
 
   console.log(`[KiroAPI] ListAvailableSubscriptions [${account.email || account.id.slice(0, 8)}]`, {
-    url
+    url,
+    hasProfileArn: profileArn !== undefined
   })
 
   try {
@@ -2085,11 +2468,13 @@ export async function fetchSubscriptionToken(
 
   const profileArn = resolveProfileArn(account)
 
-  // clientToken 是必需参数，需要生成 UUID
+  // clientToken 是必需参数；profileArn 仅在解析出有效值时附带
   const payload: Record<string, string> = {
     clientToken: uuidv4(),
-    profileArn,
     provider: 'STRIPE'
+  }
+  if (profileArn) {
+    payload.profileArn = profileArn
   }
   if (subscriptionType) {
     payload.subscriptionType = subscriptionType
@@ -2131,10 +2516,13 @@ export async function setUserPreference(
   }
 
   const profileArn = resolveProfileArn(account)
-  const body = JSON.stringify({
-    overageConfiguration: { overageStatus },
-    profileArn
-  })
+  const bodyPayload: Record<string, unknown> = {
+    overageConfiguration: { overageStatus }
+  }
+  if (profileArn) {
+    bodyPayload.profileArn = profileArn
+  }
+  const body = JSON.stringify(bodyPayload)
 
   try {
     const response = await fetchWithProxy(url, { method: 'POST', headers, body }, account)
