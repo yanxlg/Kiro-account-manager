@@ -151,8 +151,14 @@ export class IslandManager {
   exitIslandMode(): void {
     // 退出前保存窗口的实际位置（而非依赖拖拽时的计算值，确保恢复精准）
     if (this.window && !this.window.isDestroyed()) {
-      const [wx, wy] = this.window.getPosition()
-      this.deps.saveSettings({ position: { x: wx, y: wy } })
+      try {
+        const [wx, wy] = this.window.getPosition()
+        if (Number.isFinite(wx) && Number.isFinite(wy)) {
+          this.deps.saveSettings({ position: { x: wx, y: wy } })
+        }
+      } catch {
+        // ignore position read errors
+      }
       this.window.hide()
     }
     this.mode = 'window'
@@ -225,7 +231,11 @@ export class IslandManager {
 
     ipcMain.on('island:drag-move', (_e, pos: { x: number; y: number }) => {
       if (this.window && !this.window.isDestroyed() && pos && Number.isFinite(pos.x) && Number.isFinite(pos.y)) {
-        this.window.setPosition(Math.round(pos.x), Math.round(pos.y))
+        try {
+          this.window.setPosition(Math.round(pos.x), Math.round(pos.y))
+        } catch {
+          // Ignore position errors during rapid drag
+        }
       }
     })
 

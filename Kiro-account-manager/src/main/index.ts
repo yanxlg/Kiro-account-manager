@@ -2576,7 +2576,9 @@ app.whenReady().then(async () => {
 
   // IPC: 渲染进程推送灵动岛展示偏好（隐私模式 + 已解析主题色）
   ipcMain.on('update-island-prefs', (_event, prefs: IslandPrefs) => {
-    islandManager?.pushPrefs(prefs)
+    if (prefs && typeof prefs === 'object') {
+      islandManager?.pushPrefs(prefs)
+    }
   })
   ipcMain.on('update-tray-account', (_event, account: typeof currentProxyAccount) => {
     currentProxyAccount = account
