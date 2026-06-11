@@ -54,6 +54,7 @@ function AccountListRowComponent({
 }: AccountListRowProps): React.ReactNode {
   const {
     setActiveAccount,
+    setActiveCliAccount,
     removeAccount,
     checkAccountStatus,
     refreshAccountToken,
@@ -205,11 +206,16 @@ function AccountListRowComponent({
     }
 
     if (success) {
-      setActiveAccount(account.id)
+      if (target === 'ide' || target === 'both') {
+        setActiveAccount(account.id)
+      }
+      if (target === 'cli' || target === 'both') {
+        setActiveCliAccount(account.id)
+      }
     } else {
       alert(isEn ? `Switch failed: ${errorMsg}` : `切换失败：${errorMsg}`)
     }
-  }, [account, isEn, setActiveAccount])
+  }, [account, isEn, setActiveAccount, setActiveCliAccount])
 
   const handleRefresh = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation()

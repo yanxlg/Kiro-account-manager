@@ -134,6 +134,7 @@ export interface CheckResult {
   skillName: string
   status: SkillUpdateStatus
   reason?: string
+  remoteVersion?: string // 远端检测到的版本号（用于 UI 展示和版本缓存）
   checkedAt: string // ISO 8601
 }
 
@@ -182,7 +183,8 @@ async function fetchGitHubTree(
 
       if (resp.status === 403 || resp.status === 429) {
         const result: TreeResult = { error: 'GitHub API 速率限制' }
-        gitHubTreeCache.set(cacheKey, result)
+        // 不缓存 rate limit 错误，下次请求时重试（可能 token 已更新）
+        gitHubTreeCache.delete(cacheKey)
         return result
       }
       if (resp.status === 404) {
@@ -397,30 +399,126 @@ async function detectGitHub(
     return { ...base, status: 'unsupported', reason: 'Plugin 安装缺少来源追踪信息' }
   }
 
-  const ref = lockEntry.ref || '' // 空表示需要 fallback 尝试 main/master
-  // Strip trailing SKILL.md from skillPath to get the directory path
+  const ref = lockEntry.ref || ''
   const skillDir = skillPath.replace(/\/?SKILL\.md$/i, '').replace(/^\/+|\/+$/g, '')
   const localHash = lockEntry.skillFolderHash || ''
+  const localVersion = skillView.version || await readLocalVersion(skillView.path)
 
-  // 如果 lock 里有明确的 ref 就只试一次，没有就先试 main 再试 master
   const refsToTry = ref ? [ref] : ['main', 'master']
   let lastError = ''
+
   for (const tryRef of refsToTry) {
+    // 1. 尝试通过版本号比较（plugin.json / package.json）
+    const versionResult = await fetchRemoteVersionGitHub(ownerRepo, tryRef, skillDir, timeoutMs, githubToken)
+    if (versionResult && localVersion) {
+      const cmp = comparePluginVersion(versionResult, localVersion, base)
+      return { ...cmp, remoteVersion: versionResult }
+    }
+    // 即使没有本地版本，也记录远端版本
+    if (versionResult && !localVersion) {
+      // 无本地版本无法比较 → fallback 到 hash，但携带 remoteVersion
+      const result = await getGitHubTreeSha(ownerRepo, tryRef, skillDir, timeoutMs, githubToken)
+      if ('sha' in result) {
+        if (!localHash) return { ...base, status: 'latest', remoteVersion: versionResult }
+        return { ...base, status: result.sha !== localHash ? 'available' : 'latest', remoteVersion: versionResult }
+      }
+      lastError = result.error
+      if (result.error !== '仓库不存在或已删除') break
+      continue
+    }
+
+    // 2. fallback: tree SHA 比较
     const result = await getGitHubTreeSha(ownerRepo, tryRef, skillDir, timeoutMs, githubToken)
     if ('sha' in result) {
-      if (!localHash) return { ...base, status: 'latest' } // 首次检测无本地 hash
+      if (!localHash) return { ...base, status: 'latest' }
       return { ...base, status: result.sha !== localHash ? 'available' : 'latest' }
     }
     lastError = result.error
-    // 如果是 "仓库不存在" 可能只是分支不对，继续试下一个
     if (result.error !== '仓库不存在或已删除') break
   }
 
-  // All refs tried, return the last error
   if (lastError === '上游 skill 不存在或已删除') {
     return { ...base, status: 'unsupported', reason: lastError }
   }
   return { ...base, status: 'failed', reason: lastError || '检查失败' }
+}
+
+/**
+ * 从 GitHub 远端尝试获取 skill 的版本号。
+ * 利用已缓存的 recursive tree 搜索 package.json / plugin.json，
+ * 找到后用 Contents API 读取内容获取 version 字段。
+ * 优先从 skill 目录最近的版本文件开始查找。
+ */
+async function fetchRemoteVersionGitHub(
+  ownerRepo: string,
+  ref: string,
+  skillDir: string,
+  timeoutMs: number,
+  githubToken?: string
+): Promise<string | null> {
+  // 利用 tree cache 找到所有 package.json 和 plugin.json
+  const treeResult = await fetchGitHubTree(ownerRepo, ref, timeoutMs, githubToken)
+  if ('error' in treeResult) {
+    console.log(`[Detector] fetchRemoteVersionGitHub: tree fetch failed for ${ownerRepo}#${ref}: ${treeResult.error}`)
+    return null
+  }
+
+  // 从 tree 中筛选版本文件候选
+  const versionFiles = treeResult.tree.filter(
+    (entry) =>
+      entry.type === 'blob' &&
+      (entry.path.endsWith('/package.json') ||
+        entry.path === 'package.json' ||
+        entry.path.endsWith('/plugin.json') ||
+        entry.path.endsWith('/marketplace.json') ||
+        entry.path === 'marketplace.json')
+  )
+
+  // 按与 skillDir 的亲近度排序：skill 目录自身 > 逐级父目录 > 根级
+  const normalizedSkillDir = skillDir.replace(/^\/+|\/+$/g, '')
+  const skillParts = normalizedSkillDir.split('/')
+  const scored = versionFiles
+    .map((entry) => {
+      const dir = entry.path.includes('/') ? entry.path.replace(/\/[^/]+$/, '') : '' // 文件所在目录（根级文件为空字符串）
+      let score = 999
+
+      if (dir === normalizedSkillDir) {
+        score = 0 // skill 目录本身
+      } else if (normalizedSkillDir.startsWith(dir + '/') && dir !== '') {
+        // 是 skillDir 的祖先目录，层级越近分越低
+        score = skillParts.length - dir.split('/').length
+      } else if (dir === '' || !dir.includes('/')) {
+        // 根级文件或根级子目录（如 .claude-plugin/marketplace.json）
+        score = skillParts.length + 1
+      }
+      return { entry, score }
+    })
+    .filter((item) => item.score < 999)
+    .sort((a, b) => a.score - b.score)
+
+  // 依次尝试读取候选文件的 version 字段
+  for (const { entry } of scored) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const refParam = ref ? `?ref=${encodeURIComponent(ref)}` : ''
+      const url = `https://api.github.com/repos/${ownerRepo}/contents/${entry.path}${refParam}`
+      const headers: Record<string, string> = { Accept: 'application/vnd.github.v3.raw' }
+      if (githubToken) headers.Authorization = `token ${githubToken}`
+
+      const resp = await fetch(url, { signal: controller.signal, headers })
+      if (!resp.ok) continue
+
+      const data = JSON.parse(await resp.text()) as { version?: string; metadata?: { version?: string } }
+      if (data.version) return data.version
+      if (data.metadata?.version) return data.metadata.version
+    } catch {
+      // ignore and try next
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  return null
 }
 
 async function detectGitLab(
@@ -450,19 +548,59 @@ async function detectGitLab(
     return { ...base, status: 'unsupported', reason: 'Plugin 安装缺少来源追踪信息' }
   }
 
-  const ref = lockEntry.ref || '' // 空字符串让 API 使用仓库默认分支
-  // Strip trailing SKILL.md from skillPath
+  const ref = lockEntry.ref || ''
   const skillDir = skillPath.replace(/\/?SKILL\.md$/i, '').replace(/^\/+|\/+$/g, '')
+  const localHash = lockEntry.skillFolderHash || ''
+  const localVersion = skillView.version || await readLocalVersion(skillView.path)
 
-  // 构建要尝试的 host 列表（带协议）
-  // 如果 parseGitLabUrl 返回的 host 已含协议（来自 HTTPS URL），直接用
-  // 如果不含协议（来自 SSH），先试 http 再试 https
   const hostsToTry = parsed.host.startsWith('http')
     ? [parsed.host]
     : [`http://${parsed.host}`, `https://${parsed.host}`]
 
   let lastError = ''
   for (const host of hostsToTry) {
+    // 1. 尝试通过版本号比较（plugin.json / package.json）
+    const versionResult = await fetchRemoteVersionGitLab(host, parsed.projectPath, ref, skillDir, token, timeoutMs)
+    if (versionResult && localVersion) {
+      const cmp = comparePluginVersion(versionResult, localVersion, base)
+      return { ...cmp, remoteVersion: versionResult }
+    }
+    if (versionResult && !localVersion) {
+      // 有远端版本但无本地版本 → fallback hash/date 但携带 remoteVersion
+      if (localHash) {
+        const treeResult = await getGitLabTreeId(host, parsed.projectPath, ref, skillDir, token, timeoutMs)
+        if ('id' in treeResult) {
+          return { ...base, status: treeResult.id !== localHash ? 'available' : 'latest', remoteVersion: versionResult }
+        }
+      }
+      const result = await getGitLabLatestCommitDate(host, parsed.projectPath, ref, skillDir, token, timeoutMs)
+      if ('committedDate' in result) {
+        const localDate = lockEntry.updatedAt
+        if (!localDate) return { ...base, status: 'latest', remoteVersion: versionResult }
+        const remoteTime = new Date(result.committedDate).getTime()
+        const localTime = new Date(localDate).getTime()
+        return { ...base, status: remoteTime > localTime ? 'available' : 'latest', remoteVersion: versionResult }
+      }
+      lastError = result.error
+      if (result.error.includes('网络错误') || result.error.includes('请求超时')) continue
+      break
+    }
+
+    // 2. 尝试 tree hash 比较（当有 skillFolderHash 时）
+    if (localHash) {
+      const treeResult = await getGitLabTreeId(host, parsed.projectPath, ref, skillDir, token, timeoutMs)
+      if ('id' in treeResult) {
+        return { ...base, status: treeResult.id !== localHash ? 'available' : 'latest' }
+      }
+      if (!treeResult.error.includes('网络') && !treeResult.error.includes('超时')) {
+        if (treeResult.error.includes('Token') || treeResult.error.includes('不存在')) {
+          lastError = treeResult.error
+          break
+        }
+      }
+    }
+
+    // 3. fallback: commit date 比较
     const result = await getGitLabLatestCommitDate(
       host,
       parsed.projectPath,
@@ -473,7 +611,6 @@ async function detectGitLab(
     )
 
     if ('committedDate' in result) {
-      // 成功拿到 commitDate
       const localDate = lockEntry.updatedAt
       if (!localDate) return { ...base, status: 'latest' }
       const remoteTime = new Date(result.committedDate).getTime()
@@ -482,9 +619,7 @@ async function detectGitLab(
     }
 
     lastError = result.error
-    // 网络错误（fetch failed / 超时）→ 可能协议不对，继续试下一个
     if (result.error.includes('网络错误') || result.error.includes('请求超时')) continue
-    // 其他错误（401/403/404）是确定性的，不用再试
     break
   }
 
@@ -494,7 +629,222 @@ async function detectGitLab(
   return { ...base, status: 'failed', reason: lastError || '检查失败' }
 }
 
+/**
+ * 从 GitLab 远端尝试获取 skill 的版本号。
+ * 查找逻辑与 GitHub 一致（plugin.json / package.json，向上查找）。
+ */
+async function fetchRemoteVersionGitLab(
+  host: string,
+  projectPath: string,
+  ref: string,
+  skillDir: string,
+  token: string,
+  timeoutMs: number
+): Promise<string | null> {
+  const paths = buildVersionFilePaths(skillDir)
+  const encodedProject = encodeURIComponent(projectPath)
+  const refParam = ref ? `?ref=${encodeURIComponent(ref)}` : ''
+
+  console.log(`[Detector] fetchRemoteVersionGitLab: ${host}/${projectPath}, skillDir=${skillDir}, candidates=${paths.length}`)
+
+  for (const filePath of paths) {
+    const encodedFile = encodeURIComponent(filePath)
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const url = `${host}/api/v4/projects/${encodedProject}/repository/files/${encodedFile}/raw${refParam}`
+      const resp = await fetch(url, {
+        signal: controller.signal,
+        headers: { 'PRIVATE-TOKEN': token }
+      })
+      if (resp.status === 404) continue
+      if (!resp.ok) {
+        console.log(`[Detector] fetchRemoteVersionGitLab: ${filePath} → HTTP ${resp.status}`)
+        continue
+      }
+
+      const text = await resp.text()
+      try {
+        const data = JSON.parse(text) as { version?: string; metadata?: { version?: string } }
+        if (data.version) {
+          console.log(`[Detector] fetchRemoteVersionGitLab: found version ${data.version} in ${filePath}`)
+          return data.version
+        }
+        if (data.metadata?.version) {
+          console.log(`[Detector] fetchRemoteVersionGitLab: found metadata.version ${data.metadata.version} in ${filePath}`)
+          return data.metadata.version
+        }
+        console.log(`[Detector] fetchRemoteVersionGitLab: ${filePath} has no version field`)
+      } catch {
+        console.log(`[Detector] fetchRemoteVersionGitLab: ${filePath} not valid JSON`)
+      }
+    } catch (err) {
+      console.log(`[Detector] fetchRemoteVersionGitLab: ${filePath} error: ${err instanceof Error ? err.message : err}`)
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  console.log(`[Detector] fetchRemoteVersionGitLab: no version found for ${skillDir}`)
+  return null
+}
+
+// --- GitLab Tree API (for hash-based comparison) ---
+
+/**
+ * 获取 GitLab 仓库中指定路径的 tree ID（SHA），用于与本地 skillFolderHash 比较。
+ *
+ * 使用 GitLab Repository Tree API 查询指定路径和分支下的目录 tree。
+ */
+async function getGitLabTreeId(
+  host: string,
+  projectPath: string,
+  ref: string,
+  skillDir: string,
+  token: string,
+  timeoutMs: number
+): Promise<{ id: string } | { error: string }> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    const encodedProject = encodeURIComponent(projectPath)
+    const refParam = ref ? `&ref=${encodeURIComponent(ref)}` : ''
+    // 获取 skill 目录下的 tree 条目，按路径过滤
+    const url = `${host}/api/v4/projects/${encodedProject}/repository/tree?path=${encodeURIComponent(skillDir)}${refParam}&per_page=100&recursive=true`
+
+    const resp = await fetch(url, {
+      signal: controller.signal,
+      headers: { 'PRIVATE-TOKEN': token }
+    })
+
+    if (resp.status === 401 || resp.status === 403) {
+      return { error: 'GitLab Token 无效或无权限' }
+    }
+    if (resp.status === 404) {
+      return { error: '上游 skill 不存在或已删除' }
+    }
+    if (!resp.ok) {
+      return { error: `GitLab Tree API 错误 (HTTP ${resp.status})` }
+    }
+
+    const entries = (await resp.json()) as Array<{ id: string; name: string; type: string; path: string }>
+    if (!entries || entries.length === 0) {
+      return { error: '上游 skill 目录为空或不存在' }
+    }
+
+    // 计算一个复合 hash：将所有条目的 id (blob SHA) 拼接后 hash
+    // 这样任何文件变化都能被检测到
+    const concatenated = entries
+      .sort((a, b) => a.path.localeCompare(b.path))
+      .map((e) => `${e.path}:${e.id}`)
+      .join('\n')
+
+    // 使用 Web Crypto 风格的简单 hash（使用字符串 reduce 类似 skillFolderHash 的生成方式）
+    // skillFolderHash 是 npx skills 生成的，用的是类似 git tree hash 的算法
+    // 我们这里用 entries 的 blob id 排序拼接做 sha256
+    const { createHash } = await import('crypto')
+    const computedHash = createHash('sha256').update(concatenated).digest('hex')
+
+    return { id: computedHash }
+  } catch (err: unknown) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      return { error: '请求超时' }
+    }
+    return { error: `网络错误: ${err instanceof Error ? err.message : String(err)}` }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 // --- Plugin Version Detection ---
+
+/**
+ * 从本地 skill 路径尝试读取版本号。
+ * 依次尝试 skill 目录及向上所有层级的 package.json 和 .claude-plugin/plugin.json。
+ */
+async function readLocalVersion(skillPath: string): Promise<string> {
+  if (!skillPath) return ''
+  const { dirname } = await import('path')
+  const dir = skillPath.endsWith('SKILL.md') ? dirname(skillPath) : skillPath
+  const parts = dir.split('/').filter(Boolean)
+
+  // 候选本地路径：从 skill 目录向上查找 package.json 和 plugin.json
+  const candidates: string[] = []
+  // package.json 向上查找
+  candidates.push(join(dir, 'package.json'))
+  for (let i = parts.length - 1; i >= 1; i--) {
+    candidates.push('/' + parts.slice(0, i).join('/') + '/package.json')
+  }
+  // .claude-plugin/plugin.json 向上查找
+  candidates.push(join(dir, '.claude-plugin', 'plugin.json'))
+  for (let i = parts.length - 1; i >= 1; i--) {
+    candidates.push('/' + parts.slice(0, i).join('/') + '/.claude-plugin/plugin.json')
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const content = await readFile(candidate, 'utf-8')
+      const data = JSON.parse(content) as { version?: string; metadata?: { version?: string } }
+      if (data.version) return data.version
+      if (data.metadata?.version) return data.metadata.version
+    } catch {
+      // file not found or parse error, try next
+    }
+  }
+  return ''
+}
+
+/**
+ * 构建版本文件的候选路径列表（从 skill 目录向上查找）。
+ * 用于 GitHub/GitLab 远端获取版本号。
+ *
+ * 查找顺序：
+ * 1. {skillDir}/package.json
+ * 2. {skillDir}/../package.json（plugin 根目录）
+ * 3. {skillDir}/../../package.json（更上层）
+ * 4. {skillDir}/../.claude-plugin/plugin.json
+ * 5. {skillDir}/../../.claude-plugin/plugin.json
+ *
+ * 示例：skillDir = "plugins/sh-bfe-plugin/skills/o-d2c"
+ * → 尝试:
+ *   plugins/sh-bfe-plugin/skills/o-d2c/package.json
+ *   plugins/sh-bfe-plugin/skills/package.json
+ *   plugins/sh-bfe-plugin/package.json
+ *   plugins/sh-bfe-plugin/skills/.claude-plugin/plugin.json
+ *   plugins/sh-bfe-plugin/.claude-plugin/plugin.json
+ */
+function buildVersionFilePaths(skillDir: string): string[] {
+  const parts = skillDir.split('/').filter(Boolean)
+  const paths: string[] = []
+
+  // package.json: 从 skill 目录本身 → 向上直到仓库根目录
+  paths.push(`${skillDir}/package.json`)
+  for (let i = parts.length - 1; i >= 1; i--) {
+    paths.push(`${parts.slice(0, i).join('/')}/package.json`)
+  }
+  paths.push('package.json') // 仓库根目录
+
+  // .claude-plugin/plugin.json: 向上查找
+  if (parts.length >= 1) {
+    paths.push(`${skillDir}/.claude-plugin/plugin.json`)
+  }
+  if (parts.length >= 2) {
+    paths.push(`${parts.slice(0, -1).join('/')}/.claude-plugin/plugin.json`)
+  }
+  if (parts.length >= 3) {
+    paths.push(`${parts.slice(0, -2).join('/')}/.claude-plugin/plugin.json`)
+  }
+  paths.push('.claude-plugin/plugin.json') // 仓库根目录
+
+  // marketplace.json: 向上查找（metadata.version）
+  paths.push(`${skillDir}/marketplace.json`)
+  for (let i = parts.length - 1; i >= 1; i--) {
+    paths.push(`${parts.slice(0, i).join('/')}/marketplace.json`)
+  }
+  paths.push('marketplace.json')
+
+  return paths
+}
 
 interface MarketplaceConfig {
   source: { source: string; repo?: string; url?: string; ref?: string }
@@ -574,7 +924,7 @@ async function detectPluginViaGitHub(
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     try {
       const refParam = ref ? `?ref=${encodeURIComponent(ref)}` : ''
-      const url = `https://api.github.com/repos/${repo}/contents/${encodeURIComponent(filePath)}${refParam}`
+      const url = `https://api.github.com/repos/${repo}/contents/${filePath}${refParam}`
       const headers: Record<string, string> = { Accept: 'application/vnd.github.v3.raw' }
       if (options.githubToken) headers.Authorization = `token ${options.githubToken}`
 

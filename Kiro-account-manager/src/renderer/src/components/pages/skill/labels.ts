@@ -5,7 +5,8 @@ export const statusLabelZh: Record<SkillUpdateStatus, string> = {
   latest: '最新',
   available: '可更新',
   unsupported: '无法检查',
-  failed: '检查失败'
+  failed: '检查失败',
+  updating: '更新中'
 }
 
 export const statusLabelEn: Record<SkillUpdateStatus, string> = {
@@ -13,5 +14,6 @@ export const statusLabelEn: Record<SkillUpdateStatus, string> = {
   latest: 'Latest',
   available: 'Update',
   unsupported: 'Unsupported',
-  failed: 'Failed'
+  failed: 'Failed',
+  updating: 'Updating'
 }

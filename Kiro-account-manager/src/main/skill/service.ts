@@ -20,6 +20,42 @@ import {
 } from './config'
 import { isPathSafe, pathExists, readSkillDirs } from './filesystem'
 import { getGitHubTree, lockForSkill, readGlobalLock, removeGlobalLockEntry, addGlobalLockEntry } from './lock'
+
+/**
+ * 从 skill 目录本地读取版本号。
+ * 依次尝试 skill 目录及向上 2 级的 package.json / .claude-plugin/plugin.json。
+ */
+async function readSkillVersion(skillDir: string): Promise<string | undefined> {
+  const parts = skillDir.split('/').filter(Boolean)
+  const candidates: string[] = [
+    join(skillDir, 'package.json'),
+    join(skillDir, '.claude-plugin', 'plugin.json'),
+    join(skillDir, 'marketplace.json')
+  ]
+  if (parts.length >= 2) {
+    const parent = '/' + parts.slice(0, -1).join('/')
+    candidates.push(join(parent, 'package.json'))
+    candidates.push(join(parent, '.claude-plugin', 'plugin.json'))
+    candidates.push(join(parent, 'marketplace.json'))
+  }
+  if (parts.length >= 3) {
+    const grandparent = '/' + parts.slice(0, -2).join('/')
+    candidates.push(join(grandparent, 'package.json'))
+    candidates.push(join(grandparent, '.claude-plugin', 'plugin.json'))
+    candidates.push(join(grandparent, 'marketplace.json'))
+  }
+  for (const candidate of candidates) {
+    try {
+      const content = await readFile(candidate, 'utf-8')
+      const data = JSON.parse(content) as { version?: string; metadata?: { version?: string } }
+      if (data.version) return data.version
+      if (data.metadata?.version) return data.metadata.version
+    } catch {
+      // file not found or parse error, try next
+    }
+  }
+  return undefined
+}
 import type {
   SkillUpdateStatus,
   SkillsAgentView,
@@ -136,6 +172,19 @@ export async function listSkillsState(configValue: unknown): Promise<SkillsAgent
           const resolvedAutoUpdate = cfg?.autoUpdate ?? Object.values(config.skillConfigs).find(
             (c) => c.skillName === skill.name && c.autoUpdate !== undefined
           )?.autoUpdate ?? false
+          // 状态跨 agent 同步：skill 是 canonical 共享的，取所有 agent 中最新一次检测的状态，
+          // 避免某些 tab 显示过期的 available
+          const statusCandidates = Object.values(config.skillConfigs).filter(
+            (c) => c.skillName === skill.name && c.lastCheckStatus
+          )
+          const freshestStatus = statusCandidates.reduce<typeof statusCandidates[number] | undefined>(
+            (best, c) => {
+              const tc = c.lastCheckedAt ? Date.parse(c.lastCheckedAt) : 0
+              const tb = best?.lastCheckedAt ? Date.parse(best.lastCheckedAt) : 0
+              return !best || tc > tb ? c : best
+            },
+            undefined
+          )
           byName.set(key, {
             name: skill.name,
             description: skill.description,
@@ -152,10 +201,11 @@ export async function listSkillsState(configValue: unknown): Promise<SkillsAgent
             installedAt: lockEntry?.installedAt,
             updatedAt: lockEntry?.updatedAt,
             pluginName: lockEntry?.pluginName,
+            version: await readSkillVersion(skill.dir) || cfg?.lastKnownVersion || freshestStatus?.lastKnownVersion,
             installType: 'skills',
             autoUpdate: resolvedAutoUpdate,
-            updateStatus: cfg?.lastCheckStatus || 'unknown',
-            updateReason: cfg?.lastCheckReason
+            updateStatus: freshestStatus?.lastCheckStatus || 'unknown',
+            updateReason: freshestStatus?.lastCheckReason
           })
         }
       }

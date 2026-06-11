@@ -157,8 +157,8 @@ const themeGroupsEn = [
 ]
 
 export function SettingsPage() {
-  const { 
-    privacyMode, 
+  const {
+    privacyMode,
     setPrivacyMode,
     usagePrecision,
     setUsagePrecision,
@@ -203,7 +203,7 @@ export function SettingsPage() {
   const [tempProxyUrl, setTempProxyUrl] = useState(proxyUrl)
   const [themeExpanded, setThemeExpanded] = useState(false)
   const [isManualRefreshing, setIsManualRefreshing] = useState(false)
-  
+
   // 托盘设置状态
   const [traySettings, setTraySettings] = useState({
     enabled: true,
@@ -252,20 +252,20 @@ export function SettingsPage() {
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (!isRecordingShortcut) return
     e.preventDefault()
-    
+
     const parts: string[] = []
     if (e.ctrlKey) parts.push('Ctrl')
     if (e.metaKey) parts.push('Command')
     if (e.altKey) parts.push('Alt')
     if (e.shiftKey) parts.push('Shift')
-    
+
     // 忽略单独的修饰键
     const key = e.key
     if (!['Control', 'Meta', 'Alt', 'Shift'].includes(key)) {
       // 转换特殊键名
       const keyName = key.length === 1 ? key.toUpperCase() : key
       parts.push(keyName)
-      
+
       const shortcut = parts.join('+')
       handleShortcutChange(shortcut)
       setIsRecordingShortcut(false)
@@ -353,6 +353,55 @@ export function SettingsPage() {
       await window.api.saveTraySettings({ [key]: value })
     } catch (error) {
       console.error('Failed to save tray settings:', error)
+    }
+  }
+
+  // 灵动岛设置状态
+  const [islandSettings, setIslandSettings] = useState({
+    enabled: true,
+    autoLaunch: false,
+    startMode: 'window' as 'window' | 'island',
+    minimizeToIsland: true,
+    showProxyStatus: true,
+    position: null as { x: number; y: number } | null
+  })
+  const [islandLoading, setIslandLoading] = useState(true)
+  const [islandError, setIslandError] = useState('')
+
+  // 加载灵动岛设置
+  useEffect(() => {
+    const loadIslandSettings = async () => {
+      try {
+        const settings = await window.api.getIslandSettings()
+        setIslandSettings(settings)
+      } catch (error) {
+        console.error('Failed to load island settings:', error)
+      } finally {
+        setIslandLoading(false)
+      }
+    }
+    loadIslandSettings()
+  }, [])
+
+  // 保存灵动岛设置
+  const handleIslandSettingChange = async (
+    key: keyof typeof islandSettings,
+    value: boolean | string
+  ) => {
+    const prev = islandSettings
+    const newSettings = { ...islandSettings, [key]: value }
+    setIslandSettings(newSettings)
+    setIslandError('')
+    try {
+      const result = await window.api.saveIslandSettings({ [key]: value })
+      if (!result.success) {
+        // 系统调用失败（如开机自启动注册失败）→ 回滚 UI
+        setIslandSettings(prev)
+        setIslandError(result.error || 'Failed to save island settings')
+      }
+    } catch (error) {
+      setIslandSettings(prev)
+      setIslandError(String(error))
     }
   }
 
@@ -480,14 +529,14 @@ export function SettingsPage() {
 
           {/* 主题颜色 */}
           <div className="pt-2 border-t">
-            <button 
+            <button
               className="flex items-center justify-between w-full text-left"
               onClick={() => setThemeExpanded(!themeExpanded)}
             >
               <div className="flex items-center gap-2">
                 <p className="font-medium">{isEn ? 'Theme Color' : '主题颜色'}</p>
                 {!themeExpanded && (
-                  <div 
+                  <div
                     className="w-5 h-5 rounded-full ring-2 ring-primary ring-offset-1"
                     style={{ backgroundColor: themeGroups.flatMap(g => g.themes).find(t => t.id === theme)?.color || '#3b82f6' }}
                   />
@@ -509,8 +558,8 @@ export function SettingsPage() {
                         <button
                           key={t.id}
                           className={`group relative w-7 h-7 rounded-full transition-all ${
-                            theme === t.id 
-                              ? 'ring-2 ring-primary ring-offset-2 scale-110' 
+                            theme === t.id
+                              ? 'ring-2 ring-primary ring-offset-2 scale-110'
                               : 'hover:scale-110 hover:shadow-md'
                           }`}
                           style={{ backgroundColor: t.color }}
@@ -859,8 +908,8 @@ export function SettingsPage() {
                 value={tempProxyUrl}
                 onChange={(e) => setTempProxyUrl(e.target.value)}
               />
-              <Button 
-                variant="outline" 
+              <Button
+                variant="outline"
                 size="sm"
                 onClick={() => setProxy(proxyEnabled, tempProxyUrl)}
                 disabled={tempProxyUrl === proxyUrl}
@@ -1026,6 +1075,109 @@ export function SettingsPage() {
                 <p>• {isEn ? 'Double-click tray icon to show window' : '双击托盘图标可以显示主窗口'}</p>
                 <p>• {isEn ? 'Right-click tray icon to show menu' : '右键托盘图标可以显示菜单'}</p>
                 <p>• {isEn ? 'Tray menu shows current account info and usage' : '托盘菜单可以查看当前账户信息和用量'}</p>
+              </div>
+            </>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* 灵动岛设置 */}
+      <Card className="hover-lift">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-primary/10">
+              <Layers className="h-4 w-4 text-primary" />
+            </div>
+            {isEn ? 'Dynamic Island' : '灵动岛'}
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {islandLoading ? (
+            <div className="text-sm text-muted-foreground">{isEn ? 'Loading...' : '加载中...'}</div>
+          ) : (
+            <>
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="font-medium">{isEn ? 'Enable Dynamic Island' : '启用灵动岛'}</p>
+                  <p className="text-sm text-muted-foreground">{isEn ? 'A floating mini panel showing current account' : '悬浮迷你面板，显示当前账号信息'}</p>
+                </div>
+                <Button
+                  variant={islandSettings.enabled ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => handleIslandSettingChange('enabled', !islandSettings.enabled)}
+                >
+                  {islandSettings.enabled ? (isEn ? 'On' : '已开启') : (isEn ? 'Off' : '已关闭')}
+                </Button>
+              </div>
+
+              {islandSettings.enabled && (
+                <>
+                  <div className="flex items-center justify-between pt-2 border-t">
+                    <div>
+                      <p className="font-medium">{isEn ? 'Minimize to Island' : '最小化进入灵动岛'}</p>
+                      <p className="text-sm text-muted-foreground">{isEn ? 'Show island when minimizing to tray' : '最小化到托盘时显示灵动岛'}</p>
+                    </div>
+                    <Button
+                      variant={islandSettings.minimizeToIsland ? 'default' : 'outline'}
+                      size="sm"
+                      onClick={() => handleIslandSettingChange('minimizeToIsland', !islandSettings.minimizeToIsland)}
+                    >
+                      {islandSettings.minimizeToIsland ? (isEn ? 'On' : '已开启') : (isEn ? 'Off' : '已关闭')}
+                    </Button>
+                  </div>
+
+                  <div className="flex items-center justify-between pt-2 border-t">
+                    <div>
+                      <p className="font-medium">{isEn ? 'Launch at Startup' : '开机自启动'}</p>
+                      <p className="text-sm text-muted-foreground">{isEn ? 'Start automatically when system boots' : '系统启动时自动运行'}</p>
+                    </div>
+                    <Button
+                      variant={islandSettings.autoLaunch ? 'default' : 'outline'}
+                      size="sm"
+                      onClick={() => handleIslandSettingChange('autoLaunch', !islandSettings.autoLaunch)}
+                    >
+                      {islandSettings.autoLaunch ? (isEn ? 'On' : '已开启') : (isEn ? 'Off' : '已关闭')}
+                    </Button>
+                  </div>
+
+                  <div className="flex items-center justify-between pt-2 border-t">
+                    <div>
+                      <p className="font-medium">{isEn ? 'Startup Mode' : '启动形态'}</p>
+                      <p className="text-sm text-muted-foreground">{isEn ? 'Initial form on manual launch' : '手动启动时的初始形态'}</p>
+                    </div>
+                    <select
+                      className="w-[140px] h-9 px-3 rounded-lg border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary"
+                      value={islandSettings.startMode}
+                      onChange={(e) => handleIslandSettingChange('startMode', e.target.value)}
+                    >
+                      <option value="window">{isEn ? 'Main window' : '主窗口'}</option>
+                      <option value="island">{isEn ? 'Dynamic Island' : '灵动岛'}</option>
+                    </select>
+                  </div>
+
+                  <div className="flex items-center justify-between pt-2 border-t">
+                    <div>
+                      <p className="font-medium">{isEn ? 'Show Proxy Status' : '显示反代状态'}</p>
+                      <p className="text-sm text-muted-foreground">{isEn ? 'Display proxy status in expanded view' : '展开态显示反代运行状态'}</p>
+                    </div>
+                    <Button
+                      variant={islandSettings.showProxyStatus ? 'default' : 'outline'}
+                      size="sm"
+                      onClick={() => handleIslandSettingChange('showProxyStatus', !islandSettings.showProxyStatus)}
+                    >
+                      {islandSettings.showProxyStatus ? (isEn ? 'On' : '已开启') : (isEn ? 'Off' : '已关闭')}
+                    </Button>
+                  </div>
+                </>
+              )}
+
+              {islandError && (
+                <div className="text-xs text-destructive bg-destructive/10 rounded-lg p-2">{islandError}</div>
+              )}
+
+              <div className="text-xs text-muted-foreground bg-muted/50 rounded-lg p-3 space-y-1">
+                <p>• {isEn ? 'Hover the island to expand, click to open the main window' : '悬停灵动岛展开，单击打开主窗口'}</p>
+                <p>• {isEn ? 'Drag to reposition, right-click for more actions' : '拖拽可移动位置，右键查看更多操作'}</p>
               </div>
             </>
           )}

@@ -1694,7 +1694,7 @@ describe('MarketplaceManager.listRemoteSkills', () => {
       )
     })
 
-    it('should use specified ref when available', async () => {
+    it('should always use default branch (main) for market listing, ignoring specified ref', async () => {
       const mockResponse = { tree: [] }
       const fetchMock = vi.fn().mockResolvedValue({
         ok: true,
@@ -1715,7 +1715,12 @@ describe('MarketplaceManager.listRemoteSkills', () => {
 
       await manager.listRemoteSkills(marketplace)
 
+      // 市场列表查询始终使用默认分支，不使用 feature 分支（如 develop）
       expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/git/trees/main'),
+        expect.any(Object)
+      )
+      expect(fetchMock).not.toHaveBeenCalledWith(
         expect.stringContaining('/git/trees/develop'),
         expect.any(Object)
       )

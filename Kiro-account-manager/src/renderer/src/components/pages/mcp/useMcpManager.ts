@@ -101,8 +101,8 @@ export function useMcpManager(isEn: boolean) {
       const confirmed = await modal.confirm({
         title: isEn ? 'Delete MCP registration?' : '删除 MCP 注册？',
         content: isEn
-          ? `This will delete "${server.name}" from all supported local agents.`
-          : `这会从所有支持的本地 Agent 中删除「${server.name}」。`,
+          ? `Are you sure you want to delete "${server.name}"?`
+          : `确定要删除「${server.name}」吗？`,
         okText: isEn ? 'Delete' : '删除',
         cancelText: isEn ? 'Cancel' : '取消'
       })

@@ -2,12 +2,15 @@ import type { BrowserWindow } from 'electron'
 import type {
   BatchUpdateResult,
   SkillsManagerConfig,
+  SkillsSkillView,
+  SkillUpdateStatus,
   UpdateTask,
+  LockEntry,
   StatusChangedEvent,
   BatchUpdateCompletedEvent,
   CheckProgressEvent
 } from './types'
-import { filterSkillsForCheck, detectSkillVersions } from './detector'
+import { detectSkillVersions } from './detector'
 import type { CheckResult } from './detector'
 import { UpdateExecutor } from './executor'
 import { createHistoryStore } from './history'
@@ -91,24 +94,22 @@ export class AutoUpdateScheduler {
       const config = this.options.getConfig()
       const { agents } = await listSkillsState(config)
 
-      // 收集所有 skill
-      let allSkills = agents.flatMap((a) => a.skills)
+      // 收集所有 skill（用于后续 autoUpdate 匹配，未过滤）
+      const allSkills = agents.flatMap((a) => a.skills)
 
-      // 如果指定了 agent，过滤
+      // 过滤待检测列表
+      let skillsToCheck = allSkills
       if (agent) {
-        allSkills = allSkills.filter((s) => s.agent === agent)
+        skillsToCheck = skillsToCheck.filter((s) => s.agent === agent)
       }
-
-      // 如果指定了 skillName，过滤
       if (skillName) {
-        allSkills = allSkills.filter((s) => s.name === skillName)
+        skillsToCheck = skillsToCheck.filter((s) => s.name === skillName)
       }
-
       // 排除无来源的 skill（本地手动创建无 sourceType）
-      allSkills = allSkills.filter((s) => !!s.sourceType)
+      skillsToCheck = skillsToCheck.filter((s) => !!s.sourceType)
 
       // 发送检测进度事件
-      for (const skill of allSkills) {
+      for (const skill of skillsToCheck) {
         this.sendCheckProgress({ agent: skill.agent, skillName: skill.name, checking: true })
       }
 
@@ -116,7 +117,7 @@ export class AutoUpdateScheduler {
       const lock = await readGlobalLock()
 
       // 执行版本检测（并发池，默认 5 个并行，每完成一个立即回调）
-      const results = await detectSkillVersions(allSkills, lock, {
+      const results = await detectSkillVersions(skillsToCheck, lock, {
         gitlabToken: config.gitlabToken,
         githubToken: config.githubToken,
         timeoutMs: 15000,
@@ -134,7 +135,17 @@ export class AutoUpdateScheduler {
       })
 
       this.lastCheckResults = results
-      return results
+
+      // 检测完成后：对 available + autoUpdate 的 skill 立即触发更新
+      const finalStatuses = await this.runAutoUpdates(results, allSkills, lock, config)
+
+      // 合并更新后的最终状态，避免返回过期的 'available' 覆盖 UI 已推送的 'latest'
+      const merged = results.map((r) => {
+        const u = finalStatuses.get(`${r.agent}:${r.skillName}`)
+        return u ? { ...r, status: u.status, reason: u.reason } : r
+      })
+      this.lastCheckResults = merged
+      return merged
     } finally {
       this.checking = false
     }
@@ -199,105 +210,149 @@ export class AutoUpdateScheduler {
 
       this.lastCheckResults = results
 
-      // 收集需要自动更新的 skill（status=available 且 autoUpdate=true）
-      const skillsToUpdate = results.filter((r) => {
-        if (r.status !== 'available') return false
-        const skill = allSkills.find((s) => s.name === r.skillName && s.agent === r.agent)
-        return skill?.autoUpdate === true
-      })
-
-      // 找到对应的 skill view 用于构建 UpdateTask
-      if (skillsToUpdate.length > 0) {
-        this.updating = true
-
-        try {
-          // 等待空闲（没有其他操作在进行）
-          const idle = await this.executor.waitForIdle()
-          if (!idle) {
-            // 超时放弃本轮更新
-            this.scheduleNext()
-            return
-          }
-
-          // 构建 UpdateTask 列表
-          const tasks: UpdateTask[] = []
-          for (const checkResult of skillsToUpdate) {
-            const skillView = allSkills.find(
-              (s) => s.name === checkResult.skillName && s.agent === checkResult.agent
-            )
-            if (!skillView || !skillView.source) continue
-
-            tasks.push({
-              agent: checkResult.agent,
-              skillName: checkResult.skillName,
-              source: skillView.source || '',
-              sourceUrl: skillView.sourceUrl,
-              ref: skillView.ref || 'main',
-              skillPath: lock[skillView.name]?.skillPath,
-              sourceType: skillView.sourceType || 'github'
-            })
-          }
-
-          if (tasks.length > 0) {
-            // 执行批量更新
-            const batchResult = await this.executor.executeBatch(tasks, config)
-
-            // 记录历史
-            const historyStore = createHistoryStore(
-              this.options.getConfig,
-              this.options.saveConfig
-            )
-
-            for (const success of batchResult.successes) {
-              historyStore.append({
-                skillName: success.skillName,
-                agent: success.agent,
-                timestamp: new Date().toISOString(),
-                previousHash: success.previousHash || '',
-                newHash: success.newHash || '',
-                success: true
-              })
-            }
-
-            for (const failure of batchResult.failures) {
-              historyStore.append({
-                skillName: failure.skillName,
-                agent: failure.agent,
-                timestamp: new Date().toISOString(),
-                previousHash: failure.previousHash || '',
-                newHash: '',
-                success: false
-              })
-            }
-
-            // 发送批量更新完成事件
-            this.sendBatchUpdateCompleted({
-              successes: batchResult.successes.map((s) => ({
-                agent: s.agent,
-                skillName: s.skillName,
-                previousHash: s.previousHash || '',
-                newHash: s.newHash || ''
-              })),
-              failures: batchResult.failures.map((f) => ({
-                agent: f.agent,
-                skillName: f.skillName,
-                reason: f.error || '未知错误'
-              })),
-              timestamp: batchResult.timestamp
-            })
-
-            // 缓存最近一次批量更新结果
-            this.lastBatchResult = batchResult
-          }
-        } finally {
-          this.updating = false
-        }
-      }
+      // 收集需要自动更新的 skill 并执行
+      await this.runAutoUpdates(results, allSkills, lock, config)
     } catch {
       // 整个 cycle 出错不崩溃，等下一次
     } finally {
       this.checking = false
       this.scheduleNext()
+    }
+  }
+
+  /**
+   * 对检测结果中 status=available 且 autoUpdate=true 的 skill 执行批量更新。
+   * 检测周期 (runCycle) 和手动检测 (triggerCheck) 共用此逻辑。
+   * @returns 更新后各 skill 的最终状态，key 为 `agent:skillName`。
+   */
+  private async runAutoUpdates(
+    results: CheckResult[],
+    allSkills: SkillsSkillView[],
+    lock: Record<string, LockEntry>,
+    config: SkillsManagerConfig
+  ): Promise<Map<string, { status: SkillUpdateStatus; reason?: string }>> {
+    const finalStatuses = new Map<string, { status: SkillUpdateStatus; reason?: string }>()
+
+    // 收集需要自动更新的 skill（status=available 且 autoUpdate=true）
+    const skillsToUpdate = results.filter((r) => {
+      if (r.status !== 'available') return false
+      const skill = allSkills.find((s) => s.name === r.skillName && s.agent === r.agent)
+      return skill?.autoUpdate === true
+    })
+
+    if (skillsToUpdate.length === 0) return finalStatuses
+
+    // 防止与调度周期/其他手动检测的更新批次并发
+    if (this.updating) return finalStatuses
+
+    this.updating = true
+
+    try {
+      // 等待空闲（没有其他操作在进行）
+      const idle = await this.executor.waitForIdle()
+      if (!idle) {
+        // 超时放弃本轮更新
+        return finalStatuses
+      }
+
+      // 构建 UpdateTask 列表
+      const tasks: UpdateTask[] = []
+      for (const checkResult of skillsToUpdate) {
+        const skillView = allSkills.find(
+          (s) => s.name === checkResult.skillName && s.agent === checkResult.agent
+        )
+        if (!skillView || !skillView.source) continue
+
+        tasks.push({
+          agent: checkResult.agent,
+          skillName: checkResult.skillName,
+          source: skillView.source || '',
+          sourceUrl: skillView.sourceUrl,
+          ref: skillView.ref || '',
+          skillPath: lock[skillView.name]?.skillPath,
+          sourceType: skillView.sourceType || 'github'
+        })
+      }
+
+      if (tasks.length === 0) return finalStatuses
+
+      // skill 为 canonical 共享：状态需同步到所有持有该 skill 的 agent，避免切 tab 看到过期状态
+      const agentsForSkill = (name: string): string[] =>
+        Array.from(new Set(allSkills.filter((s) => s.name === name).map((s) => s.agent)))
+
+      // 更新开始前：对每个待更新 skill，向其所有 agent 推送 updating（仅事件，不持久化）
+      const updatingSkillNames = new Set(tasks.map((t) => t.skillName))
+      for (const name of updatingSkillNames) {
+        for (const ag of agentsForSkill(name)) {
+          this.sendStatusChanged({ agent: ag, skillName: name, status: 'updating' })
+        }
+      }
+
+      // 执行批量更新，每个任务完成后将最终状态同步到该 skill 的所有 agent
+      const batchResult = await this.executor.executeBatch(tasks, config, (result) => {
+        // 成功 → latest；失败 → 退回 available（保留可重试），reason 带错误信息
+        const finalStatus: SkillUpdateStatus = result.success ? 'latest' : 'available'
+        const reason = result.success ? undefined : result.error
+        const now = new Date().toISOString()
+        for (const ag of agentsForSkill(result.skillName)) {
+          finalStatuses.set(`${ag}:${result.skillName}`, { status: finalStatus, reason })
+          this.persistCheckResult({
+            agent: ag,
+            skillName: result.skillName,
+            status: finalStatus,
+            reason,
+            checkedAt: now
+          })
+          this.sendStatusChanged({ agent: ag, skillName: result.skillName, status: finalStatus, reason })
+        }
+      })
+
+      // 记录历史
+      const historyStore = createHistoryStore(this.options.getConfig, this.options.saveConfig)
+
+      for (const success of batchResult.successes) {
+        historyStore.append({
+          skillName: success.skillName,
+          agent: success.agent,
+          timestamp: new Date().toISOString(),
+          previousHash: success.previousHash || '',
+          newHash: success.newHash || '',
+          success: true
+        })
+      }
+
+      for (const failure of batchResult.failures) {
+        historyStore.append({
+          skillName: failure.skillName,
+          agent: failure.agent,
+          timestamp: new Date().toISOString(),
+          previousHash: failure.previousHash || '',
+          newHash: '',
+          success: false
+        })
+      }
+
+      // 发送批量更新完成事件
+      this.sendBatchUpdateCompleted({
+        successes: batchResult.successes.map((s) => ({
+          agent: s.agent,
+          skillName: s.skillName,
+          previousHash: s.previousHash || '',
+          newHash: s.newHash || ''
+        })),
+        failures: batchResult.failures.map((f) => ({
+          agent: f.agent,
+          skillName: f.skillName,
+          reason: f.error || '未知错误'
+        })),
+        timestamp: batchResult.timestamp
+      })
+
+      // 缓存最近一次批量更新结果
+      this.lastBatchResult = batchResult
+      return finalStatuses
+    } finally {
+      this.updating = false
     }
   }
 
@@ -343,6 +398,7 @@ export class AutoUpdateScheduler {
       lastCheckStatus: result.status,
       lastCheckReason: result.reason,
       lastCheckedAt: result.checkedAt,
+      lastKnownVersion: result.remoteVersion || existing?.lastKnownVersion,
       createdAt: existing?.createdAt || now,
       updatedAt: now
     }

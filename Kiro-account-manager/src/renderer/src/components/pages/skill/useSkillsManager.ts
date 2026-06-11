@@ -210,7 +210,7 @@ export function useSkillsManager(isEn: boolean) {
   }, [installSkillNames, installSource, installTargets, isEn, load, message])
 
   const runDelete = useCallback(
-    async (allAgents = false, names = selected) => {
+    async (_allAgents = false, names = selected) => {
       if (!currentAgent || names.length === 0) return
 
       // 找到要删除的 skill 对象
@@ -218,7 +218,7 @@ export function useSkillsManager(isEn: boolean) {
 
       for (const skill of skillsToDelete) {
         if (skill.installType === 'plugin') {
-          // Plugin skill：获取 plugin 信息，确认删除整个 plugin
+          // Plugin skill：获取 plugin 信息
           const info = await window.api.skillsGetPluginDeleteInfo({
             skillName: skill.name,
             pluginName: skill.pluginName || '',
@@ -229,16 +229,16 @@ export function useSkillsManager(isEn: boolean) {
             continue
           }
           const confirmed = await modal.confirm({
-            title: isEn ? 'Delete plugin?' : '删除插件？',
+            title: isEn ? 'Delete skill?' : '删除技能？',
             okText: isEn ? 'Delete' : '删除',
             cancelText: isEn ? 'Cancel' : '取消',
             content: info.skillNames.length <= 1
               ? (isEn
-                ? `Delete plugin "${info.pluginName}" (v${info.version})?`
-                : `确定删除插件「${info.pluginName}」(v${info.version})？`)
+                ? `Are you sure you want to delete "${skill.name}"?`
+                : `确定要删除「${skill.name}」吗？`)
               : (isEn
-                ? `Deleting plugin "${info.pluginName}" (v${info.version}) will also remove: ${info.skillNames.join(', ')}`
-                : `删除插件「${info.pluginName}」(v${info.version}) 会同时移除以下技能：${info.skillNames.join('、')}`)
+                ? `Deleting "${skill.name}" will also remove: ${info.skillNames.filter(n => n !== skill.name).join(', ')}`
+                : `删除「${skill.name}」会同时移除：${info.skillNames.filter(n => n !== skill.name).join('、')}`)
           })
           if (!confirmed) continue
 
@@ -248,17 +248,16 @@ export function useSkillsManager(isEn: boolean) {
           if (!result.success) {
             message.error(result.error || (isEn ? 'Delete failed' : '删除失败'))
           } else {
-            message.success(isEn ? 'Plugin deleted' : '插件已删除')
+            message.success(isEn ? 'Deleted' : '已删除')
           }
         } else {
-          // 非 plugin skill：确认从所有 agent 删除
           const confirmed = await modal.confirm({
             title: isEn ? 'Delete skill?' : '删除技能？',
             okText: isEn ? 'Delete' : '删除',
             cancelText: isEn ? 'Cancel' : '取消',
             content: isEn
-              ? `This will delete "${skill.name}" from all agents (excluding plugin-installed copies). Auto-update settings will be removed.`
-              : `将从所有 Agent 中删除「${skill.name}」（不包括插件中的副本）。相关自动更新配置会被清理。`
+              ? `Are you sure you want to delete "${skill.name}"?`
+              : `确定要删除「${skill.name}」吗？`
           })
           if (!confirmed) continue
 
@@ -340,27 +339,14 @@ export function useSkillsManager(isEn: boolean) {
       if (!currentAgent || skillNames.length === 0) return
 
       const skillsToUpdate = (currentAgent.skills || []).filter((s) => skillNames.includes(s.name))
-      const hasPlugin = skillsToUpdate.some((s) => s.installType === 'plugin')
-      const hasNonPlugin = skillsToUpdate.some((s) => s.installType !== 'plugin')
 
       // 确认弹窗
-      let confirmMsg = ''
-      if (hasPlugin && hasNonPlugin) {
-        confirmMsg = isEn
-          ? `Update ${skillNames.length} skill(s)? Plugin skills will pull marketplace first.`
-          : `确定更新 ${skillNames.length} 个技能？插件技能会先拉取市场最新版本。`
-      } else if (hasPlugin) {
-        confirmMsg = isEn
-          ? `Update plugin? This will pull marketplace and reinstall.`
-          : `确定更新插件？会先拉取市场最新版本再重新安装。`
-      } else {
-        confirmMsg = isEn
-          ? `Update "${skillNames.join(', ')}" across all agents?`
-          : `所有 Agent 中的「${skillNames.join('、')}」技能会一起更新。`
-      }
+      const confirmMsg = skillNames.length === 1
+        ? (isEn ? `Are you sure you want to update "${skillNames[0]}"?` : `确定要更新「${skillNames[0]}」吗？`)
+        : (isEn ? `Update ${skillNames.length} skill(s)?` : `确定更新 ${skillNames.length} 个技能？`)
 
       const confirmed = await modal.confirm({
-        title: isEn ? 'Update skills?' : '更新技能？',
+        title: isEn ? 'Update skill?' : '更新技能？',
         okText: isEn ? 'Update' : '更新',
         cancelText: isEn ? 'Cancel' : '取消',
         content: confirmMsg
@@ -372,6 +358,10 @@ export function useSkillsManager(isEn: boolean) {
 
       for (const name of skillNames) {
         const skill = skillsToUpdate.find((s) => s.name === name)
+        const key = `${currentAgent.id}:${name}`
+
+        // 更新中状态
+        setUpdateStatuses((prev) => ({ ...prev, [key]: { status: 'updating' } }))
 
         if (skill?.installType === 'plugin') {
           const result = await window.api.skillsUpdatePlugin({
@@ -381,12 +371,24 @@ export function useSkillsManager(isEn: boolean) {
           if (!result.success) {
             message.error(`${name}: ${result.error || (isEn ? 'Update failed' : '更新失败')}`)
             allSuccess = false
+            setUpdateStatuses((prev) => ({
+              ...prev,
+              [key]: { status: 'available', reason: result.error }
+            }))
+          } else {
+            setUpdateStatuses((prev) => ({ ...prev, [key]: { status: 'latest' } }))
           }
         } else {
           const result = await window.api.skillsUpdateSkill({ skillName: name })
           if (!result.success) {
             message.error(`${name}: ${result.error || (isEn ? 'Update failed' : '更新失败')}`)
             allSuccess = false
+            setUpdateStatuses((prev) => ({
+              ...prev,
+              [key]: { status: 'available', reason: result.error }
+            }))
+          } else {
+            setUpdateStatuses((prev) => ({ ...prev, [key]: { status: 'latest' } }))
           }
         }
       }
@@ -409,20 +411,15 @@ export function useSkillsManager(isEn: boolean) {
         skillName
       })
       setBusy(null)
-      setUpdateStatuses((prev) => ({
-        ...prev,
-        [`${currentAgent.id}:${skillName}`]: {
-          status: result.status,
-          reason: result.reason
-        }
-      }))
       if (!result.success || result.reason) {
         message[result.success ? 'info' : 'error'](
           result.reason || (isEn ? 'Check failed' : '检查失败')
         )
       }
+      // 检测完成后刷新列表以更新 version 列
+      await load()
     },
-    [currentAgent, isEn, message]
+    [currentAgent, isEn, load, message]
   )
 
   const runCheckAll = useCallback(
@@ -432,8 +429,10 @@ export function useSkillsManager(isEn: boolean) {
       // 委托给后端并发池检测，结果通过 push 事件实时更新
       await window.api.skillsCheckUpdateBatch({ agent: currentAgent.id })
       setBusy(null)
+      // 检测完成后重新加载列表以刷新 version（lastKnownVersion 由 backend 持久化）
+      await load()
     },
-    [currentAgent]
+    [currentAgent, load]
   )
 
   useEffect(() => {
@@ -444,15 +443,50 @@ export function useSkillsManager(isEn: boolean) {
     }
   }, [busy, currentAgent, filteredSkills.length, initialCheckDone, runCheckAll])
 
-  // Task 13.2: Listen for push events to reactively update skill statuses
+  // Task 13.2: Listen for push events to reactively update skill statuses.
+  // 为保证「更新中」过程态可见，终态至少在 'updating' 显示 MIN_UPDATING_MS 后才覆盖。
+  const updatingSinceRef = useMemo<{ current: Record<string, number> }>(() => ({ current: {} }), [])
+  const pendingFinalRef = useMemo<{ current: Record<string, ReturnType<typeof setTimeout>> }>(
+    () => ({ current: {} }),
+    []
+  )
   useEffect(() => {
+    const MIN_UPDATING_MS = 700
     const unsubStatus = window.api.onSkillsUpdateStatusChanged?.((event) => {
-      setUpdateStatuses((prev) => ({
-        ...prev,
-        [`${event.agent}:${event.skillName}`]: { status: event.status as SkillUpdateStatus, reason: event.reason }
-      }))
+      const key = `${event.agent}:${event.skillName}`
+      const next = { status: event.status as SkillUpdateStatus, reason: event.reason }
+
+      // 清除该 key 上待生效的终态
+      if (pendingFinalRef.current[key]) {
+        clearTimeout(pendingFinalRef.current[key])
+        delete pendingFinalRef.current[key]
+      }
+
+      if (event.status === 'updating') {
+        updatingSinceRef.current[key] = Date.now()
+        setUpdateStatuses((prev) => ({ ...prev, [key]: next }))
+        return
+      }
+
+      // 终态：确保「更新中」至少显示了 MIN_UPDATING_MS
+      const since = updatingSinceRef.current[key]
+      const remaining = since ? MIN_UPDATING_MS - (Date.now() - since) : 0
+      if (remaining > 0) {
+        pendingFinalRef.current[key] = setTimeout(() => {
+          delete pendingFinalRef.current[key]
+          delete updatingSinceRef.current[key]
+          setUpdateStatuses((prev) => ({ ...prev, [key]: next }))
+        }, remaining)
+      } else {
+        delete updatingSinceRef.current[key]
+        setUpdateStatuses((prev) => ({ ...prev, [key]: next }))
+      }
     })
-    return () => { unsubStatus?.() }
+    return () => {
+      unsubStatus?.()
+      Object.values(pendingFinalRef.current).forEach(clearTimeout)
+      pendingFinalRef.current = {}
+    }
   }, [])
 
   // Task 13.3: Listen for batch update completed events and show notification

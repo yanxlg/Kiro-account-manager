@@ -8,6 +8,11 @@ const api = {
     ipcRenderer.send('open-external', url, usePrivateMode)
   },
 
+  // 用系统默认应用打开本地文件
+  openLocalFile: (filePath: string): void => {
+    ipcRenderer.send('open-local-file', filePath)
+  },
+
   // 获取应用版本
   getAppVersion: (): Promise<string> => {
     return ipcRenderer.invoke('get-app-version')
@@ -1601,6 +1606,43 @@ const api = {
     minimizeOnStart?: boolean
   }): Promise<{ success: boolean; error?: string }> => {
     return ipcRenderer.invoke('save-tray-settings', settings)
+  },
+
+  // 获取灵动岛设置
+  getIslandSettings: (): Promise<{
+    enabled: boolean
+    autoLaunch: boolean
+    startMode: 'window' | 'island'
+    minimizeToIsland: boolean
+    showProxyStatus: boolean
+    position: { x: number; y: number } | null
+  }> => {
+    return ipcRenderer.invoke('get-island-settings')
+  },
+
+  // 保存灵动岛设置
+  saveIslandSettings: (settings: {
+    enabled?: boolean
+    autoLaunch?: boolean
+    startMode?: 'window' | 'island'
+    minimizeToIsland?: boolean
+    showProxyStatus?: boolean
+    position?: { x: number; y: number } | null
+  }): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('save-island-settings', settings)
+  },
+
+  // 推送灵动岛展示偏好（隐私模式 + 已解析主题色）
+  updateIslandPrefs: (prefs: {
+    privacyMode: boolean
+    isDark: boolean
+    primary: string
+    gradientTo: string
+    foreground: string
+    mutedForeground: string
+    border: string
+  }): void => {
+    ipcRenderer.send('update-island-prefs', prefs)
   },
 
   // 更新托盘当前账户信息

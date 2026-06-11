@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import { useAccountsStore } from '@/store/accounts'
 import { Card, CardContent, CardHeader, CardTitle } from '../ui'
-import { Users, CheckCircle, AlertTriangle, Clock, Zap, Shield, Fingerprint, FolderPlus, Tag, TrendingUp, Activity, BarChart3 } from 'lucide-react'
+import { Users, CheckCircle, AlertTriangle, Clock, Zap, Shield, Fingerprint, FolderPlus, Tag, TrendingUp, Activity, BarChart3, Monitor, Terminal } from 'lucide-react'
 import kiroLogo from '@/assets/kiro-high-resolution-logo-transparent.png'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
@@ -20,7 +20,7 @@ const getSubscriptionColor = (type: string, title?: string): string => {
 }
 
 export function HomePage() {
-  const { accounts, activeAccountId, getStats, darkMode, usagePrecision } = useAccountsStore()
+  const { accounts, activeAccountId, activeCliAccountId, getStats, darkMode, usagePrecision } = useAccountsStore()
   const { t } = useTranslation()
   const stats = getStats()
 
@@ -57,31 +57,31 @@ export function HomePage() {
 
   const isEn = t('common.unknown') === 'Unknown'
   const statCards = [
-    { 
-      label: isEn ? 'Total Accounts' : '总账号数', 
-      value: stats.total, 
-      icon: Users, 
+    {
+      label: isEn ? 'Total Accounts' : '总账号数',
+      value: stats.total,
+      icon: Users,
       color: 'text-blue-500',
       bgColor: 'bg-blue-500/10'
     },
-    { 
-      label: isEn ? 'Active' : '正常账号', 
-      value: stats.byStatus?.active || 0, 
-      icon: CheckCircle, 
+    {
+      label: isEn ? 'Active' : '正常账号',
+      value: stats.byStatus?.active || 0,
+      icon: CheckCircle,
       color: 'text-green-500',
       bgColor: 'bg-green-500/10'
     },
-    { 
-      label: isEn ? 'Banned' : '已封禁', 
-      value: stats.byStatus?.error || 0, 
-      icon: AlertTriangle, 
+    {
+      label: isEn ? 'Banned' : '已封禁',
+      value: stats.byStatus?.error || 0,
+      icon: AlertTriangle,
       color: 'text-red-500',
       bgColor: 'bg-red-500/10'
     },
-    { 
-      label: isEn ? 'Expiring Soon' : '即将过期', 
-      value: stats.expiringSoonCount, 
-      icon: Clock, 
+    {
+      label: isEn ? 'Expiring Soon' : '即将过期',
+      value: stats.expiringSoonCount,
+      icon: Clock,
       color: 'text-amber-500',
       bgColor: 'bg-amber-500/10'
     },
@@ -93,6 +93,33 @@ export function HomePage() {
     [accounts, activeAccountId]
   )
 
+  // 读取 IDE / CLI 各自当前账号：均来自 app 自身记录的 store 值（不解析本地配置）
+  // IDE = activeAccountId（切号时记录），CLI = activeCliAccountId（切到 CLI 时记录）
+  const cliAccount = useMemo(
+    () => (activeCliAccountId ? accounts.get(activeCliAccountId) ?? null : null),
+    [accounts, activeCliAccountId]
+  )
+  // 两端是否为同一账号
+  const sameClientAccount = !!activeAccount && !!cliAccount && activeAccount.id === cliAccount.id
+
+  const renderClientRow = (
+    label: string,
+    icon: React.ReactNode,
+    acc: typeof activeAccount
+  ): React.ReactNode => (
+    <div className="flex items-center gap-3 py-2">
+      <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center text-primary shrink-0">
+        {icon}
+      </div>
+      <span className="text-xs text-muted-foreground w-24 shrink-0">{label}</span>
+      {acc ? (
+        <span className="font-medium truncate">{acc.nickname || acc.email}</span>
+      ) : (
+        <span className="text-sm text-muted-foreground">{isEn ? 'Not logged in' : '未登录'}</span>
+      )}
+    </div>
+  )
+
   return (
     <div className="flex-1 p-6 space-y-6 overflow-auto">
       {/* Header */}
@@ -100,10 +127,10 @@ export function HomePage() {
         <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-primary/20 to-transparent rounded-full blur-2xl" />
         <div className="absolute bottom-0 left-0 w-24 h-24 bg-gradient-to-tr from-primary/20 to-transparent rounded-full blur-2xl" />
         <div className="relative flex items-center gap-4">
-          <img 
-            src={kiroLogo} 
-            alt="Kiro" 
-            className={cn("h-14 w-auto transition-all", darkMode && "invert brightness-0")} 
+          <img
+            src={kiroLogo}
+            alt="Kiro"
+            className={cn("h-14 w-auto transition-all", darkMode && "invert brightness-0")}
           />
           <div>
             <h1 className="text-2xl font-bold text-primary">{isEn ? 'Welcome to Kiro Account Manager' : '欢迎使用 Kiro 账户管理器'}</h1>
@@ -209,7 +236,7 @@ export function HomePage() {
                   </div>
                   <div className="relative h-3 bg-muted rounded-full overflow-hidden">
                     {/* 基础进度段 */}
-                    <div 
+                    <div
                       className={cn(
                         "absolute inset-y-0 left-0 transition-all",
                         isOverQuota && "bg-red-500",
@@ -221,7 +248,7 @@ export function HomePage() {
                     />
                     {/* 超额段 - 深红条纹动画从右侧叠加 */}
                     {isOverQuota && (
-                      <div 
+                      <div
                         className="absolute inset-y-0 right-0 bg-gradient-to-r from-red-600 via-red-700 to-red-800 animate-pulse"
                         style={{
                           width: `${overBarWidth}%`,
@@ -254,6 +281,28 @@ export function HomePage() {
                 </div>
               )
             })()}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Client Login State (IDE / CLI) */}
+      {(activeAccount || cliAccount) && (
+        <Card className="hover-lift">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base flex items-center gap-2">
+              <Monitor className="h-4 w-4 text-primary" />
+              {isEn ? 'Client Login State' : '客户端登录态'}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="divide-y">
+            {sameClientAccount
+              ? renderClientRow('IDE + CLI', <Monitor className="h-4 w-4" />, activeAccount)
+              : (
+                <>
+                  {renderClientRow('Kiro IDE', <Monitor className="h-4 w-4" />, activeAccount)}
+                  {renderClientRow('Kiro CLI', <Terminal className="h-4 w-4" />, cliAccount)}
+                </>
+              )}
           </CardContent>
         </Card>
       )}
@@ -301,12 +350,12 @@ export function HomePage() {
                   {activeAccount.usage?.current || 0} / {activeAccount.usage?.limit || 0}
                 </p>
                 <div className="h-1.5 bg-muted rounded-full overflow-hidden">
-                  <div 
+                  <div
                     className={`h-full rounded-full transition-all ${
-                      (activeAccount.usage?.percentUsed || 0) > 0.8 
-                        ? 'bg-red-500' 
-                        : (activeAccount.usage?.percentUsed || 0) > 0.5 
-                          ? 'bg-amber-500' 
+                      (activeAccount.usage?.percentUsed || 0) > 0.8
+                        ? 'bg-red-500'
+                        : (activeAccount.usage?.percentUsed || 0) > 0.5
+                          ? 'bg-amber-500'
                           : 'bg-green-500'
                     }`}
                     style={{ width: `${Math.min((activeAccount.usage?.percentUsed || 0) * 100, 100)}%` }}
@@ -318,7 +367,7 @@ export function HomePage() {
               <div className="space-y-1">
                 <p className="text-xs text-muted-foreground">{isEn ? 'Subscription' : '订阅剩余'}</p>
                 <p className="text-sm font-medium">
-                  {activeAccount.subscription?.daysRemaining != null 
+                  {activeAccount.subscription?.daysRemaining != null
                     ? (isEn ? `${activeAccount.subscription.daysRemaining} days` : `${activeAccount.subscription.daysRemaining} 天`)
                     : (isEn ? 'Permanent' : '永久')}
                 </p>
@@ -344,7 +393,7 @@ export function HomePage() {
               <div className="space-y-1">
                 <p className="text-xs text-muted-foreground">{isEn ? 'Auth Method' : '登录方式'}</p>
                 <p className="text-sm font-medium">
-                  {activeAccount.credentials?.authMethod === 'social' 
+                  {activeAccount.credentials?.authMethod === 'social'
                     ? (activeAccount.credentials?.provider || 'Social')
                     : 'Builder ID'}
                 </p>

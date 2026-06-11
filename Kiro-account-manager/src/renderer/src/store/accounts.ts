@@ -248,6 +248,9 @@ interface AccountsState {
   // 当前激活账号
   activeAccountId: string | null
 
+  // 当前切到 Kiro CLI 的账号（由 app 切号时记录，不解析 CLI 本地配置）
+  activeCliAccountId: string | null
+
   // 筛选和排序
   filter: AccountFilter
   /** 当前激活的分组 Tab：'all' | 'ungrouped' | <groupId>，互斥 */
@@ -342,6 +345,7 @@ interface AccountsActions {
 
   // 激活账号
   setActiveAccount: (id: string | null) => void
+  setActiveCliAccount: (id: string | null) => void
   getActiveAccount: () => Account | null
 
   // 分组操作
@@ -544,6 +548,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   groups: new Map(),
   tags: new Map(),
   activeAccountId: null,
+  activeCliAccountId: null,
   filter: defaultFilter,
   activeGroupTab: loadActiveGroupTab(),
   sort: defaultSort,
@@ -681,7 +686,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   setActiveAccount: async (id) => {
     const state = get()
-    
+
     set((s) => {
       const accounts = new Map(s.accounts)
 
@@ -703,22 +708,22 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
       return { accounts, activeAccountId: id }
     })
-    
+
     // 切换账号时自动更换机器码（如果启用）
     if (id && state.machineIdConfig.autoSwitchOnAccountChange) {
       try {
         const account = state.accounts.get(id)
-        
+
         if (state.machineIdConfig.bindMachineIdToAccount) {
           // 使用账户绑定的机器码
           let boundMachineId = state.accountMachineIds[id]
-          
+
           if (!boundMachineId) {
             // 如果没有绑定机器码，为该账户生成一个
             boundMachineId = await window.api.machineIdGenerateRandom()
             get().bindMachineIdToAccount(id, boundMachineId)
           }
-          
+
           if (state.machineIdConfig.useBindedMachineId) {
             // 使用绑定的机器码
             await get().changeMachineId(boundMachineId)
@@ -730,7 +735,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           // 每次切换都随机生成新机器码
           await get().changeMachineId()
         }
-        
+
         // 更新历史记录
         const newMachineId = get().currentMachineId
         set((s) => ({
@@ -746,13 +751,18 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             }
           ]
         }))
-        
+
         console.log(`[MachineId] Auto-switched machine ID for account: ${account?.email}`)
       } catch (error) {
         console.error('[MachineId] Failed to auto-switch machine ID:', error)
       }
     }
-    
+
+    get().saveToStorage()
+  },
+
+  setActiveCliAccount: (id) => {
+    set({ activeCliAccountId: id })
     get().saveToStorage()
   },
 
@@ -1200,7 +1210,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   importFromExportData: (data) => {
     const result: BatchOperationResult = { success: 0, failed: 0, errors: [] }
     const { accounts: existingAccounts } = get()
-    
+
     // 检查账户是否已存在（同邮箱+同provider 或 同userId 才算重复）
     const isAccountExists = (email: string, userId?: string, provider?: string): boolean => {
       return Array.from(existingAccounts.values()).some(acc => {
@@ -1211,7 +1221,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         return false
       })
     }
-    
+
     // 去重：文件内部去重
     const seenEmails = new Set<string>()
     const seenUserIds = new Set<string>()
@@ -1378,7 +1388,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   batchRefreshTokens: async (ids) => {
     const { accounts, autoRefreshConcurrency } = get()
-    
+
     // 收集需要刷新的账号
     const accountsToRefresh: Array<{
       id: string
@@ -1399,7 +1409,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     for (const id of ids) {
       const account = accounts.get(id)
       if (!account?.credentials.refreshToken) continue
-      
+
       accountsToRefresh.push({
         id,
         email: account.email,
@@ -1422,14 +1432,14 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     }
 
     console.log(`[BatchRefresh] Triggering background refresh for ${accountsToRefresh.length} accounts...`)
-    
+
     // 使用后台刷新 API（不阻塞 UI）
     const result = await window.api.backgroundBatchRefresh(accountsToRefresh, autoRefreshConcurrency)
-    
-    return { 
-      success: result.successCount, 
-      failed: result.failedCount, 
-      errors: [] 
+
+    return {
+      success: result.successCount,
+      failed: result.failedCount,
+      errors: []
     }
   },
 
@@ -1452,7 +1462,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           const acc = accounts.get(id)
           if (acc) {
             // 如果 token 被刷新，更新凭证
-            const updatedCredentials = result.data!.newCredentials 
+            const updatedCredentials = result.data!.newCredentials
               ? {
                   ...acc.credentials,
                   accessToken: result.data!.newCredentials.accessToken,
@@ -1514,7 +1524,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           return { accounts }
         })
         get().saveToStorage()
-        
+
         // 如果刷新了 token，打印日志
         if (result.data.newCredentials) {
           console.log(`[Account] Token refreshed for ${account?.email}`)
@@ -1536,7 +1546,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   batchCheckStatus: async (ids) => {
     const { accounts, autoRefreshConcurrency } = get()
-    
+
     // 收集需要检查的账号（使用批量检查 API，不刷新 Token）
     const accountsToCheck: Array<{
       id: string
@@ -1556,7 +1566,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     for (const id of ids) {
       const account = accounts.get(id)
       if (!account?.credentials.accessToken) continue
-      
+
       accountsToCheck.push({
         id,
         email: account.email,
@@ -1578,14 +1588,14 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     }
 
     console.log(`[BatchCheck] Triggering background check for ${accountsToCheck.length} accounts...`)
-    
+
     // 使用后台检查 API（只检查状态，不刷新 Token）
     const result = await window.api.backgroundBatchCheck(accountsToCheck, autoRefreshConcurrency)
-    
-    return { 
-      success: result.successCount, 
-      failed: result.failedCount, 
-      errors: [] 
+
+    return {
+      success: result.successCount,
+      failed: result.failedCount,
+      errors: []
     }
   },
 
@@ -1666,6 +1676,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       if (data) {
         const accounts = new Map(Object.entries(data.accounts ?? {}) as [string, Account][])
         const activeAccountId = data.activeAccountId ?? null
+        const activeCliAccountId = data.activeCliAccountId ?? null
 
         // 为没有 machineId 的现有账户生成一个
         let needsSave = false
@@ -1691,6 +1702,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           groups: new Map(Object.entries(data.groups ?? {}) as [string, AccountGroup][]),
           tags: new Map(Object.entries(data.tags ?? {}) as [string, AccountTag][]),
           activeAccountId,
+          activeCliAccountId,
           autoRefreshEnabled: data.autoRefreshEnabled ?? true,
           autoRefreshInterval: data.autoRefreshInterval ?? 5,
           autoRefreshConcurrency: data.autoRefreshConcurrency ?? 100,
@@ -1805,6 +1817,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       groups,
       tags,
       activeAccountId,
+      activeCliAccountId,
       autoRefreshEnabled,
       autoRefreshInterval,
       autoRefreshConcurrency,
@@ -1838,6 +1851,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           groups: Object.fromEntries(groups),
           tags: Object.fromEntries(tags),
           activeAccountId,
+          activeCliAccountId,
           autoRefreshEnabled,
           autoRefreshInterval,
           autoRefreshConcurrency,
@@ -1881,7 +1895,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       autoRefreshInterval: interval ?? get().autoRefreshInterval
     })
     get().saveToStorage()
-    
+
     // 重新启动定时器
     if (enabled) {
       get().startAutoTokenRefresh()
@@ -1964,7 +1978,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   setProxy: async (enabled, url) => {
     const targetUrl = url ?? get().proxyUrl
-    set({ 
+    set({
       proxyEnabled: enabled,
       proxyUrl: targetUrl
     })
@@ -2001,7 +2015,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     set({ language })
     get().saveToStorage()
     // 更新托盘菜单语言
-    const actualLang = language === 'auto' 
+    const actualLang = language === 'auto'
       ? (navigator.language.startsWith('zh') ? 'zh' : 'en')
       : language
     window.api.updateTrayLanguage(actualLang)
@@ -2010,10 +2024,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   applyTheme: () => {
     const { theme, darkMode } = get()
     const root = document.documentElement
-    
+
     // 移除所有主题类（包含所有 32 个主题）
     root.classList.remove(
-      'dark', 
+      'dark',
       // 蓝色系
       'theme-indigo', 'theme-cyan', 'theme-sky', 'theme-teal',
       // 紫红系
@@ -2031,12 +2045,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       // 自然深色
       'theme-coral', 'theme-forest', 'theme-ocean'
     )
-    
+
     // 应用深色模式
     if (darkMode) {
       root.classList.add('dark')
     }
-    
+
     // 应用主题颜色
     if (theme !== 'default') {
       root.classList.add(`theme-${theme}`)
@@ -2052,7 +2066,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       autoSwitchInterval: interval ?? get().autoSwitchInterval
     })
     get().saveToStorage()
-    
+
     // 重新启动定时器
     if (enabled) {
       get().startAutoSwitch()
@@ -2078,22 +2092,22 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   startAutoSwitch: () => {
     const { autoSwitchEnabled, autoSwitchInterval, checkAndAutoSwitch } = get()
-    
+
     if (!autoSwitchEnabled) return
-    
+
     // 清除现有定时器
     if (autoSwitchTimer) {
       clearInterval(autoSwitchTimer)
     }
-    
+
     // 立即检查一次
     checkAndAutoSwitch()
-    
+
     // 设置定时检查
     autoSwitchTimer = setInterval(() => {
       checkAndAutoSwitch()
     }, autoSwitchInterval * 60 * 1000)
-    
+
     console.log(`[AutoSwitch] Started with interval: ${autoSwitchInterval} minutes`)
   },
 
@@ -2108,7 +2122,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   checkAndAutoSwitch: async () => {
     const { accounts, autoSwitchThreshold, checkAccountStatus, setActiveAccount } = get()
     const activeAccount = get().getActiveAccount()
-    
+
     if (!activeAccount) {
       console.log('[AutoSwitch] No active account')
       return
@@ -2118,7 +2132,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     // 刷新当前账号状态获取最新余额
     await checkAccountStatus(activeAccount.id)
-    
+
     // 重新获取更新后的账号信息
     const updatedAccount = get().accounts.get(activeAccount.id)
     if (!updatedAccount) return
@@ -2129,7 +2143,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     // 检查是否需要切换
     if (remaining <= autoSwitchThreshold) {
       console.log(`[AutoSwitch] Account ${updatedAccount.email} reached threshold, switching...`)
-      
+
       // 查找可用的账号
       const availableAccount = Array.from(accounts.values()).find(acc => {
         // 排除当前账号
@@ -2194,6 +2208,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             profileArn: (availableAccount as { profileArn?: string }).profileArn,
             provider: creds.provider
           }).catch(err => console.warn('[AutoSwitch CLI] Failed:', err))
+          get().setActiveCliAccount(availableAccount.id)
         }
       } else {
         console.log('[AutoSwitch] No available account to switch to')
@@ -2211,7 +2226,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     // 筛选需要处理的账号
     const accountsToProcess: Array<{ id: string; email: string; needsTokenRefresh: boolean }> = []
-    
+
     for (const [id, account] of accounts) {
       // 跳过已封禁或错误状态的账号
       if (isBannedAccountError(account.lastError)) {
@@ -2257,10 +2272,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           }
         })
       )
-      
+
       successCount += results.filter(r => r.status === 'fulfilled' && r.value.success).length
       failCount += results.length - results.filter(r => r.status === 'fulfilled' && r.value.success).length
-      
+
       // 批次间延迟
       if (i + BATCH_SIZE < accountsToProcess.length) {
         await new Promise(resolve => setTimeout(resolve, 200))
@@ -2277,7 +2292,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     // 筛选需要刷新 Token 的账号
     const expiredAccounts: Array<{ id: string; email: string }> = []
-    
+
     for (const [id, account] of accounts) {
       // 跳过已封禁或错误状态的账号
       if (isBannedAccountError(account.lastError)) {
@@ -2286,7 +2301,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
       const expiresAt = account.credentials.expiresAt
       const timeUntilExpiry = expiresAt ? expiresAt - now : Infinity
-      
+
       // Token 已过期或即将过期
       if (expiresAt && timeUntilExpiry <= TOKEN_REFRESH_BEFORE_EXPIRY) {
         expiredAccounts.push({ id, email: account.email })
@@ -2323,13 +2338,13 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   startAutoTokenRefresh: () => {
     const { autoRefreshEnabled, autoRefreshInterval } = get()
-    
+
     // 如果已有定时器，先停止
     if (tokenRefreshTimer) {
       clearInterval(tokenRefreshTimer)
       tokenRefreshTimer = null
     }
-    
+
     // 如果未启用，不启动定时器
     if (!autoRefreshEnabled) {
       console.log('[AutoRefresh] Auto-refresh is disabled')
@@ -2380,7 +2395,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         profileArn?: string
       }
     }> = []
-    
+
     for (const [id, account] of accounts) {
       // 跳过已封禁或错误状态的账号
       if (isBannedAccountError(account.lastError)) {
@@ -2390,7 +2405,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const expiresAt = account.credentials.expiresAt
       const timeUntilExpiry = expiresAt ? expiresAt - now : Infinity
       const needsTokenRefresh = expiresAt && timeUntilExpiry <= TOKEN_REFRESH_BEFORE_EXPIRY
-      
+
       // Token 即将过期需要刷新，或开启了同步检测/自动换号需要检查账户信息
       if (needsTokenRefresh || autoRefreshSyncInfo || autoSwitchEnabled) {
         accountsToRefresh.push({
@@ -2420,7 +2435,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     }
 
     console.log(`[BackgroundRefresh] Triggering refresh for ${accountsToRefresh.length} accounts (syncInfo: ${autoRefreshSyncInfo})...`)
-    
+
     // 调用主进程后台刷新，不等待结果（通过 IPC 事件接收）
     window.api.backgroundBatchRefresh(accountsToRefresh, autoRefreshConcurrency, autoRefreshSyncInfo)
   },
@@ -2677,7 +2692,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     // 设置定时保存
     autoSaveTimer = setInterval(async () => {
       const currentHash = computeHash()
-      
+
       // 只有数据变化时才保存
       if (currentHash !== lastSaveHash) {
         console.log('[AutoSave] Data changed, saving...')
@@ -2712,7 +2727,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const result = await window.api.machineIdGetCurrent()
       if (result.success && result.machineId) {
         set({ currentMachineId: result.machineId })
-        
+
         // 首次获取时自动备份原始机器码
         const { originalMachineId } = get()
         if (!originalMachineId) {
@@ -2726,7 +2741,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   changeMachineId: async (newMachineId) => {
     const state = get()
-    
+
     // 首次更改时备份原始机器码
     if (!state.originalMachineId) {
       state.backupOriginalMachineId()
@@ -2734,10 +2749,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     // 生成新机器码（如果未提供）
     const machineIdToSet = newMachineId || await window.api.machineIdGenerateRandom()
-    
+
     try {
       const result = await window.api.machineIdSet(machineIdToSet)
-      
+
       if (result.success) {
         // 更新状态
         set((s) => ({
@@ -2769,7 +2784,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   restoreOriginalMachineId: async () => {
     const { originalMachineId } = get()
-    
+
     if (!originalMachineId) {
       console.warn('[MachineId] No original machine ID to restore')
       return false
@@ -2777,7 +2792,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     try {
       const result = await window.api.machineIdSet(originalMachineId)
-      
+
       if (result.success) {
         set((s) => ({
           currentMachineId: originalMachineId,
@@ -2834,14 +2849,14 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   backupOriginalMachineId: () => {
     const { currentMachineId, originalMachineId } = get()
-    
+
     // 只有在没有备份且有当前机器码时才备份
     if (!originalMachineId && currentMachineId) {
       set({
         originalMachineId: currentMachineId,
         originalBackupTime: Date.now()
       })
-      
+
       // 添加历史记录
       set((s) => ({
         machineIdHistory: [
@@ -2854,7 +2869,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           }
         ]
       }))
-      
+
       get().saveToStorage()
       console.log('[MachineId] Original machine ID backed up:', currentMachineId)
     }

@@ -46,6 +46,16 @@ import {
   type TraySettings,
   defaultTraySettings
 } from './tray'
+import { IslandManager } from './island'
+import {
+  defaultIslandSettings,
+  normalizeIslandSettings,
+  type IslandSettings,
+  type IslandPrefs,
+  type AppMode
+} from './island/types'
+import { resolveStartupMode } from './island/geometry'
+import { setAutoLaunch, getAutoLaunchStatus, wasLaunchedAtLogin } from './island/autoLaunch'
 
 // ============ 自动更新配置 ============
 autoUpdater.autoDownload = false
@@ -370,6 +380,7 @@ function initProxyServer(): ProxyServer {
       },
       onStatusChange: (running, port) => {
         mainWindow?.webContents.send('proxy-status-change', { running, port })
+        pushProxyStatusToIsland()
       },
       // Token 刷新回调 - 复用已有的刷新逻辑，含账号绑定代理
       onTokenRefresh: async (account) => {
@@ -453,6 +464,8 @@ function initProxyServer(): ProxyServer {
         debouncedStoreSet('proxyFailedRequests', failedRequests)
         // 更新托盘菜单（也防抖，避免频繁重建菜单）
         debouncedUpdateTrayMenu()
+        // 向灵动岛推送反代统计（防抖）
+        schedulePushProxyToIsland()
       },
       // 账号池为空时懒加载 - 从 store 读取账号数据同步到 pool
       onPoolEmpty: async () => {
@@ -1852,9 +1865,100 @@ async function flushBackupNow(): Promise<void> {
 let mainWindow: BrowserWindow | null = null
 let skillsScheduler: AutoUpdateScheduler | null = null
 
+// ============ Kiro IDE Auth 同步状态 ============
+// 账号管理器上一次写入 kiro-auth-token.json 时对应的 accountId，watcher 反向同步时优先用它
+let lastSwitchedAccountId: string | null = null
+// 账号管理器上一次写入时的 token 签名（access|refresh）。
+// watcher 触发时若签名一致，说明是账号管理器自己写的，跳过反向同步，避免回环。
+let lastWrittenTokenSignature: string | null = null
+// 上一次反向同步成功时刷写过的 store 数据签名，用于 dedupe webContents.send
+let lastSyncedFromIdeSignature: string | null = null
+
+// ============ 主动续期（Proactive Token Renewal） ============
+// 思路：在 Kiro IDE 内部 refresh loop 触发之前（token 剩 10 分钟时）抢先 refresh，
+//   让 IDE 永远拿到剩余时间充足的 token，IDE 自己永远不需要调 OIDC → 彻底消除 race。
+// 仅对"当前 IDE 激活账号"（lastSwitchedAccountId）维护一个 timer，开销小。
+// 默认关闭，需用户在 Settings 中显式打开。
+let proactiveRenewalEnabled = false
+let proactiveRenewalTimer: NodeJS.Timeout | null = null
+// 在 token 剩余多久时触发主动续期。15 分钟 > Kiro IDE 的 10 分钟阈值，确保抢先。
+const PROACTIVE_RENEWAL_LEAD_MS = 15 * 60 * 1000
+
 // ============ 托盘相关变量 ============
 let traySettings: TraySettings = { ...defaultTraySettings }
 let isQuitting = false // 标记是否真正退出应用
+
+// ============ 灵动岛相关变量 ============
+let islandSettings: IslandSettings = { ...defaultIslandSettings }
+let islandManager: IslandManager | null = null
+let startupMode: AppMode = 'window'
+let currentLanguage: 'en' | 'zh' = 'zh' // 跟踪当前 UI 语言，供托盘/灵动岛使用
+let islandProxyTimer: ReturnType<typeof setTimeout> | null = null
+
+// 统一的"显示主窗口"逻辑（退出灵动岛模式 + 显示并聚焦主窗口）
+function showMainWindow(): void {
+  islandManager?.exitIslandMode()
+  if (!mainWindow) {
+    createWindow()
+    return
+  }
+  if (process.platform === 'darwin' && app.dock) {
+    void app.dock.show()
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+// 加载灵动岛设置（以系统实际 Login Item 状态为准修正 autoLaunch）
+async function loadIslandSettings(): Promise<void> {
+  try {
+    await initStore()
+    islandSettings = normalizeIslandSettings(store?.get('islandSettings') ?? {})
+    const systemAutoLaunch = getAutoLaunchStatus()
+    if (systemAutoLaunch !== islandSettings.autoLaunch) {
+      islandSettings.autoLaunch = systemAutoLaunch
+    }
+    store?.set('islandSettings', islandSettings)
+  } catch (error) {
+    console.error('[Island] Failed to load island settings:', error)
+  }
+}
+
+// 持久化灵动岛设置（合并 + 归一化）
+function persistIslandSettings(patch: Partial<IslandSettings>): void {
+  islandSettings = normalizeIslandSettings({ ...islandSettings, ...patch })
+  try {
+    store?.set('islandSettings', islandSettings)
+  } catch (error) {
+    console.error('[Island] Failed to persist island settings:', error)
+  }
+}
+
+// 向灵动岛推送反代状态（防抖，避免每请求一次 IPC）
+function schedulePushProxyToIsland(): void {
+  if (islandProxyTimer) return
+  islandProxyTimer = setTimeout(() => {
+    islandProxyTimer = null
+    pushProxyStatusToIsland()
+  }, 1000)
+}
+
+function pushProxyStatusToIsland(): void {
+  if (!islandManager || !proxyServer) return
+  try {
+    const stats = proxyServer.getStats()
+    islandManager.pushProxy({
+      running: proxyServer.isRunning(),
+      port: proxyServer.getConfig().port,
+      totalRequests: stats.totalRequests,
+      successRequests: stats.successRequests,
+      failedRequests: stats.failedRequests
+    })
+  } catch (error) {
+    console.error('[Island] Failed to push proxy status:', error)
+  }
+}
 
 // ============ 全局快捷键设置 ============
 let showWindowShortcut = process.platform === 'darwin' ? 'Command+Shift+K' : 'Ctrl+Shift+K'
@@ -1892,13 +1996,7 @@ function registerShowWindowShortcut(): void {
   try {
     const success = globalShortcut.register(showWindowShortcut, () => {
       if (mainWindow) {
-        // macOS: 显示窗口时恢复 Dock 图标
-        if (process.platform === 'darwin' && app.dock) {
-          app.dock.show()
-        }
-        if (mainWindow.isMinimized()) mainWindow.restore()
-        mainWindow.show()
-        mainWindow.focus()
+        showMainWindow()
       }
     })
     if (success) {
@@ -1942,17 +2040,7 @@ function initTray(): void {
 
   createTray({
     onShowWindow: () => {
-      if (mainWindow) {
-        // macOS: 显示窗口时恢复 Dock 图标
-        if (process.platform === 'darwin' && app.dock) {
-          app.dock.show()
-        }
-        if (mainWindow.isMinimized()) {
-          mainWindow.restore()
-        }
-        mainWindow.show()
-        mainWindow.focus()
-      }
+      showMainWindow()
     },
     onQuit: () => {
       isQuitting = true
@@ -2033,7 +2121,13 @@ function createWindow(): void {
   mainWindow.on('ready-to-show', () => {
     // 设置带版本号的标题（HTML 加载后会覆盖初始标题）
     mainWindow?.setTitle(`Kiro 账号管理器 v${app.getVersion()}`)
-    mainWindow?.show()
+    // 根据启动模式决定显示主窗口还是进入灵动岛模式
+    if (startupMode === 'island' && islandSettings.enabled && islandManager) {
+      console.log('[Island] Starting in island mode (no main window shown)')
+      islandManager.enterIslandMode()
+    } else {
+      mainWindow?.show()
+    }
 
     // 检查代理服务自启动配置
     setTimeout(async () => {
@@ -2069,21 +2163,28 @@ function createWindow(): void {
 
           const proxyAccounts = Object.values(accountData.accounts)
             .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
-            .map((acc: any) => ({
-              id: acc.id,
-              email: acc.email,
-              accessToken: acc.credentials.accessToken,
-              refreshToken: acc.credentials?.refreshToken,
-              profileArn: acc.profileArn,
-              expiresAt: acc.credentials?.expiresAt,
-              machineId: acc.machineId,
-              clientId: acc.credentials?.clientId,
-              clientSecret: acc.credentials?.clientSecret,
-              region: acc.credentials?.region || 'us-east-1',
-              authMethod: acc.credentials?.authMethod,
-              provider: acc.credentials?.provider || acc.idp,
-              proxyUrl: buildProxyUrl(acc.id)
-            }))
+            .map((acc: any) => {
+              const provider = acc.credentials?.provider || acc.idp
+              const authMethod = acc.credentials?.authMethod
+              const profileArn = acc.profileArn || acc.credentials?.profileArn
+              // BuilderId/Social 不需要预填 profileArn（resolveProfileArn 会兜底，流式端点自动不传占位符）
+              // Enterprise 留给自愈获取真实 ARN
+              return {
+                id: acc.id,
+                email: acc.email,
+                accessToken: acc.credentials.accessToken,
+                refreshToken: acc.credentials?.refreshToken,
+                profileArn,
+                expiresAt: acc.credentials?.expiresAt,
+                machineId: acc.machineId,
+                clientId: acc.credentials?.clientId,
+                clientSecret: acc.credentials?.clientSecret,
+                region: acc.credentials?.region || 'us-east-1',
+                authMethod,
+                provider,
+                proxyUrl: buildProxyUrl(acc.id)
+              }
+            })
           if (proxyAccounts.length > 0) {
             const pool = server.getAccountPool()
             pool.clear()
@@ -2162,6 +2263,10 @@ function createWindow(): void {
         // macOS: 隐藏窗口时隐藏 Dock 图标
         if (process.platform === 'darwin' && app.dock) {
           app.dock.hide()
+        }
+        // 灵动岛模式：最小化到托盘时显示灵动岛
+        if (islandSettings.enabled && islandSettings.minimizeToIsland) {
+          islandManager?.enterIslandMode()
         }
         return
       } else if (traySettings.closeAction === 'ask' && mainWindow) {
@@ -2272,12 +2377,36 @@ app.whenReady().then(async () => {
   proxyLogStore.initialize(app.getPath('userData'))
   interceptConsole()
 
+  // 启动 Kiro IDE token 文件监听（反向同步：IDE 自己 refresh 后把新 token 同步回反代 store）
+  // 见 syncIdeTokenChangeToStore 注释
+  startKiroAuthTokenWatcher()
+
   // 注册自定义协议
   registerProtocol()
 
   // 加载托盘设置并初始化托盘
   await loadTraySettings()
   initTray()
+
+  // ============ 初始化灵动岛 ============
+  await loadIslandSettings()
+  islandManager = new IslandManager({
+    getSettings: () => islandSettings,
+    saveSettings: (patch) => persistIslandSettings(patch),
+    getMainWindow: () => mainWindow,
+    showMainWindow: () => showMainWindow(),
+    onSwitchAccount: () => mainWindow?.webContents.send('tray-switch-account'),
+    onRefreshAccount: () => mainWindow?.webContents.send('tray-refresh-account'),
+    onQuit: () => {
+      isQuitting = true
+      app.quit()
+    },
+    isQuitting: () => isQuitting,
+    getLanguage: () => currentLanguage
+  })
+  // 决定启动形态：开机自启动拉起 或 startMode === 'island' → 进入灵动岛模式
+  startupMode = resolveStartupMode(wasLaunchedAtLogin(), islandSettings)
+  console.log(`[Island] Startup mode resolved: ${startupMode}`)
 
   // 初始化自动更新（仅生产环境）
   if (!is.dev) {
@@ -2306,6 +2435,13 @@ app.whenReady().then(async () => {
       } else {
         shell.openExternal(url)
       }
+    }
+  })
+
+  // IPC: 用系统默认应用打开本地文件
+  ipcMain.on('open-local-file', (_event, filePath: string) => {
+    if (typeof filePath === 'string' && filePath.length > 0) {
+      shell.openPath(filePath).catch((err) => console.error('[Shell] openPath failed:', err))
     }
   })
 
@@ -2411,10 +2547,56 @@ app.whenReady().then(async () => {
     }
   })
 
-  // IPC: 更新托盘账户信息（从渲染进程调用）
+  // ============ 灵动岛相关 IPC ============
+
+  // IPC: 获取灵动岛设置
+  ipcMain.handle('get-island-settings', () => {
+    return islandSettings
+  })
+
+  // IPC: 保存灵动岛设置
+  ipcMain.handle('save-island-settings', async (_event, patch: Partial<IslandSettings>) => {
+    try {
+      // autoLaunch 需要同步系统 Login Item，仅在系统调用成功后持久化
+      if (typeof patch.autoLaunch === 'boolean' && patch.autoLaunch !== islandSettings.autoLaunch) {
+        const result = setAutoLaunch(patch.autoLaunch)
+        if (!result.success) {
+          return { success: false, error: result.error || 'Failed to set auto launch' }
+        }
+      }
+      await initStore()
+      persistIslandSettings(patch)
+      islandManager?.applySettings(islandSettings)
+      return { success: true }
+    } catch (error) {
+      console.error('[Island] Failed to save settings:', error)
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+    }
+  })
+
+  // IPC: 渲染进程推送灵动岛展示偏好（隐私模式 + 已解析主题色）
+  ipcMain.on('update-island-prefs', (_event, prefs: IslandPrefs) => {
+    islandManager?.pushPrefs(prefs)
+  })
   ipcMain.on('update-tray-account', (_event, account: typeof currentProxyAccount) => {
     currentProxyAccount = account
     updateCurrentAccount(account)
+
+    // 转发账号快照给灵动岛（复用同一数据管道）
+    islandManager?.pushAccount(
+      account
+        ? {
+            id: account.id,
+            email: account.email,
+            idp: account.idp,
+            status: account.status,
+            subscription: account.subscription,
+            usage: account.usage
+              ? { usedCredits: account.usage.usedCredits, totalCredits: account.usage.totalCredits }
+              : undefined
+          }
+        : null
+    )
 
     // 更新托盘提示
     if (account) {
@@ -2437,7 +2619,9 @@ app.whenReady().then(async () => {
 
   // IPC: 更新托盘语言
   ipcMain.on('update-tray-language', (_event, language: 'en' | 'zh') => {
+    currentLanguage = language
     updateTrayLanguage(language)
+    islandManager?.pushLanguage(language)
   })
 
   // IPC: 关闭确认对话框响应
@@ -2447,6 +2631,10 @@ app.whenReady().then(async () => {
       // macOS: 隐藏窗口时隐藏 Dock 图标
       if (process.platform === 'darwin' && app.dock) {
         app.dock.hide()
+      }
+      // 灵动岛模式：最小化到托盘时显示灵动岛
+      if (islandSettings.enabled && islandSettings.minimizeToIsland) {
+        islandManager?.enterIslandMode()
       }
     } else if (action === 'quit') {
       // 如果用户选择记住选择
@@ -4856,7 +5044,6 @@ app.whenReady().then(async () => {
     }
   })
 
-
   // IPC: 退出登录 - 清除本地 SSO 缓存
   ipcMain.handle('logout-account', async () => {
     const os = await import('os')
@@ -7101,12 +7288,7 @@ app.whenReady().then(async () => {
       createWindow()
     } else if (mainWindow) {
       // macOS: 点击 Dock 图标时显示主窗口
-      if (process.platform === 'darwin' && app.dock) {
-        app.dock.show()
-      }
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.show()
-      mainWindow.focus()
+      showMainWindow()
     }
   })
 
@@ -7128,10 +7310,9 @@ if (!gotTheLock) {
       handleProtocolUrl(url)
     }
 
-    // 聚焦主窗口
+    // 聚焦主窗口（第二个实例启动时恢复主窗口，退出灵动岛模式）
     if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.focus()
+      showMainWindow()
     }
   })
 }
@@ -7155,6 +7336,9 @@ app.on('will-quit', async (event) => {
   // Stop skill auto-update scheduler
   skillsScheduler?.stop()
   skillsScheduler = null
+  // 销毁灵动岛窗口
+  islandManager?.destroy()
+  islandManager = null
   // 防止重复处理
   if (isQuitting) return
 

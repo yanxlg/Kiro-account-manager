@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Badge,
@@ -7,7 +7,6 @@ import {
   Space,
   Switch,
   Table,
-  Tabs,
   Tag,
   Tooltip,
   Typography
@@ -21,7 +20,6 @@ import {
   Radar,
   Repeat2,
   RefreshCw,
-  RotateCw,
   Search,
   Settings2,
   Store,
@@ -38,20 +36,27 @@ import { SettingsModal } from './SettingsModal'
 import type { SkillsSkillView } from './types'
 import { useSkillsManager } from './useSkillsManager'
 
+/** Agent 颜色池 */
+const AGENT_COLORS = ['blue', 'purple', 'green', 'orange', 'cyan', 'magenta', 'geekblue', 'gold', 'lime', 'volcano'] as const
+function agentColor(index: number): string { return AGENT_COLORS[index % AGENT_COLORS.length] }
+
+/** 扁平化行：一个 skill + 它存在于哪些 agent */
+interface FlatSkillRow extends SkillsSkillView {
+  agents: Array<{ id: string; displayName: string; color: string }>
+}
+
 export function SkillsPage(): React.ReactNode {
   const tableContainerRef = useRef<HTMLDivElement | null>(null)
   const [tableScrollY, setTableScrollY] = useState(480)
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
   const {
-    activeAgent,
     agents,
     busy,
     config,
     currentAgent,
     effectiveFullSyncTargets,
     effectiveSyncTargets,
-    filteredSkills,
     fullSyncSourceAgent,
     fullSyncTargetOptions,
     fullSyncTargets,
@@ -78,7 +83,6 @@ export function SkillsPage(): React.ReactNode {
     runSyncFromAgent,
     runUpdate,
     saveConfigPatch,
-    setActiveAndPersist,
     setFullSyncTargets,
     setInstallSkillNames,
     setInstallSource,
@@ -96,6 +100,51 @@ export function SkillsPage(): React.ReactNode {
   } = useSkillsManager(isEn)
 
   const statusLabel = isEn ? statusLabelEn : statusLabelZh
+
+  // Agent 元数据映射（颜色固定）
+  const agentMeta = useMemo(() => {
+    const map = new Map<string, { displayName: string; color: string }>()
+    agents.forEach((a, idx) => map.set(a.id, { displayName: a.displayName, color: agentColor(idx) }))
+    return map
+  }, [agents])
+
+  // 扁平化所有 skill，去重合并 agent 列表
+  const allSkills: FlatSkillRow[] = useMemo(() => {
+    const rowMap = new Map<string, FlatSkillRow>()
+    for (const agent of agents) {
+      const meta = agentMeta.get(agent.id)
+      if (!meta) continue
+      for (const skill of agent.skills) {
+        const key = skill.name.toLowerCase()
+        let row = rowMap.get(key)
+        if (!row) {
+          row = { ...skill, agents: [] }
+          rowMap.set(key, row)
+        } else if (!row.version && skill.version) {
+          // 如果当前记录没有版本但新副本有，用新副本的字段覆盖（保留 agents 列表）
+          const existingAgents = row.agents
+          Object.assign(row, { ...skill, agents: existingAgents })
+        }
+        row.agents.push({ id: agent.id, displayName: meta.displayName, color: meta.color })
+      }
+    }
+    return Array.from(rowMap.values())
+  }, [agents, agentMeta])
+
+  // 搜索过滤
+  const flatFiltered = useMemo(() => {
+    const lower = query.trim().toLowerCase()
+    if (!lower) return allSkills
+    return allSkills.filter(
+      (s) =>
+        s.name.toLowerCase().includes(lower) ||
+        s.description.toLowerCase().includes(lower) ||
+        s.path.toLowerCase().includes(lower) ||
+        s.agents.some((a) => a.displayName.toLowerCase().includes(lower))
+    )
+  }, [allSkills, query])
+
+  const totalCount = allSkills.length
 
   useEffect(() => {
     const container = tableContainerRef.current
@@ -122,9 +171,9 @@ export function SkillsPage(): React.ReactNode {
       observer.disconnect()
       window.removeEventListener('resize', updateTableScrollY)
     }
-  }, [activeAgent, filteredSkills.length, query, selected.length])
+  }, [flatFiltered.length, query, selected.length])
 
-  const columns: ColumnsType<SkillsSkillView> = [
+  const columns: ColumnsType<FlatSkillRow> = [
     {
       title: isEn ? 'Skill' : 'Skill',
       dataIndex: 'name',
@@ -134,11 +183,6 @@ export function SkillsPage(): React.ReactNode {
         <div className="min-w-0">
           <div className="flex items-center gap-1.5">
             <span className="font-medium text-foreground">{skill.name}</span>
-            {skill.version && (
-              <span className="inline-flex items-center rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
-                v{skill.version}
-              </span>
-            )}
             {skill.installType === 'plugin' && (
               <span className="inline-flex items-center rounded bg-orange-500/10 px-1.5 py-0.5 text-[10px] font-medium text-orange-600">
                 plugin
@@ -180,6 +224,27 @@ export function SkillsPage(): React.ReactNode {
           </div>
         )
       }
+    },
+    {
+      title: isEn ? 'Version' : '版本',
+      key: 'version',
+      width: 80,
+      render: (_value, skill) => {
+        if (!skill.version) return <span className="text-muted-foreground">-</span>
+        return <Tag color="blue">v{skill.version}</Tag>
+      }
+    },
+    {
+      title: isEn ? 'Agents' : 'Agent',
+      key: 'agents',
+      width: 180,
+      render: (_value, skill: FlatSkillRow) => (
+        <div className="flex flex-wrap gap-1">
+          {skill.agents.map((a) => (
+            <Tag key={a.id} color={a.color}>{a.displayName}</Tag>
+          ))}
+        </div>
+      )
     },
     {
       title: isEn ? 'Status' : '状态',
@@ -272,7 +337,19 @@ export function SkillsPage(): React.ReactNode {
         </div>
         <div className="min-w-0 flex-1">
           <Typography.Title level={4} style={{ margin: 0 }}>
-            {isEn ? 'Skills Manager' : 'Skills 管理'}
+            <Badge
+              count={totalCount}
+              showZero
+              overflowCount={999}
+              offset={[8, -4]}
+              style={{
+                backgroundColor: 'var(--color-primary)',
+                color: 'var(--color-primary-foreground)',
+                fontSize: 11
+              }}
+            >
+              {isEn ? 'Skills Manager' : 'Skills 管理'}
+            </Badge>
           </Typography.Title>
           <Typography.Text type="secondary">
             {isEn ? 'Manage local agent skills across installed agents' : '管理本机已安装 Agent 的本地 skills'}
@@ -313,7 +390,7 @@ export function SkillsPage(): React.ReactNode {
             {isEn ? 'Install' : '安装'}
           </Button>
           <Button icon={<Radar className="h-4 w-4" />} onClick={() => void runCheckAll()} loading={busy === 'check'}>
-            {isEn ? 'Check all' : '检查全部'}
+            {isEn ? 'Check updates' : '检查更新'}
           </Button>
           <Button
             icon={<Repeat2 className="h-4 w-4" />}
@@ -333,37 +410,11 @@ export function SkillsPage(): React.ReactNode {
         </div>
       </div>
 
-      <Tabs
-        style={{ marginBottom: 0 }}
-        tabBarStyle={{ marginBottom: 8 }}
-        activeKey={activeAgent}
-        onChange={(key) => void setActiveAndPersist(key)}
-        items={agents.map((agent) => ({
-          key: agent.id,
-          label: (
-            <Badge
-              count={agent.count}
-              size="small"
-              offset={[10, -2]}
-              styles={{
-                indicator: {
-                  backgroundColor: 'var(--color-primary)',
-                  color: 'var(--color-primary-foreground)',
-                  boxShadow: '0 0 0 1px var(--color-background)'
-                }
-              }}
-            >
-              <span className="inline-block">{agent.displayName}</span>
-            </Badge>
-          )
-        }))}
-      />
-
       <div ref={tableContainerRef} className="min-h-0 flex-1 overflow-hidden">
         <Table
-          rowKey={(skill) => `${skill.agent}:${skill.name}`}
+          rowKey={(skill) => skill.name}
           columns={columns}
-          dataSource={filteredSkills}
+          dataSource={flatFiltered}
           pagination={false}
           size="middle"
           loading={busy === 'load'}
@@ -390,7 +441,7 @@ export function SkillsPage(): React.ReactNode {
                 prefix={<Search className="h-3.5 w-3.5" />}
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
-                placeholder={isEn ? 'Search skills...' : '搜索 skills...'}
+                placeholder={isEn ? 'Search Skill...' : '搜索 Skill...'}
                 className="ml-auto"
                 style={{ width: 280 }}
               />
@@ -398,13 +449,9 @@ export function SkillsPage(): React.ReactNode {
           )}
           rowSelection={{
             type: 'checkbox',
-            selectedRowKeys: selected.map((name) => `${activeAgent}:${name}`),
+            selectedRowKeys: selected,
             onChange: (keys) =>
-              setSelected(
-                keys
-                  .map((key) => String(key).split(':').slice(1).join(':'))
-                  .filter(Boolean)
-              )
+              setSelected(keys.map((key) => String(key)).filter(Boolean))
           }}
           scroll={{ x: 1080, y: tableScrollY }}
           locale={{

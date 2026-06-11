@@ -8,7 +8,15 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()]
   },
   preload: {
-    plugins: [externalizeDepsPlugin()]
+    plugins: [externalizeDepsPlugin()],
+    build: {
+      rollupOptions: {
+        input: {
+          index: resolve(__dirname, 'src/preload/index.ts'),
+          island: resolve(__dirname, 'src/preload/island.ts')
+        }
+      }
+    }
   },
   renderer: {
     resolve: {
@@ -17,6 +25,14 @@ export default defineConfig({
         '@': resolve('src/renderer/src')
       }
     },
-    plugins: [react(), tailwindcss()]
+    plugins: [react(), tailwindcss()],
+    build: {
+      rollupOptions: {
+        input: {
+          index: resolve(__dirname, 'src/renderer/index.html'),
+          island: resolve(__dirname, 'src/renderer/island.html')
+        }
+      }
+    }
   }
 })

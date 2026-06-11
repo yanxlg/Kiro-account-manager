@@ -1,19 +1,39 @@
-import { Alert, Badge, Button, Input, Space, Table, Tabs, Tag, Tooltip, Typography } from 'antd'
+import { Badge, Button, Input, Space, Table, Tag, Tooltip, Typography } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { Download, Edit, Plug, Plus, RefreshCw, Search, Trash2 } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from '@/hooks/useTranslation'
 import { EditModal } from './EditModal'
-import type { ManagedMcpServer } from './types'
+import type { ManagedMcpServer, McpAgentView } from './types'
 import { useMcpManager } from './useMcpManager'
 
-type LocalMcpRegistration = {
+/** Agent 颜色池（按 index 分配，保证同一 Agent 颜色固定） */
+const AGENT_COLORS = [
+  'blue',
+  'purple',
+  'green',
+  'orange',
+  'cyan',
+  'magenta',
+  'geekblue',
+  'gold',
+  'lime',
+  'volcano'
+] as const
+
+function agentColor(index: number): string {
+  return AGENT_COLORS[index % AGENT_COLORS.length]
+}
+
+/** 扁平化后的行数据：一个 MCP server + 它存在于哪些 Agent（含配置路径） */
+interface FlatRow {
   name: string
+  transport: string
   managed: boolean
-  nativeTransport: string
-  configPath: string
-  warning?: string
   managedServer?: ManagedMcpServer
+  /** 每个拥有此 server 的 agent（displayName + configPath + color） */
+  agents: Array<{ displayName: string; configPath: string; color: string }>
+  warning?: string
 }
 
 export function McpPage(): React.ReactNode {
@@ -22,12 +42,9 @@ export function McpPage(): React.ReactNode {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
   const {
-    activeAgent,
     agents,
     busy,
-    currentAgent,
     editing,
-    hasMcpApi,
     kiroInstalled,
     query,
     servers,
@@ -38,40 +55,86 @@ export function McpPage(): React.ReactNode {
     openCreate,
     openEdit,
     saveServer,
-    setActiveAndPersist,
     setQuery,
     setShowEditDialog
   } = useMcpManager(isEn)
 
-  const lowerQuery = query.trim().toLowerCase()
-  const currentRegistrations: LocalMcpRegistration[] = (currentAgent?.servers || [])
-    .map((registration) => ({
-      ...registration,
-      managedServer:
-        servers.find((server) => server.name.toLowerCase() === registration.name.toLowerCase()) ||
-        registration.server || {
-          name: registration.name,
-          transport:
-            registration.nativeTransport === 'http' || registration.nativeTransport === 'sse'
-              ? registration.nativeTransport
-              : 'stdio',
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          source: 'imported'
+  // 构建 agent id → (displayName, color) 映射
+  const agentMeta = useMemo(() => {
+    const map = new Map<string, { displayName: string; color: string }>()
+    agents.forEach((agent, idx) => {
+      map.set(agent.id, { displayName: agent.displayName, color: agentColor(idx) })
+    })
+    return map
+  }, [agents])
+
+  // 扁平化：去重 server name，合并各 agent 信息
+  const flatRows: FlatRow[] = useMemo(() => {
+    const rowMap = new Map<string, FlatRow>()
+
+    agents.forEach((agent: McpAgentView) => {
+      if (!agent.installed) return
+      const meta = agentMeta.get(agent.id)
+      if (!meta) return
+
+      for (const reg of agent.servers) {
+        const key = reg.name.toLowerCase()
+        let row = rowMap.get(key)
+        if (!row) {
+          const managed =
+            servers.find((s) => s.name.toLowerCase() === key) ||
+            reg.server || {
+              name: reg.name,
+              transport:
+                reg.nativeTransport === 'http' || reg.nativeTransport === 'sse'
+                  ? reg.nativeTransport
+                  : 'stdio',
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+              source: 'imported'
+            }
+          row = {
+            name: reg.name,
+            transport: reg.nativeTransport,
+            managed: reg.managed,
+            managedServer: managed as ManagedMcpServer,
+            agents: [],
+            warning: reg.warning
+          }
+          rowMap.set(key, row)
         }
-    }))
-    .filter((registration) => {
-      if (!lowerQuery) return true
-      const managed = registration.managedServer
-      return (
-        registration.name.toLowerCase().includes(lowerQuery) ||
-        registration.nativeTransport.toLowerCase().includes(lowerQuery) ||
-        registration.configPath.toLowerCase().includes(lowerQuery) ||
-        (managed?.url || '').toLowerCase().includes(lowerQuery) ||
-        (managed?.command || '').toLowerCase().includes(lowerQuery)
-      )
+        row.agents.push({
+          displayName: meta.displayName,
+          configPath: reg.configPath,
+          color: meta.color
+        })
+      }
     })
 
+    return Array.from(rowMap.values())
+  }, [agents, agentMeta, servers])
+
+  // 搜索过滤
+  const lowerQuery = query.trim().toLowerCase()
+  const filteredRows = useMemo(
+    () =>
+      lowerQuery
+        ? flatRows.filter(
+            (row) =>
+              row.name.toLowerCase().includes(lowerQuery) ||
+              row.transport.toLowerCase().includes(lowerQuery) ||
+              row.agents.some((a) => a.displayName.toLowerCase().includes(lowerQuery)) ||
+              row.agents.some((a) => a.configPath.toLowerCase().includes(lowerQuery)) ||
+              (row.managedServer?.url || '').toLowerCase().includes(lowerQuery) ||
+              (row.managedServer?.command || '').toLowerCase().includes(lowerQuery)
+          )
+        : flatRows,
+    [flatRows, lowerQuery]
+  )
+
+  const totalCount = flatRows.length
+
+  // 表格高度自适应
   useEffect(() => {
     const container = tableContainerRef.current
     if (!container) return
@@ -94,42 +157,39 @@ export function McpPage(): React.ReactNode {
       observer.disconnect()
       window.removeEventListener('resize', updateTableScrollY)
     }
-  }, [activeAgent, currentRegistrations.length, query])
+  }, [filteredRows.length, query])
 
-  const columns: ColumnsType<LocalMcpRegistration> = [
+  const columns: ColumnsType<FlatRow> = [
     {
       title: 'MCP',
       key: 'registration',
       width: 320,
-      render: (_value, registration) => (
+      render: (_value, row) => (
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <span className="font-medium text-foreground">{registration.name}</span>
-            {registration.managedServer?.disabled ? (
+            <span className="font-medium text-foreground">{row.name}</span>
+            {row.managedServer?.disabled ? (
               <Tag color="default">{isEn ? 'Disabled' : '已禁用'}</Tag>
             ) : null}
           </div>
-          {registration.managedServer?.description ? (
+          {row.managedServer?.description ? (
             <div className="line-clamp-2 text-xs text-muted-foreground">
-              {registration.managedServer.description}
+              {row.managedServer.description}
             </div>
           ) : null}
           <div className="truncate font-mono text-[10px] text-muted-foreground/80">
-            {registration.managedServer?.url ||
-              [
-                registration.managedServer?.command,
-                ...(registration.managedServer?.args || [])
-              ]
+            {row.managedServer?.url ||
+              [row.managedServer?.command, ...(row.managedServer?.args || [])]
                 .filter(Boolean)
                 .join(' ') ||
-              registration.configPath}
+              ''}
           </div>
         </div>
       )
     },
     {
       title: isEn ? 'Transport' : '传输',
-      dataIndex: 'nativeTransport',
+      dataIndex: 'transport',
       width: 90,
       render: (transport: string) =>
         transport === 'unknown' ? (
@@ -139,36 +199,47 @@ export function McpPage(): React.ReactNode {
         )
     },
     {
-      title: isEn ? 'Config File' : '配置文件',
-      key: 'configPath',
-      render: (_value, registration) => (
-        <div className="truncate font-mono text-[11px] text-muted-foreground">
-          {registration.configPath}
+      title: isEn ? 'Agents' : 'Agent',
+      key: 'agents',
+      width: 220,
+      render: (_value, row) => (
+        <div className="flex flex-wrap gap-1">
+          {row.agents.map((agent) => (
+            <Tooltip key={agent.displayName} title={agent.configPath}>
+              <Tag
+                color={agent.color}
+                className="cursor-pointer"
+                onClick={() => window.api.openLocalFile(agent.configPath)}
+              >
+                {agent.displayName}
+              </Tag>
+            </Tooltip>
+          ))}
         </div>
       )
     },
     {
       title: isEn ? 'Actions' : '操作',
       key: 'actions',
-      width: 96,
+      width: 72,
       fixed: 'right',
-      render: (_value, registration) => (
+      render: (_value, row) => (
         <Space size={4}>
           <Tooltip title={isEn ? 'Edit' : '编辑'}>
             <Button
               size="small"
               type="text"
               icon={<Edit className="h-4 w-4" />}
-              onClick={() => openEdit(registration.managedServer!)}
+              onClick={() => openEdit(row.managedServer!)}
             />
           </Tooltip>
-          <Tooltip title={isEn ? 'Delete from all agents' : '从所有 Agent 删除'}>
+          <Tooltip title={isEn ? 'Delete' : '删除'}>
             <Button
               size="small"
               type="text"
               danger
               icon={<Trash2 className="h-4 w-4" />}
-              onClick={() => void deleteServer({ name: registration.name })}
+              onClick={() => void deleteServer({ name: row.name })}
             />
           </Tooltip>
         </Space>
@@ -184,7 +255,19 @@ export function McpPage(): React.ReactNode {
         </div>
         <div className="min-w-0 flex-1">
           <Typography.Title level={4} style={{ margin: 0 }}>
-            {isEn ? 'MCP Manager' : 'MCP 管理'}
+            <Badge
+              count={totalCount}
+              showZero
+              overflowCount={999}
+              offset={[8, -4]}
+              style={{
+                backgroundColor: 'var(--color-primary)',
+                color: 'var(--color-primary-foreground)',
+                fontSize: 11
+              }}
+            >
+              {isEn ? 'MCP Manager' : 'MCP 管理'}
+            </Badge>
           </Typography.Title>
           <Typography.Text type="secondary">
             {isEn ? 'Manage local MCP registrations' : '管理本机 MCP 注册'}
@@ -198,18 +281,6 @@ export function McpPage(): React.ReactNode {
           {isEn ? 'Refresh' : '刷新'}
         </Button>
       </div>
-
-      {!hasMcpApi ? (
-        <Alert
-          type="error"
-          showIcon
-          message={
-            isEn
-              ? 'MCP API is not loaded. Please restart the Electron app.'
-              : 'MCP API 尚未加载，请重启 Electron 应用。'
-          }
-        />
-      ) : null}
 
       <div
         className="border px-4 py-3"
@@ -232,50 +303,11 @@ export function McpPage(): React.ReactNode {
         </div>
       </div>
 
-      <Tabs
-        style={{ marginBottom: 0 }}
-        tabBarStyle={{ marginBottom: 8 }}
-        activeKey={activeAgent}
-        onChange={(key) => void setActiveAndPersist(key)}
-        items={agents.map((agent) => ({
-          key: agent.id,
-          label: (
-            <Badge
-              count={agent.count}
-              size="small"
-              offset={[10, -2]}
-              styles={{
-                indicator: {
-                  backgroundColor: 'var(--color-primary)',
-                  color: 'var(--color-primary-foreground)',
-                  boxShadow: '0 0 0 1px var(--color-background)'
-                }
-              }}
-            >
-              <span className="inline-block">{agent.displayName}</span>
-            </Badge>
-          )
-        }))}
-      />
-
-      {currentAgent && !currentAgent.supported ? (
-        <Alert
-          className="mb-3"
-          type="info"
-          showIcon
-          message={
-            isEn
-              ? 'This agent is detected, but MCP registration editing is not supported yet.'
-              : '已检测到该 Agent，但暂未支持 MCP 注册编辑。'
-          }
-        />
-      ) : null}
-
       <div ref={tableContainerRef} className="min-h-0 flex-1 overflow-hidden">
         <Table
-          rowKey={(registration) => `${activeAgent}:${registration.name}`}
+          rowKey={(row) => row.name}
           columns={columns}
-          dataSource={currentRegistrations}
+          dataSource={filteredRows}
           pagination={false}
           size="middle"
           loading={busy === 'load'}
@@ -290,13 +322,13 @@ export function McpPage(): React.ReactNode {
                 prefix={<Search className="h-3.5 w-3.5" />}
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
-                placeholder={isEn ? 'Search MCP registrations...' : '搜索 MCP 注册...'}
+                placeholder={isEn ? 'Search MCP...' : '搜索 MCP...'}
                 className="ml-auto"
                 style={{ width: 280 }}
               />
             </div>
           )}
-          scroll={{ x: 980, y: tableScrollY }}
+          scroll={{ x: 780, y: tableScrollY }}
           locale={{ emptyText: isEn ? 'No MCP registrations' : '暂无 MCP 注册' }}
         />
       </div>

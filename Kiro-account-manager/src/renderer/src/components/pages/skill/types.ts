@@ -1,4 +1,4 @@
-export type SkillUpdateStatus = 'unknown' | 'latest' | 'available' | 'unsupported' | 'failed'
+export type SkillUpdateStatus = 'unknown' | 'latest' | 'available' | 'unsupported' | 'failed' | 'updating'
 export type SkillInstallMode = 'symlink' | 'copy'
 
 export interface SkillsManagerConfig {

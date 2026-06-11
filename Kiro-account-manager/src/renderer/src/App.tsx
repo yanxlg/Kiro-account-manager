@@ -49,6 +49,25 @@ function App(): React.JSX.Element {
     updateAccount
   } = useAccountsStore()
 
+  // 灵动岛展示偏好：隐私模式 + 主题色，跟随主窗口变化推送给灵动岛
+  const privacyMode = useAccountsStore(s => s.privacyMode)
+  const theme = useAccountsStore(s => s.theme)
+  const darkMode = useAccountsStore(s => s.darkMode)
+  useEffect(() => {
+    if (typeof window.api.updateIslandPrefs !== 'function') return
+    const cs = getComputedStyle(document.documentElement)
+    const readVar = (name: string, fallback: string): string => cs.getPropertyValue(name).trim() || fallback
+    window.api.updateIslandPrefs({
+      privacyMode,
+      isDark: document.documentElement.classList.contains('dark'),
+      primary: readVar('--color-primary', '#5B8CFF'),
+      gradientTo: readVar('--gradient-to', '#8B5CF6'),
+      foreground: readVar('--color-foreground', '#0f172a'),
+      mutedForeground: readVar('--color-muted-foreground', '#64748b'),
+      border: readVar('--color-border', 'rgba(15,23,42,0.1)')
+    })
+  }, [privacyMode, theme, darkMode])
+
   // 切换到下一个可用账户
   const switchToNextAccount = useCallback(() => {
     const activeAccounts = Array.from(accounts.values()).filter(acc => acc.status === 'active')

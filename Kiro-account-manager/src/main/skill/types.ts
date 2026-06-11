@@ -1,4 +1,4 @@
-export type SkillUpdateStatus = 'unknown' | 'latest' | 'available' | 'unsupported' | 'failed'
+export type SkillUpdateStatus = 'unknown' | 'latest' | 'available' | 'unsupported' | 'failed' | 'updating'
 export type SkillInstallMode = 'symlink' | 'copy'
 
 export interface SkillsManagerConfig {
@@ -20,6 +20,7 @@ export interface SkillManagerSkillConfig {
   lastCheckStatus?: SkillUpdateStatus
   lastCheckReason?: string
   lastCheckedAt?: string // ISO 8601
+  lastKnownVersion?: string // 最近一次远端检测到的版本号
   createdAt: number
   updatedAt: number
 }

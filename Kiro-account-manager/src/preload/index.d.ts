@@ -5,6 +5,7 @@ interface AccountData {
   groups: Record<string, unknown>
   tags: Record<string, unknown>
   activeAccountId: string | null
+  activeCliAccountId?: string | null
   autoRefreshEnabled: boolean
   autoRefreshInterval: number
   autoRefreshConcurrency?: number
@@ -313,6 +314,7 @@ interface StatusResult {
 
 interface KiroApi {
   openExternal: (url: string, usePrivateMode?: boolean) => void
+  openLocalFile: (filePath: string) => void
   getAppVersion: () => Promise<string>
   onAuthCallback: (callback: (data: { code: string; state: string }) => void) => () => void
 
@@ -1416,6 +1418,37 @@ interface KiroApi {
     showNotifications?: boolean
     minimizeOnStart?: boolean
   }) => Promise<{ success: boolean; error?: string }>
+
+  // 获取灵动岛设置
+  getIslandSettings: () => Promise<{
+    enabled: boolean
+    autoLaunch: boolean
+    startMode: 'window' | 'island'
+    minimizeToIsland: boolean
+    showProxyStatus: boolean
+    position: { x: number; y: number } | null
+  }>
+
+  // 保存灵动岛设置
+  saveIslandSettings: (settings: {
+    enabled?: boolean
+    autoLaunch?: boolean
+    startMode?: 'window' | 'island'
+    minimizeToIsland?: boolean
+    showProxyStatus?: boolean
+    position?: { x: number; y: number } | null
+  }) => Promise<{ success: boolean; error?: string }>
+
+  // 推送灵动岛展示偏好
+  updateIslandPrefs: (prefs: {
+    privacyMode: boolean
+    isDark: boolean
+    primary: string
+    gradientTo: string
+    foreground: string
+    mutedForeground: string
+    border: string
+  }) => void
 
   // 更新托盘当前账户信息
   updateTrayAccount: (

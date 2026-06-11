@@ -1,7 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
   <component name="ChangeListManager">
-    <list default="true" id="e44d6fdd-4173-4730-a1bf-ca9eb1cd7cca" name="Changes" comment="" />
+    <list default="true" id="e44d6fdd-4173-4730-a1bf-ca9eb1cd7cca" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Kiro-account-manager/src/main/index.ts" beforeDir="false" afterPath="$PROJECT_DIR$/Kiro-account-manager/src/main/index.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Kiro-account-manager/src/main/skill/scheduler.ts" beforeDir="false" afterPath="$PROJECT_DIR$/Kiro-account-manager/src/main/skill/scheduler.ts" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -10,10 +17,10 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "associatedIndex": 6,
-  "fromUser": false
-}]]></component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 6,
+  &quot;fromUser&quot;: false
+}</component>
   <component name="ProjectId" id="3Etkv4kSBY4FuSiUxeSCY6EEDGU" />
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
@@ -27,13 +34,17 @@
     "RunOnceActivity.git.unshallow": "true",
     "RunOnceActivity.typescript.service.memoryLimit.init": "true",
     "com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1": "true",
+    "git-widget-placeholder": "main",
     "javascript.preferred.runtime.type.id": "node",
     "junie.onboarding.icon.badge.shown": "true",
     "last_opened_file_path": "/Users/yanxianliang/shuhe/Kiro-account-manager",
     "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
     "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
     "nodejs_package_manager_path": "npm",
     "to.speed.mode.migration.done": "true",
+    "ts.external.directory.path": "/Users/yanxianliang/shuhe/Kiro-account-manager/Kiro-account-manager/node_modules/typescript/lib",
     "vue.rearranger.settings.migration": "true"
   }
 }]]></component>
@@ -52,6 +63,8 @@
       <option name="presentableId" value="Default" />
       <updated>1781005481169</updated>
       <workItem from="1781005482457" duration="94000" />
+      <workItem from="1781005582360" duration="1188000" />
+      <workItem from="1781131779724" duration="284000" />
     </task>
     <servers />
   </component>

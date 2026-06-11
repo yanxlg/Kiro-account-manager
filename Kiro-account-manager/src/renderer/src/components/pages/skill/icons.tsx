@@ -1,4 +1,5 @@
 import { CheckCircle2, AlertTriangle, Folder, GitBranch, Github } from 'lucide-react'
+import { SyncOutlined } from '@ant-design/icons'
 import { getSourceProvider } from './source'
 import type { SkillUpdateStatus, SkillsSkillView } from './types'
 
@@ -82,6 +83,9 @@ export function getSourceUrl(skill: SkillsSkillView): string | null {
 }
 
 export function StatusIcon({ status }: { status: SkillUpdateStatus }): React.ReactNode {
+  if (status === 'updating') {
+    return <SyncOutlined spin className="text-sky-500" />
+  }
   return status === 'latest' ? (
     <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
   ) : (

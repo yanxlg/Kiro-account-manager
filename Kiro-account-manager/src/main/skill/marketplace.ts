@@ -844,7 +844,7 @@ export class MarketplaceManager {
    * - lockEntry.sourceUrl 规范化后与市场 gitUrl 规范化后匹配
    */
   private isSkillInstalled(
-    skillName: string,
+    _skillName: string,
     skillPath: string,
     ownerRepo: string | undefined,
     gitUrl: string,

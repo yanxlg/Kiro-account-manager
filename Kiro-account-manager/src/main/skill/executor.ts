@@ -10,7 +10,6 @@ import { readGlobalLock, lockForSkill } from './lock'
 import { pathExists } from './filesystem'
 import { join } from 'path'
 import { cp, mkdir, rm } from 'fs/promises'
-import { parseGitLabUrl } from './detector'
 
 const MAX_QUEUE_SIZE = 50
 const COMMAND_TIMEOUT_MS = 120_000
@@ -27,8 +26,8 @@ const DEFAULT_MAX_WAIT_MS = 600_000
  *
  * skillFolder 从 skillPath 中提取：去掉尾部的 SKILL.md 并规范化路径分隔符。
  */
-export function buildInstallSource(task: UpdateTask): string {
-  const ref = task.ref || 'main'
+export function buildInstallSource(task: UpdateTask, refOverride?: string): string {
+  const ref = refOverride || task.ref || 'main'
   const skillFolder = normalizeSkillFolder(task.skillPath)
 
   if (task.sourceType === 'github' || task.sourceType === 'plugin-github') {
@@ -163,8 +162,8 @@ export class UpdateExecutor {
   /**
    * 构建安装源地址，委托给模块级 buildInstallSource 函数。
    */
-  buildInstallSource(task: UpdateTask): string {
-    return buildInstallSource(task)
+  buildInstallSource(task: UpdateTask, refOverride?: string): string {
+    return buildInstallSource(task, refOverride)
   }
 
   // --- 队列管理 ---
@@ -307,12 +306,13 @@ export class UpdateExecutor {
       const entryBefore = lockForSkill(lockBefore, task.skillName)
       const previousHash = entryBefore?.skillFolderHash || ''
 
-      // 3. 构建安装源
-      const installSource = this.buildInstallSource(task)
-
-      // 4. 执行 npx skills add <installSource> -g -y，带 120 秒超时
+      // 3-4. 使用 `npx skills add <source> -g -y -s <skillName>`：
+      //   - bare source（不拼 #ref 子路径），由 skills CLI 解析仓库默认分支
+      //   - -s 按名精确选中 skill（兼容 monorepo / 子目录 / SSH GitLab）
+      //   与手动更新 (updateSkillV2) 保持一致，避免分支/子路径猜测导致 clone 失败
+      const installSource = task.sourceUrl || task.source || ''
       const result = await runNpxSkillsWithTimeout(
-        ['add', installSource, '-g', '-y'],
+        ['add', installSource, '-g', '-y', '-s', task.skillName],
         COMMAND_TIMEOUT_MS
       )
 
